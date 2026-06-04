@@ -1,0 +1,14 @@
+# GUI
+PyQt6>=6.6.0
+
+# ID3 tag reading/writing
+mutagen>=1.47.0
+
+# Audio fingerprinting (duplicate detection)
+pyacoustid>=1.3.0
+
+# Serato crate reading/writing
+serato-crate>=0.1.0
+
+# Optional: higher-level Serato metadata API (reference/fallback)
+# serato-tools>=0.1.0

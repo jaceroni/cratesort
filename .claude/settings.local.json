@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:homepage.ruhr-uni-bochum.de)",
+      "WebFetch(domain:pypi.org)",
+      "Bash(mkdir -p /Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev/docs)",
+      "Bash(mkdir -p /Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev/cratesort/src/core)",
+      "Bash(mkdir -p /Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev/cratesort/src/serato)",
+      "Bash(mkdir -p /Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev/cratesort/src/export)",
+      "Bash(mkdir -p /Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev/cratesort/src/gui)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 *)",
+      "Read(//opt/homebrew/lib/python3.14/site-packages/serato_crate/**)",
+      "Bash(echo \"App launched \\(PID $!\\)\")",
+      "Bash(PYTHONPATH=/Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev python3 src/gui/main_window.py)",
+      "Bash(pkill -f \"main_window.py\")"
+    ]
+  }
+}

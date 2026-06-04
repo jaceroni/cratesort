@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "cratesort"
+version = "0.1.0"
+description = "DJ music library organizer and Serato crate manager"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.6.0",
+    "mutagen>=1.47.0",
+    "pyacoustid>=1.3.0",
+    "serato-crate>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.4",
+]
+
+[project.scripts]
+cratesort = "cratesort.src.gui.main_window:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
