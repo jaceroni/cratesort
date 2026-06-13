@@ -106,12 +106,13 @@ QStatusBar::item {{
 QPushButton {{
     background-color: {C['orange']};
     color: #ffffff;
-    border: none;
+    border: 1px solid transparent;
     border-radius: 5px;
     padding: 7px 16px;
     font-size: 13px;
     font-weight: 600;
     min-height: 28px;
+    margin: 0px;
 }}
 QPushButton:hover {{
     background-color: {C['orange_hover']};
@@ -130,7 +131,8 @@ QPushButton[secondary="true"] {{
     color: #ffffff;
     font-weight: 400;
     border-radius: 6px;
-    border: none;
+    border: 1px solid transparent;
+    margin: 0px;
 }}
 QPushButton[secondary="true"]:hover {{
     background-color: {C['teal_hover']};
@@ -149,6 +151,8 @@ QPushButton[flat=true] {{
     background-color: transparent;
     color: {C['text']};
     border: 1px solid {C['border']};
+    font-weight: 400;
+    margin: 0px;
 }}
 QPushButton[flat="true"]:hover,
 QPushButton[flat=true]:hover {{
@@ -161,7 +165,10 @@ QPushButton[danger="true"] {{
     background-color: {C['error']};
 }}
 QPushButton[danger="true"]:hover {{
-    background-color: #d96a6a;
+    background-color: #b24c4c;
+}}
+QPushButton[danger="true"]:pressed {{
+    background-color: #9c3b3b;
 }}
 
 /* ── Sidebar nav buttons ──────────────────────────────────────────── */

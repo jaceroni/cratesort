@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
+
+logger = logging.getLogger(__name__)
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QSplitterHandle, QStackedWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
@@ -87,6 +91,14 @@ class _GripSplitter(QSplitter):
         return _GripHandle(self.orientation(), self)
 
 
+class _ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 # ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
@@ -155,7 +167,7 @@ class _ClickableCard(QFrame):
 # ---------------------------------------------------------------------------
 
 class _AnimatedStatCard(QFrame):
-    def __init__(self, icon: str, target: int, suffix: str, label: str, parent=None):
+    def __init__(self, target: int, suffix: str, label: str, parent=None):
         super().__init__(parent)
         self._target   = target
         self._suffix   = suffix
@@ -172,12 +184,6 @@ class _AnimatedStatCard(QFrame):
         col = QVBoxLayout(self)
         col.setContentsMargins(14, 16, 14, 16)
         col.setSpacing(4)
-
-        icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet(
-            'font-size: 16px; color: #7a6a55; background: transparent; border: none;'
-        )
-        col.addWidget(icon_lbl)
 
         self._num_label = QLabel('0' + suffix)
         self._num_label.setStyleSheet(
@@ -223,24 +229,34 @@ class _AnimatedStatCard(QFrame):
 # ---------------------------------------------------------------------------
 
 class _WorkflowCard(QFrame):
-    def __init__(self, step: str, title: str, desc: str, callback, parent=None):
+    _STYLE_REST  = 'QFrame { background-color: #2F2F2F; border: 1px solid #3a3a3a; border-radius: 10px; }'
+    _STYLE_HOVER = 'QFrame { background-color: #353028; border: 1px solid #D17D34; border-radius: 10px; }'
+    _ICON_DIM    = '#2a2a2a'
+    _ICON_ACTIVE = '#D17D34'
+
+    def __init__(self, step: str, title: str, desc: str, callback, icon_path=None, parent=None):
         super().__init__(parent)
-        self._callback = callback
+        self._callback  = callback
+        self._icon_path = icon_path
+        self._icon_svg: QSvgWidget | None = None
+        self._svg_bytes: bytes | None = None
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setMinimumHeight(130)
-        self.setStyleSheet(
-            'QFrame { background-color: #2F2F2F; border: 1px solid #3a3a3a; border-radius: 10px; }'
-        )
+        self.setMinimumHeight(230)
+        self.setStyleSheet(self._STYLE_REST)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        col = QVBoxLayout(self)
-        col.setContentsMargins(18, 20, 18, 20)
+        # Outer row: text on left, icon on right
+        row = QHBoxLayout(self)
+        row.setContentsMargins(18, 14, 14, 14)
+        row.setSpacing(0)
+
+        col = QVBoxLayout()
         col.setSpacing(4)
 
         self._step_label = QLabel(step)
         self._step_label.setStyleSheet(
-            'font-size: 32px; font-weight: 600; color: #3a3a3a; '
+            'font-size: 32px; font-weight: 600; color: #D17D34; '
             'letter-spacing: -1px; background: transparent; border: none;'
         )
         col.addWidget(self._step_label)
@@ -259,23 +275,346 @@ class _WorkflowCard(QFrame):
         desc_lbl.setWordWrap(True)
         col.addWidget(desc_lbl)
 
+        col.addStretch()
+
+        row.addLayout(col, stretch=1)
+
+        # Large icon — anchored top-right, dimmed at rest, orange on hover
+        if _SVG_AVAILABLE and icon_path and Path(icon_path).exists():
+            try:
+                self._svg_bytes = Path(icon_path).read_bytes()
+                self._icon_svg = QSvgWidget()
+                self._icon_svg.setFixedSize(100, 100)
+                self._icon_svg.setStyleSheet('background: transparent;')
+                self._icon_svg.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                self._load_icon_color(self._ICON_DIM)
+                row.addWidget(self._icon_svg, alignment=Qt.AlignmentFlag.AlignTop)
+            except Exception:
+                pass
+
+    def _load_icon_color(self, color: str) -> None:
+        if self._icon_svg and self._svg_bytes:
+            from PyQt6.QtCore import QByteArray
+            colored = self._svg_bytes.decode('utf-8').replace(
+                '#d17d34', color
+            ).replace('#D17D34', color)
+            self._icon_svg.load(QByteArray(colored.encode('utf-8')))
+
     def enterEvent(self, event):
-        self._step_label.setStyleSheet(
-            'font-size: 32px; font-weight: 600; color: #D17D34; '
-            'letter-spacing: -1px; background: transparent; border: none;'
-        )
+        self.setStyleSheet(self._STYLE_HOVER)
+        self._load_icon_color(self._ICON_ACTIVE)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self._step_label.setStyleSheet(
-            'font-size: 32px; font-weight: 600; color: #3a3a3a; '
-            'letter-spacing: -1px; background: transparent; border: none;'
-        )
+        self.setStyleSheet(self._STYLE_REST)
+        self._load_icon_color(self._ICON_DIM)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         if self._callback:
             self._callback()
+
+
+# ---------------------------------------------------------------------------
+# Change Review Dialog
+# ---------------------------------------------------------------------------
+
+class _ChangeReviewDialog(QDialog):
+    """
+    Review Serato library changes detected since the last session.
+
+    Each row shows the change description, when it happened, and a Revert
+    button. Clicking Revert marks that change as pending revert (row grays out,
+    button becomes Undo). Clicking Undo cancels the pending revert. No disk
+    writes happen until the user clicks Sync & Proceed — at that point all
+    pending reverts are executed and the checkpoint is saved. Clicking Cancel
+    leaves the checkpoint unchanged and the sync banner remains.
+    """
+
+    _TEAL_TYPES   = {'crate_added', 'tracks_added', 'renamed', 'added'}
+    _ORANGE_TYPES = {'crate_removed', 'tracks_removed', 'removed'}
+
+    def __init__(
+        self,
+        changes: list[dict],
+        serato_dir: Optional[Path],
+        current_crates: dict,
+        checkpoint_timestamp: Optional[datetime],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle('Review Serato Changes')
+        self.setMinimumSize(540, 400)
+
+        self._serato_dir         = serato_dir
+        self._updated_crates     = dict(current_crates)
+        self._pending_reverts:   set[int] = set()   # indices into self._changes
+        self._changes            = list(changes)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 16)
+
+        # ── Header ───────────────────────────────────────────────────────────
+        title = QLabel('Serato Library Changes Detected')
+        title.setStyleSheet('font-size: 16px; font-weight: 600; color: #f1e3c8;')
+        layout.addWidget(title)
+
+        if checkpoint_timestamp:
+            day = checkpoint_timestamp.day
+            since_str = checkpoint_timestamp.strftime(f'%B {day}, %Y at %I:%M %p')
+            desc_text = (
+                f'Changes detected since your last session on {since_str}. '
+                'Mark any changes to revert before syncing.'
+            )
+        else:
+            desc_text = (
+                'Changes detected since your last CrateSort session. '
+                'Mark any changes to revert before syncing.'
+            )
+        desc = QLabel(desc_text)
+        desc.setStyleSheet('color: #a89b85; font-size: 12px;')
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # ── Change rows ───────────────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }')
+
+        rows_container = QWidget()
+        rows_container.setStyleSheet('background: transparent;')
+        self._rows_layout = QVBoxLayout(rows_container)
+        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._rows_layout.setSpacing(4)
+        scroll.setWidget(rows_container)
+        layout.addWidget(scroll, stretch=1)
+
+        self._row_frames: list[QFrame] = []
+        for i, change in enumerate(self._changes):
+            self._rows_layout.addWidget(self._build_row(i, change))
+
+        self._rows_layout.addStretch()
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet('background: #383838; border: none;')
+        layout.addWidget(sep)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self._cancel_btn = QPushButton('Cancel')
+        self._cancel_btn.setStyleSheet(
+            'QPushButton { background: #C75B5B; color: #ffffff; font-weight: 400; '
+            'border-radius: 6px; border: none; padding: 7px 18px; }'
+            'QPushButton:hover { background: #b24c4c; }'
+            'QPushButton:pressed { background: #9c3b3b; }'
+        )
+        self._cancel_btn.clicked.connect(self.reject)
+
+        self._sync_btn = QPushButton('Sync && Proceed')
+        self._sync_btn.setStyleSheet(
+            'QPushButton { background: #428175; color: #ffffff; font-weight: 600; '
+            'border-radius: 6px; border: none; padding: 7px 18px; }'
+            'QPushButton:hover { background: #38706a; }'
+            'QPushButton:pressed { background: #2d6358; }'
+        )
+        self._sync_btn.clicked.connect(self._on_sync)
+
+        btn_row.addStretch()
+        btn_row.addWidget(self._cancel_btn)
+        btn_row.addWidget(self._sync_btn)
+        layout.addLayout(btn_row)
+
+    # ── Row builder ───────────────────────────────────────────────────────────
+
+    def _build_row(self, idx: int, change: dict) -> QFrame:
+        ctype = change.get('type', '')
+        dot_color = (
+            '#428175' if ctype in self._TEAL_TYPES
+            else '#D17D34' if ctype in self._ORANGE_TYPES
+            else '#a89b85'
+        )
+
+        frame = QFrame()
+        frame.setStyleSheet(
+            'QFrame { background: #2a2a2a; border: none; border-radius: 4px; }'
+        )
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(10, 8, 10, 8)
+        h.setSpacing(10)
+
+        dot = QLabel('●')
+        dot.setStyleSheet(
+            f'color: {dot_color}; font-size: 8px; background: transparent; border: none;'
+        )
+        dot.setFixedWidth(14)
+        dot.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(dot)
+
+        desc_lbl = QLabel(change.get('description', ''))
+        desc_lbl.setStyleSheet('color: #f1e3c8; font-size: 13px; background: transparent; border: none;')
+        desc_lbl.setWordWrap(False)
+        h.addWidget(desc_lbl, stretch=1)
+
+        mtime: Optional[datetime] = change.get('mtime')
+        time_lbl = QLabel(self._fmt_time(mtime))
+        time_lbl.setStyleSheet('color: #5a5a5a; font-size: 11px; background: transparent; border: none;')
+        time_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(time_lbl)
+
+        can_revert = self._can_revert(change)
+        if can_revert:
+            revert_btn = QPushButton('Revert')
+            revert_btn.setFixedHeight(26)
+            revert_btn.setStyleSheet(
+                'QPushButton { background: #C75B5B; color: #ffffff; font-size: 11px; font-weight: 600; '
+                'border: none; border-radius: 4px; padding: 2px 10px; }'
+                'QPushButton:hover { background: #b24c4c; }'
+                'QPushButton:pressed { background: #9c3b3b; }'
+            )
+            revert_btn.clicked.connect(
+                lambda _, i=idx, f=frame, d=desc_lbl, t=time_lbl, b=revert_btn: self._on_revert(i, f, d, b)
+            )
+            h.addWidget(revert_btn)
+
+        self._row_frames.append(frame)
+        return frame
+
+    # ── Revert interaction ────────────────────────────────────────────────────
+
+    def _on_revert(
+        self,
+        idx: int,
+        frame: QFrame,
+        desc_lbl: QLabel,
+        btn: QPushButton,
+    ) -> None:
+        if idx in self._pending_reverts:
+            # Undo the pending revert
+            self._pending_reverts.discard(idx)
+            frame.setStyleSheet(
+                'QFrame { background: #2a2a2a; border: none; border-radius: 4px; }'
+            )
+            desc_lbl.setStyleSheet(
+                'color: #f1e3c8; font-size: 13px; background: transparent; border: none;'
+            )
+            btn.setText('Revert')
+            btn.setStyleSheet(
+                'QPushButton { background: #C75B5B; color: #ffffff; font-size: 11px; font-weight: 600; '
+                'border: none; border-radius: 4px; padding: 2px 10px; }'
+                'QPushButton:hover { background: #b24c4c; }'
+                'QPushButton:pressed { background: #9c3b3b; }'
+            )
+        else:
+            # Mark as pending revert
+            self._pending_reverts.add(idx)
+            frame.setStyleSheet(
+                'QFrame { background: #222222; border: 1px solid #3a3a3a; border-radius: 4px; }'
+            )
+            desc_lbl.setStyleSheet(
+                'color: #5a5a5a; font-size: 13px; text-decoration: line-through; '
+                'background: transparent; border: none;'
+            )
+            btn.setText('Undo')
+            btn.setStyleSheet(
+                'QPushButton { background: #2a2a2a; color: #a89b85; font-size: 11px; font-weight: 600; '
+                'border: 1px solid #444; border-radius: 4px; padding: 2px 10px; }'
+                'QPushButton:hover { background: #383838; }'
+            )
+
+    # ── Sync action ───────────────────────────────────────────────────────────
+
+    def _on_sync(self) -> None:
+        failed: list[str] = []
+        for idx in self._pending_reverts:
+            change = self._changes[idx]
+            try:
+                self._execute_revert(change)
+            except Exception as exc:
+                logger.warning("Revert failed for %s: %s", change.get('type'), exc)
+                failed.append(f'• {change.get("description", "unknown")} — {exc}')
+
+        if failed:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self,
+                'Revert Failed',
+                'The following changes could not be reverted:\n\n'
+                + '\n'.join(failed)
+                + '\n\nThe sync was not saved. Please try again or contact support.',
+            )
+            return  # don't save checkpoint — user can retry
+
+        if self._serato_dir:
+            save_checkpoint(str(self._serato_dir), self._updated_crates)
+
+        self.accept()
+
+    def _execute_revert(self, change: dict) -> None:
+        ctype      = change.get('type', '')
+        crate_path = change.get('crate_path', '')
+        prev_tracks = change.get('prev_tracks', [])
+
+        if ctype == 'crate_added':
+            p = Path(crate_path)
+            if p.exists():
+                p.unlink()
+            self._updated_crates.pop(crate_path, None)
+
+        elif ctype == 'crate_removed':
+            self._write_crate(crate_path, prev_tracks)
+            self._updated_crates[crate_path] = prev_tracks
+
+        elif ctype == 'renamed':
+            # Delete the new (renamed) file, restore the old name with old tracks
+            new_path = Path(crate_path)
+            if new_path.exists():
+                new_path.unlink()
+            self._updated_crates.pop(crate_path, None)
+            old_path = change.get('old_crate_path', '')
+            if old_path:
+                self._write_crate(old_path, prev_tracks)
+                self._updated_crates[old_path] = prev_tracks
+
+        elif ctype in ('tracks_added', 'tracks_removed'):
+            self._write_crate(crate_path, prev_tracks)
+            self._updated_crates[crate_path] = prev_tracks
+
+    def _write_crate(self, crate_path_str: str, track_paths: list[str]) -> None:
+        import sys as _sys
+        _sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
+        from serato_crate.crate_file import write_crate_file
+        p = Path(crate_path_str)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = [('otrk', [('ptrk', t)]) for t in track_paths]
+        tmp = p.with_suffix(p.suffix + '.tmp')
+        write_crate_file(tmp, data)
+        tmp.replace(p)
+        logger.info("Reverted crate: %s (%d tracks)", p.name, len(track_paths))
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _can_revert(self, change: dict) -> bool:
+        """Return True if this change type can be reverted."""
+        ctype = change.get('type', '')
+        if ctype == 'crate_added':
+            return True   # just delete the file — no prev_tracks needed
+        return bool(change.get('prev_tracks'))   # all other types need the old track list
+
+    @staticmethod
+    def _fmt_time(dt: Optional[datetime]) -> str:
+        if dt is None:
+            return ''
+        now = datetime.now()
+        if dt.date() == now.date():
+            return f'Today at {dt.strftime("%I:%M %p").lstrip("0")}'
+        if dt.year == now.year:
+            return f'{dt.strftime("%b")} {dt.day} at {dt.strftime("%I:%M %p").lstrip("0")}'
+        return f'{dt.strftime("%b")} {dt.day}, {dt.year}'
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +648,9 @@ class DashboardWidget(QWidget):
         self._summary       = None
         self._scan_start_ms = 0
         self._scan_cancelled = False
+        self._sync_pending = False
+        self._detected_changes = []
+        self._current_crates = {}
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -323,6 +665,9 @@ class DashboardWidget(QWidget):
         self._stack.setCurrentIndex(0)
 
     # ── Public API ────────────────────────────────────────────────────
+
+    def is_sync_pending(self) -> bool:
+        return self._sync_pending
 
     def set_library_path(self, path: Path) -> None:
         self._library_path = path
@@ -449,6 +794,7 @@ class DashboardWidget(QWidget):
         self._scan_cancel = QPushButton('Cancel')
         self._scan_cancel.setProperty('flat', 'true')
         self._scan_cancel.setFixedWidth(100)
+        self._scan_cancel.setStyleSheet('QPushButton { color: #C75B5B; } QPushButton:hover { color: #b24c4c; }')
         self._scan_cancel.clicked.connect(self._on_cancel_scan)
 
         layout.addWidget(self._scan_label)
@@ -498,6 +844,9 @@ class DashboardWidget(QWidget):
         inv        = self._inventory
         serato_dir = self._library_path / '_Serato_' if self._library_path else None
 
+        if self._sync_pending:
+            layout.addWidget(self._build_sync_warning_banner())
+
         layout.addWidget(self._build_stat_cards_section(summary, inv))
         layout.addWidget(self._make_divider())
         layout.addWidget(self._build_action_cards_section())
@@ -533,7 +882,7 @@ class DashboardWidget(QWidget):
         row_layout.setSpacing(10)
 
         total_target = summary.total_files if summary else 0
-        c0 = _AnimatedStatCard('♪', total_target, '', 'Total Tracks')
+        c0 = _AnimatedStatCard(total_target, '', 'Total Tracks')
         row_layout.addWidget(c0)
 
         crate_target = 0
@@ -541,18 +890,18 @@ class DashboardWidget(QWidget):
             subcrates = serato_dir / 'Subcrates'
             if subcrates.exists():
                 crate_target = len(list(subcrates.rglob('*.crate')))
-        c1 = _AnimatedStatCard('⊞', crate_target, '', 'Total Crates')
+        c1 = _AnimatedStatCard(crate_target, '', 'Total Crates')
         row_layout.addWidget(c1)
 
         artists_target = len(summary.unique_artists) if summary else 0
-        c2 = _AnimatedStatCard('♟', artists_target, '', 'Unique Artists')
+        c2 = _AnimatedStatCard(artists_target, '', 'Unique Artists')
         row_layout.addWidget(c2)
 
         hours_target = 0
         if inv:
             total_secs = sum(r.duration for r in inv if r.duration)
             hours_target = int(total_secs / 3600)
-        c3 = _AnimatedStatCard('◷', hours_target, 'h', 'Hours of Music')
+        c3 = _AnimatedStatCard(hours_target, 'h', 'Hours of Music')
         row_layout.addWidget(c3)
 
         vbox.addWidget(row_widget)
@@ -566,24 +915,16 @@ class DashboardWidget(QWidget):
         return outer
 
     def _build_action_cards_section(self) -> QWidget:
-        _base_create = (
-            'QFrame { background-color: #2a2218; border: 0.5px solid #4a3520; border-radius: 10px; }'
-        )
-        _hover_create = (
-            f'QFrame {{ background-color: #2a2218; border: 0.5px solid {self._ORANGE}; '
-            f'border-radius: 10px; }}'
-        )
-
         outer = QWidget()
         vbox = QVBoxLayout(outer)
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(10)
 
+        _icons = _ASSETS / 'icons'
         goto_cards = [
-            ('01', 'Change Library',   'Set active library path',          self._on_select_library),
-            ('02', 'Classify Library', 'Reassign artists and genres',       self.classify_requested.emit),
-            ('03', 'Manage Crates',    'Build crates and edit tracks',      self.crates_requested.emit),
-            ('04', 'Organize Media',   'Manage folders and file locations', self.organize_requested.emit),
+            ('01', 'Classify Library', 'Reassign artists and genres',       self.classify_requested.emit,    _icons / 'icon-classification.svg'),
+            ('02', 'Manage Crates',    'Build crates and edit tracks',      self.crates_requested.emit,      _icons / 'icon-crates.svg'),
+            ('03', 'Organize Media',   'Manage folders and file locations', self.organize_requested.emit,    _icons / 'icon-organize.svg'),
         ]
 
         goto_widget = QWidget()
@@ -591,15 +932,28 @@ class DashboardWidget(QWidget):
         goto_grid.setContentsMargins(0, 0, 0, 0)
         goto_grid.setSpacing(10)
 
-        for col_idx, (step, title, desc, action) in enumerate(goto_cards):
-            card = _WorkflowCard(step, title, desc, action)
+        for col_idx, (step, title, desc, action, icon_path) in enumerate(goto_cards):
+            card = _WorkflowCard(step, title, desc, action, icon_path=icon_path)
             goto_grid.addWidget(card, 0, col_idx)
 
         vbox.addWidget(goto_widget)
 
-        create_cards = [
-            ('＋', 'New Crate',       'Start with a fresh crate',  self.new_crate_requested.emit),
-            ('✦',  'New Smart Crate', 'Create a rule-based crate', self.new_smart_crate_requested.emit),
+        # Create cards — each has its own accent color
+        create_defs = [
+            {
+                'icon': '＋', 'title': 'New Crate', 'desc': 'Start with a fresh crate',
+                'action': self.new_crate_requested.emit,
+                'accent': self._ORANGE,
+                'base':  'QFrame { background-color: #2a2218; border: 0.5px solid #4a3520; border-radius: 10px; }',
+                'hover': f'QFrame {{ background-color: #2e2519; border: 0.5px solid {self._ORANGE}; border-radius: 10px; }}',
+            },
+            {
+                'icon': '✦', 'title': 'New Smart Crate', 'desc': 'Create a rule-based crate',
+                'action': self.new_smart_crate_requested.emit,
+                'accent': self._ORANGE,
+                'base':  'QFrame { background-color: #2a2218; border: 0.5px solid #4a3520; border-radius: 10px; }',
+                'hover': f'QFrame {{ background-color: #2e2519; border: 0.5px solid {self._ORANGE}; border-radius: 10px; }}',
+            },
         ]
 
         create_widget = QWidget()
@@ -607,27 +961,27 @@ class DashboardWidget(QWidget):
         create_grid.setContentsMargins(0, 0, 0, 0)
         create_grid.setSpacing(10)
 
-        for col_idx, (icon, title, desc, action) in enumerate(create_cards):
-            card = _ClickableCard(action, _base_create, _hover_create)
+        for col_idx, defn in enumerate(create_defs):
+            card = _ClickableCard(defn['action'], defn['base'], defn['hover'])
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(14, 16, 14, 16)
             card_layout.setSpacing(4)
 
-            icon_lbl = QLabel(icon)
+            icon_lbl = QLabel(defn['icon'])
             icon_lbl.setStyleSheet(
-                f'font-size: 20px; color: {self._ORANGE}; background: transparent; border: none;'
+                f'font-size: 20px; color: {defn["accent"]}; background: transparent; border: none;'
             )
             card_layout.addWidget(icon_lbl)
 
-            title_lbl = QLabel(title)
+            title_lbl = QLabel(defn['title'])
             title_lbl.setStyleSheet(
                 f'font-size: 13px; font-weight: 500; color: {self._CREAM}; '
                 f'background: transparent; border: none;'
             )
             card_layout.addWidget(title_lbl)
 
-            desc_lbl = QLabel(desc)
+            desc_lbl = QLabel(defn['desc'])
             desc_lbl.setStyleSheet(
                 'font-size: 11px; color: #7a6a55; background: transparent; border: none;'
             )
@@ -662,21 +1016,7 @@ class DashboardWidget(QWidget):
         items = []
 
         if serato_dir and serato_dir.exists():
-            current_crates: dict = {}
-            subcrates = serato_dir / 'Subcrates'
-            if subcrates.exists():
-                for crate_file in subcrates.rglob('*.crate'):
-                    try:
-                        from cratesort.src.serato.crate_reader import CrateReader
-                        reader = CrateReader(serato_dir)
-                        tracks, _ = reader._read_tracks(crate_file)
-                        current_crates[str(crate_file)] = len(tracks)
-                    except Exception:
-                        current_crates[str(crate_file)] = None
-
-            checkpoint = load_checkpoint(serato_dir)
-            changes = detect_changes(current_crates, checkpoint) if checkpoint else []
-            save_checkpoint(serato_dir, current_crates)
+            changes = list(self._detected_changes)
 
             _teal_types   = {'crate_added', 'tracks_added', 'renamed', 'added'}
             _orange_types = {'crate_removed', 'tracks_removed', 'removed'}
@@ -710,6 +1050,41 @@ class DashboardWidget(QWidget):
             except Exception:
                 pass
 
+            # Reorganization log entries
+            crate_sort_dir = serato_dir.parent / '_CrateSort'
+            cutoff = now - timedelta(days=30)
+            for log_file in sorted(crate_sort_dir.glob('reorganization_log_*.json'), reverse=True):
+                try:
+                    with open(log_file, encoding='utf-8') as f:
+                        log = json.load(f)
+                    exec_str = log.get('executed_at', '')
+                    if not exec_str:
+                        continue
+                    dt = datetime.fromisoformat(exec_str)
+                    if dt >= cutoff:
+                        moved = sum(1 for m in log.get('moves', []) if m.get('status') == 'completed')
+                        time_str = 'Today' if dt.date() == now.date() else dt.strftime('%b %d')
+                        items.append({
+                            'dot_color': self._TEAL,
+                            'text': f'Library Reorganized — {moved:,} file{"s" if moved != 1 else ""} moved',
+                            'time_str': time_str,
+                            '_dt': dt,
+                        })
+                    rb_str = log.get('rolled_back_at', '')
+                    if rb_str:
+                        dt_rb = datetime.fromisoformat(rb_str)
+                        if dt_rb >= cutoff:
+                            moved = sum(1 for m in log.get('moves', []) if m.get('status') == 'completed')
+                            time_str_rb = 'Today' if dt_rb.date() == now.date() else dt_rb.strftime('%b %d')
+                            items.append({
+                                'dot_color': self._ORANGE,
+                                'text': f'Reorganization Rolled Back — {moved:,} file{"s" if moved != 1 else ""} restored',
+                                'time_str': time_str_rb,
+                                '_dt': dt_rb,
+                            })
+                except Exception:
+                    continue
+
         items.sort(key=lambda x: x['_dt'], reverse=True)
         items = items[:10]
 
@@ -728,8 +1103,9 @@ class DashboardWidget(QWidget):
                     panel_vbox.addWidget(sep)
 
                 row = QWidget()
+                row.setStyleSheet("background: transparent; border: none;")
                 row_h = QHBoxLayout(row)
-                row_h.setContentsMargins(0, 8, 0, 8)
+                row_h.setContentsMargins(8, 8, 8, 8)
                 row_h.setSpacing(10)
 
                 dot = QLabel('●')
@@ -791,16 +1167,25 @@ class DashboardWidget(QWidget):
         h.addWidget(ts_lbl)
         h.addStretch()
 
-        # Right: teal dot + synced text
+        # Right: dot + sync text (Amber if pending, Teal if synced)
+        dot_color = self._ORANGE if self._sync_pending else self._TEAL
+        status_text = '  Review Serato changes' if self._sync_pending else '  Library synced'
+
         dot = QLabel('●')
         dot.setStyleSheet(
-            f'color: {self._TEAL}; font-size: 9px; background: transparent; border: none;'
+            f'color: {dot_color}; font-size: 9px; background: transparent; border: none;'
         )
         h.addWidget(dot)
 
-        sync_lbl = QLabel('  Library synced')
+        if self._sync_pending:
+            sync_lbl = _ClickableLabel(status_text)
+            sync_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            sync_lbl.clicked.connect(self._on_review_sync_clicked)
+        else:
+            sync_lbl = QLabel(status_text)
+
         sync_lbl.setStyleSheet(
-            f'color: {self._TEAL}; font-size: 11px; background: transparent; border: none;'
+            f'color: {dot_color}; font-size: 11px; background: transparent; border: none;'
         )
         h.addWidget(sync_lbl)
 
@@ -855,17 +1240,123 @@ class DashboardWidget(QWidget):
         delay = max(0, _MIN_SCAN_DISPLAY_MS - elapsed_ms)
         QTimer.singleShot(delay, self._show_dashboard)
 
+    def _check_serato_sync(self) -> None:
+        serato_dir = self._library_path / '_Serato_' if self._library_path else None
+        self._sync_pending = False
+        self._detected_changes = []
+        self._current_crates = {}
+        self._checkpoint_timestamp: Optional[datetime] = None
+
+        if serato_dir and serato_dir.exists():
+            # Gather current crates — store full track lists for revert support
+            subcrates = serato_dir / 'Subcrates'
+            if subcrates.exists():
+                for crate_file in subcrates.rglob('*.crate'):
+                    try:
+                        from cratesort.src.serato.crate_reader import CrateReader
+                        reader = CrateReader(serato_dir)
+                        tracks, _ = reader._read_tracks(crate_file)
+                        self._current_crates[str(crate_file)] = tracks
+                    except Exception:
+                        self._current_crates[str(crate_file)] = None
+
+            checkpoint = load_checkpoint(serato_dir)
+            if checkpoint is None:
+                save_checkpoint(serato_dir, self._current_crates)
+            else:
+                try:
+                    self._checkpoint_timestamp = datetime.fromisoformat(
+                        checkpoint.get('timestamp', '')
+                    )
+                except Exception:
+                    pass
+                self._detected_changes = detect_changes(self._current_crates, checkpoint)
+                # Attach mtime of each changed .crate file so the dialog can show it
+                for change in self._detected_changes:
+                    crate_path = Path(change.get('crate_path', ''))
+                    if crate_path.exists():
+                        try:
+                            change['mtime'] = datetime.fromtimestamp(
+                                crate_path.stat().st_mtime
+                            )
+                        except Exception:
+                            change['mtime'] = None
+                    else:
+                        # Removed crate — fall back to checkpoint timestamp
+                        change['mtime'] = self._checkpoint_timestamp
+                if self._detected_changes:
+                    self._sync_pending = True
+                else:
+                    save_checkpoint(serato_dir, self._current_crates)
+
     def _show_dashboard(self) -> None:
         try:
             if self._scan_cancelled or self._summary is None:
                 return
+            self._check_serato_sync()
             self._populate_dashboard()
             self._stack.setCurrentIndex(2)
             self.scan_finished.emit()
-            self.status_message.emit('Library synced. Ready.', 'green')
+            if self._sync_pending:
+                self.status_message.emit('Serato library changes detected. Review required.', 'amber')
+            else:
+                self.status_message.emit('Library synced. Ready.', 'green')
         except Exception as exc:
             import traceback
             print(f'[CrateSort] _show_dashboard error: {exc}\n{traceback.format_exc()}')
+
+    def _on_review_sync_clicked(self) -> None:
+        serato_dir = self._library_path / '_Serato_' if self._library_path else None
+        dialog = _ChangeReviewDialog(
+            self._detected_changes,
+            serato_dir,
+            self._current_crates,
+            self._checkpoint_timestamp,
+            self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Dialog handled checkpoint save internally after executing reverts.
+            # Re-scan so the inventory and Crates tab reflect any reverted crate files.
+            self._sync_pending = False
+            if self._library_path:
+                self.start_scan(self._library_path)
+            else:
+                self._populate_dashboard()
+            self.status_message.emit('Library synced. Ready.', 'green')
+
+    def _build_sync_warning_banner(self) -> QWidget:
+        banner = QFrame()
+        banner.setStyleSheet(
+            'QFrame { background-color: #2a2218; border: 1px solid #D17D34; border-radius: 8px; }'
+        )
+        layout = QHBoxLayout(banner)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+        
+        icon_lbl = QLabel('⚠️')
+        icon_lbl.setStyleSheet('font-size: 16px; border: none; background: transparent;')
+        layout.addWidget(icon_lbl)
+        
+        msg_lbl = QLabel(
+            'Changes detected in Serato library since last CrateSort session. '
+            'Please review and sync to continue.'
+        )
+        msg_lbl.setStyleSheet('color: #f1e3c8; font-size: 13px; font-weight: 500; border: none; background: transparent;')
+        layout.addWidget(msg_lbl)
+        
+        layout.addStretch()
+        
+        btn = QPushButton('Review && Sync…')
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(self._on_review_sync_clicked)
+        btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; border-radius: 4px; padding: 6px 14px; font-weight: 600; font-size: 12px; min-width: 170px; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        layout.addWidget(btn)
+        
+        return banner
 
     def _on_scan_error(self, message: str) -> None:
         self._scan_label.setText('Scan failed')

@@ -29,10 +29,9 @@ CrateSort is the single writer. Serato is the reader. CrateSort handles all orga
 - **Always run prompts at Sonnet high effort.** Medium effort produces incomplete reads and introduces bugs. High effort is required for this codebase.
 - **Read every referenced file completely before writing any code.** Do not skim. Verify every column constant index, every widget reference, every signal connection before using it.
 - **Verify imports before using any class or module.** If a class is not already imported in the target file, add it to the imports before using it. Never use a class without first confirming it exists in the import block.
-- **Every Claude Code prompt must be delivered as a markdown (.md) file.** Never paste code or instructions directly into chat as inline code blocks — always write a proper prompt file.
 - **GUI from day one.** No terminal-only phase.
 - **Modular architecture.** Every feature is a module that can be independently developed and (in the future) gated behind a subscription tier.
-- **Claude Code for execution. Planning chat for strategy/design.** The owner (Jace) architects in a separate Claude chat, then provides detailed prompts to Claude Code.
+- **For small visual-only changes (height, color, spacing): read the exact lines, change only those lines, do not reason about surrounding layout or touch other files.**
 
 ---
 
@@ -55,30 +54,53 @@ CrateSort is the single writer. Serato is the reader. CrateSort handles all orga
 - **Orange accent / selection**: `#D17D34`
 - **Selected crate / warm brown**: `#573d26`
 - **Teal action color**: `#428175`
+- **Red / cancel / destructive**: `#C75B5B`
 - **Row separator**: `#383838`
 - **Grid lines**: `#383838`
 - **Branch connector lines**: `#4a4a4a`
 
-### Teal = Action (critical rule)
+### Color rules (critical)
 
-Teal (`#428175`) is the action color throughout the entire app. Any time something is happening or has just happened, it must be teal:
-- Drag indicator lines showing drop targets
-- Footer status text after any operation
-- Inline edit flashes when a cell edit is committed
-- Undo/Redo buttons when active/available
+- **Teal (`#428175`) = action.** Drag indicators, status confirmations, active Undo/Redo buttons, teal flashes on inline edits.
+- **Orange (`#D17D34`) = selection / CTA.** Selected crate highlight, step numbers, New Crate button, primary action cards.
+- **Red (`#C75B5B`) = cancel / undo / destructive.** Every Cancel, Rollback, Revert, Delete, and Stop button. Hover: `#b24c4c`. Pressed: `#9c3b3b`. No exceptions.
+- **Never swap teal and orange roles.**
 
-Everything else is informational and uses the standard cream/muted palette. Orange (`#D17D34`) is the selection color. Never swap these roles.
+### Button hover rule
+
+All teal buttons get **darker** on hover, never lighter. `#428175` → hover `#38706a` → pressed `#2d6358`. This applies to every teal button across all views including modals and popups.
 
 ### Track table visual standard
 
 All track listing tables across the entire app must use:
 - `setAlternatingRowColors(True)`
 - Base color: `#242424`, AlternateBase: `#2a2a2a`
-- Full grid lines (both vertical and horizontal): `gridline-color: #383838`
+- Full grid lines: `gridline-color: #383838`
 - `setShowGrid(True)`
-- Row height: 36px (`setDefaultSectionSize(36)`, `setMinimumSectionSize(36)`, `setMaximumSectionSize(36)`)
-- Column header height: 36px (`horizontalHeader().setFixedHeight(36)`)
+- Row height: 36px
+- Column header height: 45px (`horizontalHeader().setFixedHeight(45)`)
 - For QTreeWidget track tables: include `QTreeWidget::branch { border-bottom: 1px solid #383838; }` and hover/selected branch states to prevent left-edge gaps
+
+---
+
+## Nav structure (locked)
+
+6 items in order. Content stack index matches nav index exactly.
+
+| Nav index | ID | Label | Icon | Content widget |
+|---|---|---|---|---|
+| 0 | `dashboard` | Dashboard | `⌂` (+ SVG) | `DashboardWidget` |
+| 1 | `classification` | Classification | `🔍` (+ SVG) | `ClassifierView` |
+| 2 | `library` | Library | `📚` (+ SVG) | `LibraryBrowserView` |
+| 3 | `crates` | Crates | `📦` (+ SVG) | `CrateManagerView` |
+| 4 | `organize` | Organize | `📁` (+ SVG) | `OrganizeView` |
+| 5 | `settings` | Settings | `⚙` (+ SVG) | `SettingsView` |
+
+SVG icons live in `cratesort/assets/icons/` as `icon-{nav_id}.svg`. All are filled orange (`#D17D34`).
+
+Nav buttons load SVGs via `QIcon(str(icon_path))` at `16×16`. The `_on_nav(index)` handler calls `.load()` on the appropriate view. Classification (index 1) guards against "no library loaded" and redirects to Dashboard with a status message.
+
+After reorg or rollback completes, `OrganizeView.reorg_completed` fires → `MainWindow._on_reorg_completed()` → `_dashboard.start_scan(lib)` to rebuild inventory with new file paths.
 
 ---
 
@@ -87,77 +109,87 @@ All track listing tables across the entire app must use:
 The launch screen is a context-aware single screen — no popup dialog. It lives in `DashboardWidget._build_welcome()` as stack index 0.
 
 ### First launch (no saved library path):
-- Shows `cs-logo-mascot-stacked.svg` logo, "Get your shit together." tagline, instruction text, single "Select Music Library…" button
+- Shows `cs-logo-mascot-stacked.svg` logo, tagline, single "Select Music Library…" button
 
 ### Returning user (saved library path exists):
-- Shows same logo and tagline
-- Library path displayed as plain muted text (no box or frame)
+- Same logo and tagline
+- Library path as plain muted text
 - "Load Library" primary orange button
 - "Choose Different Library" secondary muted button
-- "Always load without asking" checkbox — when checked + Load Library clicked, saves `always_load_last = True` to QSettings and skips this screen on next launch
+- "Always load without asking" checkbox — saves `always_load_last = True` to QSettings
 
 ### Key rules:
 - `_LaunchDialog` has been deleted — do not recreate it
 - No popup modal on launch under any circumstances
-- Logo path: `assets/logos/cs-logo-mascot-stacked.svg`
 - `always_load_last` preference stored in QSettings key `always_load_last` (bool)
 
 ---
 
 ## Dashboard Architecture
 
-The dashboard (`src/gui/dashboard.py`) is a session-aware command center. Stack index 2 in `DashboardWidget`. Content is injected by `_populate_dashboard()` after a successful library scan.
+`src/gui/dashboard.py` — session-aware command center. Stack index 2 in `DashboardWidget`.
 
 ### Sections (in order):
 
-1. **Stat Cards** (`_build_stat_cards_section()`) — four cards: Total Tracks, Total Crates, Unique Artists, Hours of Music. Numbers animate from 0 on load with cubic ease-out via `QTimer`. Click any card to replay its animation. Uses `_AnimatedStatCard` widget class.
+1. **Stat Cards** (`_build_stat_cards_section()`) — four cards: Total Tracks, Total Crates, Unique Artists, Hours of Music. Count-up animation on load. No icon labels — numbers and labels only. `_AnimatedStatCard(target, suffix, label)` — note: no icon parameter.
 
 2. **Action Cards** (`_build_action_cards_section()`) — two groups:
-   - **Go To** (4 cards): Change Library, Classify Library, Manage Crates, Organize Media. Large muted step numbers (01–04) turn orange on hover. Uses `_WorkflowCard` widget class.
-   - **Create** (2 cards): New Crate, New Smart Crate. Orange accent treatment. Uses `_ClickableCard` widget class.
+   - **Go To** (3 cards, not 4): `01 Classify Library`, `02 Manage Crates`, `03 Organize Media`. "Change Library" card was removed — that lives in Settings now.
+     - Step numbers always orange (visible at rest, not just on hover).
+     - On hover: border turns orange, background warms slightly.
+     - Large SVG icon (100px, `AlignTop`) on the right side of each card: icon-classification.svg, icon-crates.svg, icon-organize.svg. Dimmed (`#2a2a2a`) at rest, full orange on hover.
+     - Card height: `setMinimumHeight(230)`.
+   - **Create** (2 cards): `＋ New Crate` (orange), `✦ New Smart Crate` (orange). Both use the same orange warm-tinted base/hover style (`#2a2218` base, orange border on hover).
 
-3. **Recent Activity** (`_build_activity_section()`) — combined feed of crate changes (from checkpoint diff) and recently added tracks (from `read_track_add_dates()`), last 30 days, capped at 10 items. Teal dot = addition/rename, orange dot = removal.
+3. **Recent Activity** (`_build_activity_section()`) — combined feed: crate changes, recently added tracks, and reorganization events (teal dot = reorg/addition, orange dot = rollback/removal). Last 30 days, capped at 10 items.
 
 4. **Footer** (`_build_footer_bar()`) — last session timestamp + Serato sync status. Do not modify.
 
-### Dashboard signals on DashboardWidget:
-- `library_path_changed` — emitted when library path changes
-- `scan_started` — emitted when scan begins
-- `scan_finished` — emitted when scan completes
-- `classify_requested` — emitted by Classify Library card
-- `status_message` — emitted for footer status updates
-- `crates_requested` — emitted by Manage Crates card (connect to Crates tab navigation)
-- `organize_requested` — emitted by Organize Media card (connect to Organize tab navigation)
-- `new_crate_requested` — emitted by New Crate card (connect to new crate dialog)
-- `new_smart_crate_requested` — emitted by New Smart Crate card (connect to smart crate dialog)
+### Serato sync warning:
+
+When changes are detected on launch, an amber banner appears with a "Review && Sync…" button (min-width 170px, `&&` required for literal ampersand in PyQt6). The `_ChangeReviewDialog` shows each change with timestamp and a **Revert** button. Revert marks the change as pending (row grays out, button becomes Undo). On "Sync && Proceed": reverts execute, checkpoint saves, re-scan triggers. On Cancel: nothing written.
 
 ### Checkpoint system (`src/utils/checkpoint.py`):
-- `save_checkpoint(serato_dir, crate_data)` — writes `_CrateSort/checkpoint.json` with crate paths → track counts, timestamp
-- `load_checkpoint(serato_dir)` — returns dict or None
-- `detect_changes(current, previous)` — normalized path matching (handles mount point/case/separator differences), None guard for failed scans. Returns list of `{type, description}` dicts.
-- Change types: `crate_added`, `crate_removed`, `renamed`, `tracks_added`, `tracks_removed`
-- **Bug 2 fixed**: path normalization via `_normalize_path()` helper; failed scans stored as `None` (not `0`) to prevent false "tracks removed" reports
 
-### Animation classes (module-level in dashboard.py):
-- `_AnimatedStatCard(QFrame)` — stat card with count-up animation. `start_animation(duration_ms)` triggers the effect. `mousePressEvent` replays it.
-- `_WorkflowCard(QFrame)` — Go To action card with `enterEvent`/`leaveEvent` for step number hover color change.
-- `_ClickableCard(QFrame)` — base clickable card used for Create group.
+- Schema: `{crate_path: [track_path, ...]}` — stores full track lists, not just counts.
+- Backward compatible: old checkpoints with integer values are handled by `_count(val)` / `_track_list(val)` helpers.
+- `detect_changes()` returns dicts with `prev_tracks` (list for revert) and `old_crate_path` (for rename revert).
+- `_ChangeReviewDialog` uses `prev_tracks` to restore crate files on revert.
 
-### Things that must not be modified in the dashboard:
-- `_build_dashboard()` — scroll container only, do not touch
-- `_build_scanning()` — stack index 1, do not touch
-- `_build_welcome()` — stack index 0, do not touch
-- `_build_footer_bar()` — correct as-is, do not touch
+### Dashboard layout rule:
+
+`_dashboard_layout` uses `addStretch()` at the end — do NOT add `setAlignment(AlignTop)` to it. The stretch absorbs extra space. Adding AlignTop conflicts with addStretch and causes gaps at large window sizes. Section widgets must use `setMinimumHeight`, not `setFixedHeight`, so they don't over-constrain the layout.
 
 ---
 
 ## Crate Manager — Current Architecture
 
-### Crate tree
+### New crate buttons
 
-The crate tree (`self._crate_tree`, `QTreeWidget`) uses a fully custom `CrateItemDelegate(QStyledItemDelegate)` for all item rendering. **Do not use `setItemWidget` or stylesheet-based selection coloring** — macOS overrides both. The delegate's `paint()` method is the single source of truth for all crate tree visual rendering.
+Two buttons at the top of the crate panel (below the search bar), inside a `QWidget` container with `setFixedHeight(45)` and `setContentsMargins(8, 5, 8, 5)`:
+- **＋ New Crate** — orange (`#D17D34`), calls `_on_new_crate()`
+- **✦ Smart Crate** — teal (`#428175`), calls `_on_new_smart_crate()` (Pro stub)
 
-#### CrateItemDelegate — four states
+The container is fixed at 45px. The track table header is also `setFixedHeight(45)` so they align side-by-side in the splitter.
+
+### Default crate selection
+
+On first visit to Crates tab: defaults to "All Tracks" (`_ALL_TRACKS_KEY`).
+On return visits: restores `_last_selected_path` or `_current_crate_path`.
+Resets to All Tracks on app restart (in-memory only, not persisted).
+Implemented via: `restore_sel = self._last_selected_path or self._current_crate_path or _ALL_TRACKS_KEY` in `load()`, followed by the same post-rebuild track-load block as `_refresh()`.
+
+### Track-to-crate drag and drop
+
+Tracks can be dragged from the track panel and dropped onto a crate in the crate tree. Key details:
+- `setDragDropMode(NoDragDrop)` must be called BEFORE `setAcceptDrops(True)` — NoDragDrop internally calls `setAcceptDrops(false)` and propagates to viewport, overriding any prior True call.
+- Correct order: `setDragEnabled(False)` → `setDragDropMode(NoDragDrop)` → `setDropIndicatorShown(False)` → `setAcceptDrops(True)` → `viewport().setAcceptDrops(True)`
+- The eventFilter handles `DragEnter`, `DragMove`, `DragLeave`, `Drop` events on the crate tree viewport.
+- On hover during drag: target crate lights up with `STATE_E` (teal-tinted bg `#1a3530`, teal left bar). Prior state saved and restored on leave/drop.
+- Ghost drag pixmap: teal pill showing track title (single) or "N tracks" (multi), built in `startDrag()` using `QFontMetrics` + `QPainter`.
+- Multi-track drag: `startDrag()` collects all selected rows by `{idx.row() for idx in self.selectedIndexes()}`.
+
+### CrateItemDelegate — five states
 
 | State | Trigger | Background | Left Bar |
 |-------|---------|------------|----------|
@@ -166,125 +198,139 @@ The crate tree (`self._crate_tree`, `QTreeWidget`) uses a fully custom `CrateIte
 | B | Selected (no active sub-crate) | `#573d26` | `#D17D34`, 5px |
 | C | Parent of active sub-crate | `#000000` | `#D17D34`, 5px |
 | D | Selected sub-crate | `#573d26` | `#D17D34`, 5px |
-
-State transitions are managed in `_on_tree_selection_changed`. Only `_prev_selected_item` and `_prev_parent_item` are reset on each selection change — never the entire tree. Maximum 4 delegate updates per selection change regardless of library size.
-
-The delegate also draws the expand/collapse arrow (▶/▼) right-aligned in each row for parent crates.
-
-#### Crate tree row height
-
-Controlled by `CrateItemDelegate.sizeHint()` returning `QSize(w, 36)`. Do not use stylesheet `height` rules on `QTreeWidget::item` — they are unreliable on macOS. `setUniformRowHeights(True)` is set on the tree.
-
-#### Crate tree expand/collapse
-
-- **Single click** = select the crate, load its tracks. Never auto-expand.
-- **Double click** = toggle expand/collapse. Does not change selection or reload tracks.
-- `setChildIndicatorPolicy(ShowIndicator)` is set on every item with children.
-
-#### Sub-crate background grouping
-
-Sub-crates use `#222222` as their State A background (vs `#2F2F2F` for top-level crates). This creates a visual grouping even when the parent isn't the active selection. Detected in `paint()` via `index.parent().isValid()`.
+| E | Track drag hover target | `#1a3530` | `#428175`, 5px + teal inset border |
 
 ### Track panel
 
-The track panel (`self._track_table`, `_ReorderableTable(QTableWidget)`) has 14 columns:
+14 columns. Header height: 45px. Column widths persist via QSettings (`_SETTINGS_KEY`).
 
-| Index | Name | Notes |
-|-------|------|-------|
-| 0 | # | Position in crate, 1-based integer, numeric sort via UserRole |
-| 1 | Title | |
-| 2 | Artist | |
-| 3 | Album | |
-| 4 | Duration | |
-| 5 | Genre | |
-| 6 | Style Tags | |
-| 7 | BPM | |
-| 8 | Date Added | Pulled from Serato `database V2` via `src/serato/database_reader.py`. Stores Unix timestamp in UserRole for correct chronological sort. Serato stores paths using `\uf022` (U+F022) as a substitute for ` : ` in folder names — normalize on read. Some tracks stored with absolute paths, others relative — handle both. |
-| 9 | Format | |
-| 10 | Year | |
-| 11 | Bitrate | |
-| 12 | Comments | Actual ID3 comment metadata only — never inject status text here |
-| 13 | File Path | Shows actual path for resolved tracks; "Not found in library" for unresolved |
-
-Column widths persist via QSettings (`_SETTINGS_KEY`). Auto-sizers only run on first launch (no saved state).
-
-#### Track panel sort behavior
-
-- The `#` column sorts numerically (integer UserRole), not as string
-- Sorting by any column is visual and temporary — never rewrites the `.crate` file order
-- The active sort column and direction persist globally across all crates for the session (`_sort_col`, `_sort_order`)
-- After any operation (add, remove, reorder), the active sort is reapplied
-
-#### Track drag reorder
-
-`_ReorderableTable` supports drag-to-reorder within the track panel:
-- Shows a teal (`#428175`) horizontal drop indicator line between rows
-- On drop: captures new order of track paths, calls `crate_writer.reorder_tracks()`, then **reloads the crate from disk** via `_refresh()` — never manipulates table rows directly
-- This reload-after-write approach is mandatory to prevent data corruption
-
-#### Parent crate track panel
-
-When a parent crate is selected, the track panel shows ALL tracks — the parent's own tracks plus every sub-crate's tracks merged into one flat deduplicated list. Uses `_collect_tracks_recursive()`.
-
-### Crate drag and drop
-
-Fully manual drag implementation — Qt's built-in tree drag is disabled (`NoDragDrop`). Mouse events tracked via viewport event filter.
-
-- **Sibling reorder**: teal horizontal line between crate rows; on drop, order saved to `neworder.pref` (UTF-16 BE) in `_Serato_/` folder
-- **Reparent**: hover over target crate for 1.5 seconds → auto-expand → drop inside. Target crate highlights with teal border during hover delay.
-- **Promote to top level**: dropping a sub-crate beside a top-level item un-nests it
-- **Crate cannot be dropped onto itself**
-
-### Crate CRUD — confirmation dialogs
-
-Every destructive action requires a modal confirmation dialog centered on screen, blocking all interaction:
-- **Delete empty crate**: "Delete '[Name]'? This cannot be undone." → Delete / Cancel
-- **Delete populated crate**: "Delete '[Name]'? It contains [X] tracks. This cannot be undone." → Delete / Cancel
-- **Remove track(s) from crate**: "Remove '[Title]' from [Crate]?" or "Remove [X] tracks from [Crate]?" → Remove / Cancel
-
-### Export Crate to Folder (paid tier)
-
-Right-click any crate → **"Export Crate to Folder..."**
-
-- Exports only the crate that was right-clicked — never the parent, never sub-crates
-- Opens a native OS folder picker with no default location — user picks freely (local drive, external drive, USB, anywhere)
-- CrateSort creates a new folder at the chosen destination named exactly after the crate
-- All files from that crate are copied flat into the folder — no Genre/Artist subfolders
-- Originals are never moved or modified
-- Filename collision handling: if two tracks share the same filename, the second copy is renamed with a number suffix (e.g. `Inner City Blues (2).mp3`). Artist name is never appended — filename = song title only, always.
-- Teal footer confirms on completion: "Exported 23 tracks to 'Gangsta Rap'"
-- **Paid tier feature** — consistent with all other file operation features
-
-### Tree state preservation
-
-Expanded/collapsed state and selected crate are preserved after every operation. On tab switch away and return, `showEvent` re-triggers `_on_tree_selection_changed` to reapply delegate colors.
+| Index | Name |
+|---|---|
+| 0 | # (position, numeric sort) |
+| 1 | Title |
+| 2 | Artist |
+| 3 | Album |
+| 4 | Duration |
+| 5 | Genre |
+| 6 | Style Tags |
+| 7 | BPM |
+| 8 | Date Added |
+| 9 | Format |
+| 10 | Year |
+| 11 | Bitrate |
+| 12 | Comments |
+| 13 | File Path |
 
 ---
 
-## Undo/Redo System
+## Organize View — Current Architecture
 
-- `src/utils/undo_manager.py` — Command pattern, 10-state stack, global across tabs
-- 8 command classes: `AddTracksCommand`, `RemoveTracksCommand`, `ReorderTracksCommand`, `CreateCrateCommand`, `DeleteCrateCommand`, `RenameCrateCommand`, `ReorderCratesCommand`, `ReparentCrateCommand`
-- Undo/Redo buttons in sidebar below album art — teal when active, gray when inactive
-- Cmd+Z / Cmd+Shift+Z keyboard shortcuts
-- Auto-tab switch when undoing a cross-tab action
-- Teal footer text describes what was undone/redone
+`src/gui/organize_view.py` — `QStackedWidget` across 5 states:
+
+- **State 0: Gate / Landing Screen** — always shown on tab visit. Shows classification status (toggles `_gate_needs_class_widget` / `_gate_ready_widget`) and a history list of up to 3 recent reorganizations (`_history_layout`). Each history row shows date, file count, and either "Rolled back on [date]" or a red **Rollback** button. `_refresh_gate_screen()` is called on every `load()` and every `_on_back_to_dashboard()`. `load()` never auto-transitions to planning — user clicks "Plan Reorganization…".
+- **State 1: Planning Screen** — `_PlanWorker` thread builds the plan.
+- **State 2: Preview Screen** — animated stat cards + operations table.
+- **State 3: Executing Screen** — copy-verify-delete progress.
+- **State 4: Done Screen** — success or rollback-in-progress state. Has `self._done_back_btn` (re-enabled after rollback finishes) and `self._rollback_btn`.
+
+### Operations table action labels:
+
+| Condition | Label | Color |
+|---|---|---|
+| Filename changed + folder changed | Move & Rename | `#d98c52` peach |
+| Filename changed + folder same | **Rename** | `#c9a87a` warm amber |
+| Metadata only + folder changed | Move & Tag | `#9fa4c7` lavender |
+| Metadata only + folder same | **Tag Update** | `#9fa4c7` lavender |
+| Neither | Move Only | `#e89ebb` pink |
+
+### Rollback from history
+
+`_on_rollback_requested(log_path=None)` — accepts an optional `Path`. If a Path is passed (from history row), sets `_rollback_log_path = log_path`, transitions to State 4 in in-progress mode (labels set, rollback btn hidden, back btn disabled). Guard: `isinstance(log_path, Path)` distinguishes real Path from QPushButton's `checked=False` signal arg.
+
+### reorg_completed signal
+
+`OrganizeView.reorg_completed` pyqtSignal — emitted from `_on_back_to_dashboard()` only (not from cancel). Connected in MainWindow to `_on_reorg_completed()` which calls `_dashboard.start_scan(lib)`. This re-scans the library after a reorg so the Crates tab immediately reflects new file paths without requiring a restart.
+
+---
+
+## File Organizer — Current Architecture
+
+`src/core/file_organizer.py`
+
+### Path rewriter fix (critical)
+
+`.crate` files store paths in two formats:
+1. **Relative** to library root: `MP3/Blues/track.mp3`
+2. **Absolute**: `/Users/.../MP3/Blues/track.mp3`
+
+`_update_crate_paths()` must supply both variants for each moved file. Serato also inconsistently encodes `:` as `` (U+F022) in some crate files. `PathRewriter._process_crate()` normalizes stored paths via `inner_val.replace('', ':')` before lookup so both encoding variants match.
+
+### Stems handling
+
+- `_execute_move()` moves paired `.serato-stems` files alongside their audio file.
+- `.serato-stems` packages can be **files OR directories** — all code must handle both.
+- `_will_be_empty()` ignores stems (file or dir) when checking if a source directory is empty.
+- `_clean_empty_dir_recursive()` quarantines orphaned stems to `_CrateSort/orphaned_stems/` (preserving relative path structure) before removing empty dirs. Uses `_quarantine_stems_in()` which checks `child.name.lower().endswith('.serato-stems')` — NOT `child.is_dir()`.
+
+### Title tag sync
+
+When `build_plan()` generates an operation, it also adds a `MetadataChange(field='title')` to sync the ID3 title tag with the clean destination filename stem. This prevents `FilenameCleaner` from re-proposing the same rename on every subsequent run.
+
+### _sync_metadata_files
+
+Called after every execute and rollback. Updates `classification_session.json` and `library_edits.json` with new file paths so subsequent scans find correct records.
+- Forward (after execute): old path → new path
+- Reverse (after rollback): new path → original path
+- Normalises keys to `Path` objects internally before lookup.
+
+### Rollback log
+
+`RollbackLog` stores `rolled_back_at` ISO timestamp and saves when rollback completes. The Organize gate screen reads this to determine whether to show the Rollback button or a "Rolled back on [date]" label.
+
+### Protected prefixes
+
+`DEFAULT_PROTECTED_PREFIXES = ()` — no folders are protected. The docstring claiming `_`-prefixed folders are skipped is outdated and wrong.
+
+---
+
+## Settings View
+
+`src/gui/settings_view.py` — `SettingsView(QWidget)`
+
+### Signals
+- `library_changed(Path)` — user picked a new library. MainWindow handles: saves to QSettings, calls `_dashboard.start_scan(path)`, navigates to Dashboard.
+- `repair_requested` — triggers `_on_repair_crate_paths()` in MainWindow, which replays all reorg logs through PathRewriter to fix stale crate references.
+
+### Sections
+
+**Your Library**
+- Current library path display
+- Change Library button (orange) — opens folder picker
+- Auto-load on startup checkbox — persists `always_load_last` to QSettings. Uses SVG indicator images from `assets/icons/checkbox-checked.svg` (orange fill + black checkmark) and `assets/icons/checkbox-unchecked.svg`.
+
+**Maintenance**
+- Repair Crate Paths (teal) — replays reorg logs through PathRewriter
+- Reset Track Table Columns (muted) — removes `_SETTINGS_KEY` from QSettings
+
+**About**
+- App name, version, tagline
+- 5-step workflow walkthrough
+
+### load(library_path) must be called in `_on_nav` for index 5.
 
 ---
 
 ## Serato File Format (research confirmed)
 
-- **`.crate` files**: only contain `ptrk` (track path). No timestamps, no metadata.
+- **`.crate` files**: only contain `ptrk` (track path). No timestamps, no metadata. Paths can be relative OR absolute depending on how the crate was created.
 - **`database V2`**: TLV binary format, UTF-16 BE. Contains `uadd` (add timestamp), `pfil` (file path), and full track metadata per `otrk` record.
-- **`neworder.pref`**: UTF-16 BE text. One `[crate]CrateName%%SubcrateName` entry per line between `[begin record]` and `[end record]`. Canonical crate display order that Serato reads on launch.
-- **`collapsed.pref`**: tracks which parent crates are expanded/collapsed in Serato UI.
-- Serato uses `\uf022` (U+F022 private-use) as a substitute for ` : ` in folder names within database V2 paths.
+- **`neworder.pref`**: UTF-16 BE text. Canonical crate display order.
+- **`collapsed.pref`**: tracks crate expansion states.
+- Serato uses `` (U+F022 private-use) as a substitute for `:` in folder names — inconsistently applied. Always normalize on read by replacing `` → `:` before path comparisons.
 
 ---
 
 ## Genre taxonomy (12 parent genres)
-
-These are the only folder-level categories. Style distinctions live in metadata and Serato crates.
 
 | Genre | Key styles |
 |-------|-----------|
@@ -310,43 +356,15 @@ These are the only folder-level categories. Style distinctions live in metadata 
 
 ---
 
-## Serato integration rules
-
-- **Serato's edits always win** on startup sync. CrateSort absorbs changes, never overwrites.
-- **Serato custom ID3 frames** (cue points, beat grids, loops, color tags, markers) are NEVER modified under any circumstances.
-- **Crate file order** is only ever changed by explicit user drag reorder actions. All other sorting is visual and temporary.
-- **CrateSort owns crate structure.** Crate order, hierarchy, names — all controlled by CrateSort. Serato reads whatever CrateSort writes.
-- **Crate order is written to `neworder.pref`** (UTF-16 BE) in the `_Serato_/` folder. `neworder.pref` is the canonical display order that Serato reads on launch.
-
-### Library and Serato directory architecture (locked)
-
-**The `_Serato_` folder must live on the same drive as the media files.** This is the only architecture that works correctly for DJs who hot-swap drives between computers.
-
-- CrateSort points at a single root directory (the media drive root)
-- CrateSort expects `_Serato_/` to exist at that same root alongside the media folders
-- Everything travels together — media files and Serato data on the same drive
-- When the DJ plugs into any computer, they Option-launch Serato and point it at the drive's `_Serato_/` folder
-
-**CrateSort never auto-creates the `_Serato_/` folder structure.** If `_Serato_/` is not found at the media root, CrateSort displays a guided message directing the user to copy or initialize `_Serato_/` at the drive root.
-
-### Startup sync sequence (not yet built)
-
-On every launch, CrateSort will:
-1. Read the `_Serato_/` folder on the drive
-2. Compare against its last known checkpoint
-3. Surface any changes for the user to review
-4. User confirms before CrateSort unlocks (Amber → Change Review → Green)
-
----
-
 ## File organization rules
 
 - CrateSort works in place — reorganizes within the user's designated directory
 - Genre/Artist/track hierarchy. No style subfolders on disk.
-- Filename = song title only.
+- **Filename = song title only.** Artist prefix is stripped from both the filename AND the ID3 title tag.
 - "The" moved to end with comma: `The Doors` → `Doors, The/`
+- macOS: `/` in artist names replaced with `:` in filesystem (Finder renders `:` as `/`). Implemented in `sanitize_filename()` via `sys.platform == 'darwin'` check.
 - No empty genre folders
-- No file deletion outside user-approved duplicate consolidation (quarantine, not permanent delete)
+- No file deletion outside user-approved duplicate consolidation
 - No independent file moves outside user-triggered reorganization
 
 ---
@@ -357,12 +375,42 @@ On every launch, CrateSort will:
 - **The `.crate` file order** — only changed by explicit user drag reorder, never by sorting
 - **CrateItemDelegate** — the single source of truth for crate tree rendering; never revert to setItemWidget or stylesheet selection coloring
 - **Reload-after-write pattern** — after any crate content modification, reload from `.crate` file rather than manipulating table rows directly
-- **Track panel column constants** — verify every index before use; they shift when columns are added
+- **Track panel column constants** — verify every index before use
 - **Column width persistence** — QSettings save/restore; auto-sizers only run on first launch
 - **Confirmation dialogs** — every destructive action requires modal confirmation before executing
-- **Teal = action, Orange = selection** — never swap these color roles
-- **36px row height** — app-wide standard; never change without updating all views simultaneously
+- **Teal = action, Orange = selection/CTA, Red = cancel/destructive** — never swap these roles
+- **45px header/button-row height** — track table header and crate panel new-crate button container both fixed at 45px
 - **`_LaunchDialog` is deleted** — do not recreate it or any other launch popup
+- **`addStretch()` in `_dashboard_layout`** — do not add `setAlignment(AlignTop)` to this layout; it conflicts with addStretch at large window sizes
+- **`setDragDropMode(NoDragDrop)` before `setAcceptDrops(True)`** — NoDragDrop overrides acceptDrops; order is mandatory
+
+---
+
+## Undo/Redo System
+
+- `src/utils/undo_manager.py` — Command pattern, 10-state stack, global across tabs
+- 8 command classes: `AddTracksCommand`, `RemoveTracksCommand`, `ReorderTracksCommand`, `CreateCrateCommand`, `DeleteCrateCommand`, `RenameCrateCommand`, `ReorderCratesCommand`, `ReparentCrateCommand`
+- Undo/Redo buttons in sidebar below album art — teal when active, gray when inactive
+- Cmd+Z / Cmd+Shift+Z keyboard shortcuts
+
+---
+
+## Serato integration rules
+
+- **Serato's edits always win** on startup sync. CrateSort absorbs changes, never overwrites.
+- **Serato custom ID3 frames** (cue points, beat grids, loops, color tags, markers) are NEVER modified under any circumstances.
+- **Crate file order** is only ever changed by explicit user drag reorder actions.
+- **CrateSort owns crate structure.** Crate order, hierarchy, names — all controlled by CrateSort.
+- **The `_Serato_` folder must live on the same drive as the media files.**
+- **CrateSort never auto-creates the `_Serato_/` folder structure.**
+
+### Startup sync (built)
+
+On every launch after scan, CrateSort:
+1. Reads current `.crate` files and compares to `checkpoint.json`
+2. If changes detected: shows amber banner and `_ChangeReviewDialog` with per-change Revert buttons
+3. User can revert individual changes before syncing
+4. On "Sync && Proceed": reverts execute, checkpoint saves with track lists, re-scan triggers
 
 ---
 
@@ -370,7 +418,7 @@ On every launch, CrateSort will:
 
 - **Free tier**: Serato crate management (view, create, rename, duplicate, delete, drag tracks)
 - **Paid tier** (~$5-10/month or ~$100/year): Drive reorganization, Export Crate to Folder, duplicate detection, style suggestions, smart crate builder, CrateView bridge
-- Architecture supports feature gating without rewrites.
+- Smart Crate button exists (✦) in the Crates tab and Dashboard but shows a "Pro feature" stub — not yet built.
 
 ---
 

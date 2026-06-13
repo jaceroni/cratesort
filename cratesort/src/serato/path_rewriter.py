@@ -140,8 +140,11 @@ class PathRewriter:
             if tag == 'otrk':
                 inner_records: list[tuple[str, Any]] = []
                 for inner_tag, inner_val in value:
-                    if inner_tag == 'ptrk' and inner_val in change_map:
-                        new_path = change_map[inner_val]
+                    # Serato inconsistently stores ':' as U+F022 in some crates.
+                    # Normalise before lookup so both variants match the same key.
+                    normalised = inner_val.replace('', ':') if inner_tag == 'ptrk' else inner_val
+                    if inner_tag == 'ptrk' and normalised in change_map:
+                        new_path = change_map[normalised]
                         crate_changes.append(PathChangeRecord(
                             crate_full_path=crate_display,
                             crate_file=crate_file,

@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Folder name prefixes that mark a folder as protected by default.
 # Files inside protected folders are catalogued but never moved.
-DEFAULT_PROTECTED_PREFIXES = ('_',)
+DEFAULT_PROTECTED_PREFIXES = ()
 
 
 # ---------------------------------------------------------------------------
@@ -178,24 +178,57 @@ class RollbackLog:
         errors: list[str] = []
 
         # Reverse file moves: destination → source
+        dest_to_src = {}
         for entry in reversed(self._data['moves']):
             if entry['status'] != 'completed':
                 skipped += 1
                 continue
             src = Path(entry['destination'])
             dst = Path(entry['source'])
+            dest_to_src[entry['destination']] = entry['source']
             try:
                 if not src.exists():
                     errors.append(f"Rollback source missing: {src}")
                     failed += 1
                     continue
                 dst.parent.mkdir(parents=True, exist_ok=True)
+
+                # Rollback stems if they exist
+                stems_src = _find_stems_file(src)
+                if stems_src:
+                    stems_dst = dst.parent / (dst.stem + stems_src.name[len(src.stem):])
+                    if stems_dst.exists():
+                        if stems_dst.is_dir():
+                            shutil.rmtree(str(stems_dst))
+                        else:
+                            stems_dst.unlink()
+                    shutil.move(str(stems_src), str(stems_dst))
+                    logger.info("Rolled back stems: %s → %s", stems_src.name, stems_dst)
+
                 shutil.move(str(src), str(dst))
                 logger.info("Rolled back: %s → %s", src.name, dst)
                 restored += 1
             except Exception as exc:
                 errors.append(f"Failed to roll back {src}: {exc}")
                 failed += 1
+
+        # Restore original metadata changes
+        for change in self._data.get('metadata_changes', []):
+            orig_path_str = dest_to_src.get(change['file_path'])
+            if not orig_path_str:
+                continue
+            orig_path = Path(orig_path_str)
+            if not orig_path.exists():
+                continue
+            try:
+                ext = orig_path.suffix.lower()
+                audio = mutagen.File(orig_path, easy=False)
+                if audio is not None:
+                    _write_metadata_tag(audio, ext, change['field'], change['value_before'])
+                    audio.save()
+                    logger.info("Rolled back metadata tag %s on %s", change['field'], orig_path.name)
+            except Exception as exc:
+                errors.append(f"Failed to revert metadata for {orig_path.name}: {exc}")
 
         # Restore Serato crate backups
         for backup_str in self._data.get('crate_backup_paths', []):
@@ -216,6 +249,16 @@ class RollbackLog:
         library_root = Path(self._data.get('library_root', ''))
         if library_root.exists():
             self._remove_empty_dirs(library_root)
+
+        # Sync metadata files back to original paths
+        _sync_metadata_files(library_root, dest_to_src)
+
+        # Mark as rolled back and save
+        self._data['rolled_back_at'] = datetime.now().isoformat()
+        try:
+            self.save()
+        except Exception as exc:
+            logger.warning("Failed to save rolled_back_at to log: %s", exc)
 
         return {
             'restored': restored,
@@ -245,7 +288,7 @@ class FileOrganizer:
     The plan is always built first — nothing happens until execute() is called.
     execute() uses copy-verify-delete for safety and writes a rollback log.
 
-    Protected folders (default: any folder starting with '_') are skipped.
+    Protected folders are skipped when protected_prefixes is non-empty. By default no folders are protected — all tracks in inventory are eligible for reorganization.
     """
 
     def __init__(
@@ -325,7 +368,71 @@ class FileOrganizer:
 
             # Metadata changes
             mp = meta_proposals.get(record.path)
-            meta_changes = mp.changes if mp else []
+            meta_changes = list(mp.changes) if mp else []
+
+            # Sync title tag with the clean filename so subsequent runs don't
+            # re-propose the same rename. Applies whether or not the filename changed.
+            clean_title = destination.stem
+            current_title = record.title or ''
+            already_has_title = any(mc.field == 'title' for mc in meta_changes)
+            if not already_has_title and clean_title and current_title != clean_title:
+                meta_changes.append(MetadataChange(
+                    field='title',
+                    current_value=current_title or None,
+                    proposed_value=clean_title,
+                    confidence='HIGH',
+                    reason='Title synced with cleaned filename',
+                ))
+
+            # Add manual user overrides to metadata changes if they differ
+            if hasattr(record, '_original_title') and record.title != record._original_title:
+                meta_changes.append(MetadataChange(
+                    field='title',
+                    current_value=record._original_title,
+                    proposed_value=record.title,
+                    confidence='HIGH',
+                    reason='Manual user override',
+                ))
+            if hasattr(record, '_original_album') and record.album != record._original_album:
+                meta_changes.append(MetadataChange(
+                    field='album',
+                    current_value=record._original_album,
+                    proposed_value=record.album,
+                    confidence='HIGH',
+                    reason='Manual user override',
+                ))
+            if hasattr(record, '_original_bpm') and record.bpm != record._original_bpm:
+                meta_changes.append(MetadataChange(
+                    field='bpm',
+                    current_value=str(record._original_bpm) if record._original_bpm is not None else None,
+                    proposed_value=str(record.bpm) if record.bpm is not None else None,
+                    confidence='HIGH',
+                    reason='Manual user override',
+                ))
+            if hasattr(record, '_original_year') and record.year != record._original_year:
+                meta_changes.append(MetadataChange(
+                    field='year',
+                    current_value=record._original_year,
+                    proposed_value=record.year,
+                    confidence='HIGH',
+                    reason='Manual user override',
+                ))
+            if hasattr(record, '_original_comment') and record.comment != record._original_comment:
+                meta_changes.append(MetadataChange(
+                    field='comment',
+                    current_value=record._original_comment,
+                    proposed_value=record.comment,
+                    confidence='HIGH',
+                    reason='Manual user override',
+                ))
+            if hasattr(record, '_original_artist') and record.artist != record._original_artist:
+                meta_changes.append(MetadataChange(
+                    field='artist',
+                    current_value=record._original_artist,
+                    proposed_value=record.artist,
+                    confidence='HIGH',
+                    reason='Manual artist reassignment',
+                ))
 
             # Crates affected
             crate_rel = record.path.as_posix().lstrip('/')
@@ -438,6 +545,23 @@ class FileOrganizer:
 
             # Skip if destination already exists as a conflict
             if op.destination_path.exists():
+                # Check if it's an identical duplicate (same SHA-256)
+                try:
+                    src_hash = _sha256(op.source_path)
+                    dest_hash = _sha256(op.destination_path)
+                    if src_hash == dest_hash:
+                        op.sha256_source = src_hash
+                        op.sha256_copy = dest_hash
+                        op.source_path.unlink()
+                        op.status = 'completed'
+                        op.executed_at = datetime.now().isoformat()
+                        rlog.log_move(op)
+                        logger.info("Consolidated duplicate: %s (deleted) -> %s", op.source_path.name, op.destination_path)
+                        completed.append(op)
+                        continue
+                except Exception as exc:
+                    logger.warning("Duplicate check failed: %s", exc)
+
                 op.status = 'skipped'
                 op.error = f'Destination already exists: {op.destination_path.name}'
                 skipped.append(op)
@@ -466,14 +590,13 @@ class FileOrganizer:
         if plan.serato_dir and plan.serato_dir.exists() and completed:
             crate_result = self._update_crate_paths(completed, plan.serato_dir, rlog)
 
-        # Clean up approved empty folders
+        # Clean up empty folders recursively up to library root
         for folder in plan.empty_folders_after:
-            if folder.exists() and not any(folder.iterdir()):
-                try:
-                    folder.rmdir()
-                    logger.info("Removed empty folder: %s", folder)
-                except OSError:
-                    pass
+            self._clean_empty_dir_recursive(folder)
+
+        # Sync classification_session.json and library_edits.json to new paths
+        path_mapping = {op.source_path: op.destination_path for op in completed}
+        _sync_metadata_files(self._library_root, path_mapping)
 
         rlog.save()
         duration = time.time() - start
@@ -497,6 +620,80 @@ class FileOrganizer:
         rlog = RollbackLog.load(log_path)
         return rlog.rollback()
 
+    def _clean_empty_dir_recursive(self, directory: Path) -> None:
+        """Remove source directory after all audio files have moved.
+
+        If only hidden files and orphaned .serato-stems packages remain, the
+        stems are quarantined to _CrateSort/orphaned_stems/ (preserving relative
+        path) before the now-empty directory is removed. Stems that successfully
+        moved with their audio file in _execute_move are already gone; only
+        truly orphaned stems reach this point.
+        """
+        current = directory
+        while current != self._library_root and current.exists():
+            has_non_removable = False
+            hidden_files = []
+            try:
+                for child in current.rglob('*'):
+                    if child.is_file():
+                        if child.name.startswith('.'):
+                            hidden_files.append(child)
+                        elif not _is_stems_path(child):
+                            has_non_removable = True
+                            break
+            except Exception:
+                break
+
+            if has_non_removable:
+                break
+
+            # Delete macOS/system hidden files
+            for hf in hidden_files:
+                try:
+                    hf.unlink()
+                except OSError:
+                    pass
+
+            # Quarantine any remaining .serato-stems packages
+            quarantine = self._library_root / '_CrateSort' / 'orphaned_stems'
+            self._quarantine_stems_in(current, quarantine)
+
+            # Remove the now-empty directory tree
+            try:
+                for sub in sorted(current.rglob('*'), reverse=True):
+                    if sub.is_dir():
+                        try:
+                            sub.rmdir()
+                        except OSError:
+                            pass
+                current.rmdir()
+                logger.info("Removed empty folder: %s", current)
+            except OSError:
+                break
+
+            current = current.parent
+
+    def _quarantine_stems_in(self, directory: Path, quarantine_base: Path) -> None:
+        """Move all .serato-stems packages (files or directories) to quarantine_base."""
+        try:
+            for child in directory.iterdir():
+                if child.name.lower().endswith('.serato-stems'):
+                    # Handle both file and directory stems packages
+                    try:
+                        dest = quarantine_base / child.relative_to(self._library_root)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(child), str(dest))
+                        logger.info(
+                            "Quarantined orphan stems: %s → %s",
+                            child.relative_to(self._library_root), dest.parent,
+                        )
+                    except Exception as exc:
+                        logger.warning("Could not quarantine stems %s: %s", child.name, exc)
+                elif child.is_dir():
+                    self._quarantine_stems_in(child, quarantine_base)
+        except Exception as exc:
+            logger.warning("Stems quarantine scan failed in %s: %s", directory, exc)
+
     # ── Internal: single file move ────────────────────────────────────────────
 
     def _execute_move(self, op: FileMoveOp, rlog: RollbackLog) -> None:
@@ -519,6 +716,23 @@ class FileOrganizer:
 
         # Atomic rename
         tmp_dest.replace(op.destination_path)
+
+        # Check and move stems file if present
+        stems_source = _find_stems_file(op.source_path)
+        if stems_source:
+            stems_dest = op.destination_path.parent / (op.destination_path.stem + stems_source.name[len(op.source_path.stem):])
+            tmp_stems_dest = stems_dest.with_suffix(stems_dest.suffix + '.tmp')
+            if stems_source.is_dir():
+                shutil.copytree(str(stems_source), str(tmp_stems_dest))
+                if stems_dest.exists():
+                    shutil.rmtree(str(stems_dest))
+                tmp_stems_dest.replace(stems_dest)
+                shutil.rmtree(str(stems_source))
+            else:
+                shutil.copy2(str(stems_source), str(tmp_stems_dest))
+                tmp_stems_dest.replace(stems_dest)
+                stems_source.unlink()
+            logger.info("Moved stems: %s → %s", stems_source.name, stems_dest)
 
         # Delete original
         op.source_path.unlink()
@@ -545,34 +759,13 @@ class FileOrganizer:
         for change in changes:
             if change.needs_review or change.proposed_value is None:
                 continue
-            if change.field == 'genre':
-                rlog.log_metadata(file_path, 'genre', change.current_value, change.proposed_value)
-                self._write_genre(audio, ext, change.proposed_value)
-            elif change.field == 'sort_artist':
-                rlog.log_metadata(file_path, 'sort_artist', change.current_value, change.proposed_value)
-                self._write_sort_artist(audio, ext, change.proposed_value)
+            rlog.log_metadata(file_path, change.field, change.current_value, change.proposed_value)
+            try:
+                _write_metadata_tag(audio, ext, change.field, change.proposed_value)
+            except Exception as exc:
+                logger.warning("Tag write failed for %s (%s): %s", file_path.name, change.field, exc)
 
         audio.save()
-
-    def _write_genre(self, audio, ext: str, value: str) -> None:
-        if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags['TCON'] = mutagen.id3.TCON(encoding=3, text=[value])
-        elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
-            if audio.tags is not None:
-                audio.tags['©gen'] = [value]
-        elif ext == '.flac':
-            audio['genre'] = [value]
-
-    def _write_sort_artist(self, audio, ext: str, value: str) -> None:
-        if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags['TSOP'] = mutagen.id3.TSOP(encoding=3, text=[value])
-        elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
-            if audio.tags is not None:
-                audio.tags['soar'] = [value]
 
     # ── Internal: crate path update ───────────────────────────────────────────
 
@@ -585,13 +778,21 @@ class FileOrganizer:
         try:
             from cratesort.src.serato.path_rewriter import PathRewriter, PathChange
 
-            changes = [
-                PathChange(
-                    old_path=op.source_path.as_posix().lstrip('/'),
-                    new_path=op.destination_path.as_posix().lstrip('/'),
-                )
-                for op in completed_ops
-            ]
+            # Serato crates store paths in two formats depending on how they were
+            # created: relative to the library root, or absolute. We supply both
+            # variants for each move so the lookup succeeds either way.
+            changes = []
+            for op in completed_ops:
+                try:
+                    rel_old = op.source_path.relative_to(self._library_root).as_posix()
+                    rel_new = op.destination_path.relative_to(self._library_root).as_posix()
+                except ValueError:
+                    logger.warning("Path outside library root, skipping crate update: %s", op.source_path)
+                    continue
+                abs_old = op.source_path.as_posix()
+                abs_new = op.destination_path.as_posix()
+                changes.append(PathChange(old_path=rel_old, new_path=rel_new))
+                changes.append(PathChange(old_path=abs_old, new_path=abs_new))
 
             rewriter = PathRewriter(serato_dir)
             result = rewriter.rewrite(changes, dry_run=False)
@@ -620,6 +821,12 @@ class FileOrganizer:
     ) -> Path:
         artist = record.artist or 'Unknown Artist'
 
+        # macOS visual slash replacement for genre path component
+        if sys.platform == 'darwin':
+            genre_folder = genre.replace('/', ':')
+        else:
+            genre_folder = genre.replace('/', ' - ')
+
         # Consolidation: determine the folder hierarchy
         candidate = consolidation.get(artist)
         if candidate:
@@ -629,21 +836,24 @@ class FileOrganizer:
                 variant_folder = self._artist_folder_name(artist, the_proposals)
                 artist_path = (
                     self._library_root
-                    / Path(genre)
+                    / "Media"
+                    / genre_folder
                     / sanitize_path_component(winner_folder)
                     / sanitize_path_component(variant_folder)
                 )
             else:
                 artist_path = (
                     self._library_root
-                    / Path(genre)
+                    / "Media"
+                    / genre_folder
                     / sanitize_path_component(winner_folder)
                 )
         else:
             folder = self._artist_folder_name(artist, the_proposals)
             artist_path = (
                 self._library_root
-                / Path(genre)
+                / "Media"
+                / genre_folder
                 / sanitize_path_component(folder)
             )
 
@@ -684,10 +894,15 @@ class FileOrganizer:
         return None
 
     def _will_be_empty(self, directory: Path, moving_sources: set[Path]) -> bool:
-        """True if every file in directory is being moved."""
+        """True if every non-hidden, non-stems file in directory is being moved."""
         for child in directory.rglob('*'):
-            if child.is_file() and child not in moving_sources:
-                return False
+            if child.is_file():
+                if child.name.startswith('.'):
+                    continue
+                if _is_stems_path(child):
+                    continue
+                if child not in moving_sources:
+                    return False
         return True
 
     def _build_crate_lookup(self, crate_library) -> dict[str, list[str]]:
@@ -705,9 +920,256 @@ class FileOrganizer:
 # Utility
 # ---------------------------------------------------------------------------
 
+def _sync_metadata_files(library_root: Path, path_mapping: dict) -> None:
+    """Update file paths in classification_session.json and library_edits.json after moves."""
+    if not path_mapping:
+        return
+
+    # Normalise to Path → Path so lookups work regardless of how caller built the dict
+    norm: dict[Path, Path] = {Path(k): Path(v) for k, v in path_mapping.items()}
+
+    session_file = library_root / '_CrateSort' / 'classification_session.json'
+    if session_file.exists():
+        try:
+            with open(session_file, encoding='utf-8') as f:
+                data = json.load(f)
+            updated = False
+            for entry in data.get('entries', []):
+                for track in entry.get('tracks', []):
+                    tp = Path(track['path'])
+                    if tp in norm:
+                        track['path'] = str(norm[tp])
+                        updated = True
+            if updated:
+                with open(session_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                logger.info("Synced classification_session.json with moved file paths.")
+        except Exception as exc:
+            logger.error("Failed to sync classification_session.json: %s", exc)
+
+    edits_file = library_root / '_CrateSort' / 'library_edits.json'
+    if edits_file.exists():
+        try:
+            with open(edits_file, encoding='utf-8') as f:
+                edits = json.load(f)
+            new_edits: dict = {}
+            updated = False
+            for k, v in edits.items():
+                kp = Path(k)
+                if kp in norm:
+                    new_edits[str(norm[kp])] = v
+                    updated = True
+                else:
+                    new_edits[k] = v
+            if updated:
+                with open(edits_file, 'w', encoding='utf-8') as f:
+                    json.dump(new_edits, f, indent=2)
+                logger.info("Synced library_edits.json with moved file paths.")
+        except Exception as exc:
+            logger.error("Failed to sync library_edits.json: %s", exc)
+
+
+def _is_stems_path(path: Path) -> bool:
+    return any(part.endswith('.serato-stems') for part in path.parts)
+
+
+def _find_stems_file(track_path: Path) -> Optional[Path]:
+    if not track_path.parent.exists():
+        return None
+    track_stem_lower = track_path.stem.lower()
+    try:
+        for child in track_path.parent.iterdir():
+            if child.name.lower().endswith('.serato-stems'):
+                name_lower = child.name.lower()
+                if name_lower.startswith(track_stem_lower):
+                    rest = name_lower[len(track_stem_lower):]
+                    if rest == '.serato-stems' or (rest.startswith('.') and rest.endswith('.serato-stems')):
+                        return child
+    except Exception:
+        pass
+    return None
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(65536), b''):
             h.update(chunk)
     return h.hexdigest()
+
+# ── Mutagen Tag Writing Helpers ───────────────────────────────────────────
+
+def _write_metadata_tag(audio, ext: str, field: str, value: Optional[str]) -> None:
+    if field == 'genre':
+        _write_genre(audio, ext, value)
+    elif field == 'sort_artist':
+        _write_sort_artist(audio, ext, value)
+    elif field == 'artist':
+        _write_artist(audio, ext, value)
+    elif field == 'title':
+        _write_title(audio, ext, value)
+    elif field == 'album':
+        _write_album(audio, ext, value)
+    elif field == 'bpm':
+        _write_bpm(audio, ext, value)
+    elif field == 'year':
+        _write_year(audio, ext, value)
+    elif field == 'comment':
+        _write_comment(audio, ext, value)
+
+def _write_genre(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('TCON', None)
+        else:
+            audio.tags['TCON'] = mutagen.id3.TCON(encoding=3, text=[value])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('©gen', None)
+            else:
+                audio.tags['©gen'] = [value]
+    elif ext == '.flac':
+        if value is None:
+            audio.pop('genre', None)
+        else:
+            audio['genre'] = [value]
+
+def _write_sort_artist(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('TSOP', None)
+        else:
+            audio.tags['TSOP'] = mutagen.id3.TSOP(encoding=3, text=[value])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('soar', None)
+            else:
+                audio.tags['soar'] = [value]
+
+def _write_artist(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('TPE1', None)
+        else:
+            audio.tags['TPE1'] = mutagen.id3.TPE1(encoding=3, text=[value])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('©ART', None)
+            else:
+                audio.tags['©ART'] = [value]
+    elif ext == '.flac':
+        if value is None:
+            audio.pop('artist', None)
+        else:
+            audio['artist'] = [value]
+
+def _write_title(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('TIT2', None)
+        else:
+            audio.tags['TIT2'] = mutagen.id3.TIT2(encoding=3, text=[value])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('©nam', None)
+            else:
+                audio.tags['©nam'] = [value]
+    elif ext == '.flac':
+        if value is None:
+            audio.pop('title', None)
+        else:
+            audio['title'] = [value]
+
+def _write_album(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('TALB', None)
+        else:
+            audio.tags['TALB'] = mutagen.id3.TALB(encoding=3, text=[value])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('©alb', None)
+            else:
+                audio.tags['©alb'] = [value]
+    elif ext == '.flac':
+        if value is None:
+            audio.pop('album', None)
+        else:
+            audio['album'] = [value]
+
+def _write_bpm(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('TBPM', None)
+        else:
+            audio.tags['TBPM'] = mutagen.id3.TBPM(encoding=3, text=[str(value)])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('tmpo', None)
+            else:
+                try:
+                    audio.tags['tmpo'] = [int(float(value))]
+                except ValueError:
+                    pass
+    elif ext == '.flac':
+        if value is None:
+            audio.pop('bpm', None)
+        else:
+            audio['bpm'] = [str(value)]
+
+def _write_year(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('TDRC', None)
+        else:
+            audio.tags['TDRC'] = mutagen.id3.TDRC(encoding=3, text=[value])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('©day', None)
+            else:
+                audio.tags['©day'] = [value]
+    elif ext == '.flac':
+        if value is None:
+            audio.pop('date', None)
+        else:
+            audio['date'] = [value]
+
+def _write_comment(audio, ext: str, value: Optional[str]) -> None:
+    if ext in {'.mp3', '.wav', '.aif', '.aiff'}:
+        if audio.tags is None:
+            audio.add_tags()
+        if value is None:
+            audio.tags.pop('COMM::eng', None)
+        else:
+            audio.tags['COMM::eng'] = mutagen.id3.COMM(encoding=3, lang='eng', desc='', text=[value])
+    elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        if audio.tags is not None:
+            if value is None:
+                audio.tags.pop('©cmt', None)
+            else:
+                audio.tags['©cmt'] = [value]
+    elif ext == '.flac':
+        if value is None:
+            audio.pop('comment', None)
+        else:
+            audio['comment'] = [value]

@@ -261,6 +261,34 @@ Expanded/collapsed state and selected crate are preserved after every operation.
 
 ---
 
+## Organize View — Current Architecture
+
+The Organize tab (`src/gui/organize_view.py`) manages the file-reorganization workflow using a `QStackedWidget` across 5 states:
+
+- **State 0: Gate Screen** — instructional warning if no classification session exists (`classification_session.json` is missing). Includes a rich-text hyperlink to navigate to the Classifier.
+- **State 1: Planning Screen** — indeterminate progress bar shown while a background `_PlanWorker` thread builds the reorganization proposal plan.
+- **State 2: Preview Screen** — displays a count-up animated stats cards strip (`_OrganizeStatCard`) and a 5-column operations table listing moves.
+- **State 3: Executing Screen** — tracks execution progress of a background `_ExecutionWorker` copy-verify-delete thread with a progress bar and detail label.
+- **State 4: Done Screen** — shows a success banner, a "Back to Dashboard" button, and a "Rollback Reorganization" button connected to a `_RollbackWorker` thread.
+
+### Sizing and Sibling Alignment Constraints:
+- To prevent the operations table from pushing the footer frame off-screen, the operations table is explicitly constrained using `self._ops_table.setMinimumHeight(150)`.
+- The footer layout aligns elements vertically center (`Qt.AlignmentFlag.AlignVCenter`).
+
+### Stat Cards Strip:
+- Cards count up on load using cubic ease-out animations triggered with sequential cascade time offsets (e.g. `100ms`, `220ms`, `340ms`, `460ms`, `580ms`). Clicking a card replays its animation.
+- Pure-text icons (`➔`, `✓`, `⧉`, `⊞`, `▲`) are styled `#7a6a55` to avoid system emoji discrepancy.
+
+### Operations Table Layout:
+- 5 Columns: `Action` $\rightarrow$ `Proposed Filename` $\rightarrow$ `Proposed Folder` $\rightarrow$ `Current Filename` $\rightarrow$ `Crates Affected`.
+- Column 0 and 4 are set to `ResizeToContents`. Columns 1, 2, and 3 are set to `Stretch`.
+- Retro-pastel color labels in the Action column (no icons):
+  - `Move & Rename`: `#d98c52` (peach)
+  - `Move & Tag`: `#9fa4c7` (lavender)
+  - `Move Only`: `#e89ebb` (soft pastel pink)
+
+---
+
 ## Undo/Redo System
 
 - `src/utils/undo_manager.py` — Command pattern, 10-state stack, global across tabs

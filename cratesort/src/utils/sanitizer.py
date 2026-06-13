@@ -1,4 +1,5 @@
 import re
+import sys
 
 _ILLEGAL_CHARS = r'[<>:"/\\|?*\x00-\x1f]'
 
@@ -11,7 +12,15 @@ _WINDOWS_RESERVED = {
 
 def sanitize_filename(name: str, replacement: str = "_") -> str:
     """Strip or replace characters that are illegal in cross-platform filenames."""
-    sanitized = re.sub(_ILLEGAL_CHARS, replacement, name).strip(". ")
+    name = name.replace('"', "'")
+    if sys.platform == 'darwin':
+        # macOS: replace / with : — Finder renders : as a visual / in filenames
+        name = name.replace('/', ':')
+        illegal_chars = r'[<>"\\|?*\x00-\x1f]'
+    else:
+        illegal_chars = _ILLEGAL_CHARS
+
+    sanitized = re.sub(illegal_chars, replacement, name).strip(". ")
     if sanitized.upper() in _WINDOWS_RESERVED:
         sanitized = f"{sanitized}{replacement}"
     return sanitized or replacement

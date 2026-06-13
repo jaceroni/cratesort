@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QDrag, QIcon, QPixmap, QPainter
+from PyQt6.QtGui import QBrush, QColor, QDrag, QFontMetrics, QIcon, QPen, QPixmap, QPainter
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox,
     QFrame, QHBoxLayout,
@@ -75,6 +75,25 @@ _BORDER = '#444444'
 _SETTINGS_KEY   = 'crate_manager_header_state'
 _ALL_TRACKS_KEY = '__ALL_TRACKS__'
 
+_RED_BTN = (
+    'QPushButton { background-color: #C75B5B; color: #ffffff; font-weight: 400; '
+    'border-radius: 6px; border: none; padding: 8px 24px; min-width: 80px; }'
+    'QPushButton:hover { background-color: #b24c4c; }'
+    'QPushButton:pressed { background-color: #9c3b3b; }'
+)
+
+
+def _style_cancel_btns(box: 'QMessageBox') -> None:
+    """Apply red styling to all Reject/Destructive/No role buttons in a QMessageBox."""
+    for btn in box.buttons():
+        role = box.buttonRole(btn)
+        if role in (
+            QMessageBox.ButtonRole.RejectRole,
+            QMessageBox.ButtonRole.DestructiveRole,
+            QMessageBox.ButtonRole.NoRole,
+        ):
+            btn.setStyleSheet(_RED_BTN)
+
 _MSGBOX_STYLE = """
     QMessageBox { background-color: #2F2F2F; }
     QMessageBox QLabel {
@@ -84,7 +103,7 @@ _MSGBOX_STYLE = """
         background-color: #428175; color: #ffffff; font-weight: 400; font-size: 13px;
         padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
     }
-    QMessageBox QPushButton:hover  { background-color: #4f9688; }
+    QMessageBox QPushButton:hover  { background-color: #38706a; }
     QMessageBox QPushButton:pressed { background-color: #36675d; }
     QDialogButtonBox { qproperty-centerButtons: true; }
 """
@@ -104,13 +123,16 @@ class CrateItemDelegate(QStyledItemDelegate):
     STATE_B = 'b'  # selected, no active sub-crate
     STATE_C = 'c'  # parent of active sub-crate
     STATE_D = 'd'  # selected sub-crate
+    STATE_E = 'e'  # track drag-drop hover target
 
     BG_A      = QColor('#2F2F2F')
     BG_SUB    = QColor('#222222')
     BG_B      = QColor('#573d26')
     BG_C      = QColor('#000000')
     BG_D      = QColor('#573d26')
+    BG_E      = QColor('#1a3530')
     BAR_COLOR = QColor('#D17D34')
+    BAR_TEAL  = QColor('#428175')
     TEXT_A    = QColor('#f1e3c8')
     TEXT_B    = QColor('#f1e3c8')
     EXPAND_COLOR = QColor('#a89b85')
@@ -148,18 +170,27 @@ class CrateItemDelegate(QStyledItemDelegate):
                 self.STATE_B: self.BG_B,
                 self.STATE_C: self.BG_C,
                 self.STATE_D: self.BG_D,
+                self.STATE_E: self.BG_E,
             }.get(state, self.BG_A)
 
         # Fill entire cell
         painter.fillRect(option.rect, bg)
 
-        # Orange left bar for States B, C, and D (all selected/active states)
-        if state in (self.STATE_B, self.STATE_C, self.STATE_D):
+        # Left bar: orange for selected states, teal for drop-target
+        if state in (self.STATE_B, self.STATE_C, self.STATE_D, self.STATE_E):
+            bar_color = self.BAR_TEAL if state == self.STATE_E else self.BAR_COLOR
             bar_rect = QRect(
                 option.rect.left(), option.rect.top(),
                 self.BAR_WIDTH, option.rect.height()
             )
-            painter.fillRect(bar_rect, self.BAR_COLOR)
+            painter.fillRect(bar_rect, bar_color)
+
+        # Teal inset border for drop-target state
+        if state == self.STATE_E:
+            pen = QPen(self.BAR_TEAL, 1)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(option.rect.adjusted(1, 0, -1, -1))
 
         # Crate name text
         text      = index.data(Qt.ItemDataRole.DisplayRole) or ''
@@ -352,21 +383,56 @@ class _ReorderableTable(QTableWidget):
         self.rows_reordered.emit(new_order)
 
     def startDrag(self, supported_actions) -> None:
+        rows  = sorted({idx.row() for idx in self.selectedIndexes()})
         paths: list[str] = []
-        for r in sorted({idx.row() for idx in self.selectedIndexes()}):
+        for r in rows:
             cell = self.item(r, TC_TITLE)
             if cell:
                 orig = cell.data(Qt.ItemDataRole.UserRole + 1)
                 if orig:
                     paths.append(orig)
-        if paths:
-            mime = QMimeData()
-            mime.setData(_TRACKS_MIME, json.dumps(paths).encode('utf-8'))
-            drag = QDrag(self)
-            drag.setMimeData(mime)
-            drag.exec(supported_actions)
-        else:
+        if not paths:
             super().startDrag(supported_actions)
+            return
+
+        mime = QMimeData()
+        mime.setData(_TRACKS_MIME, json.dumps(paths).encode('utf-8'))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+
+        # Ghost pixmap: teal pill showing track title or "N tracks"
+        n = len(paths)
+        if n == 1:
+            title_cell = self.item(rows[0], TC_TITLE)
+            label = title_cell.text() if title_cell else paths[0].rsplit('/', 1)[-1]
+        else:
+            label = f'{n} tracks'
+
+        font = self.font()
+        font.setPointSize(11)
+        font.setBold(True)
+        fm   = QFontMetrics(font)
+        pad_x, pad_y = 14, 7
+        pm_w = fm.horizontalAdvance(label) + pad_x * 2
+        pm_h = fm.height() + pad_y * 2
+
+        pm = QPixmap(pm_w, pm_h)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(0.88)
+        p.setBrush(QColor('#428175'))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(0, 0, pm_w, pm_h, 6, 6)
+        p.setOpacity(1.0)
+        p.setPen(QColor('#ffffff'))
+        p.setFont(font)
+        p.drawText(pad_x, pad_y + fm.ascent(), label)
+        p.end()
+
+        drag.setPixmap(pm)
+        drag.setHotSpot(QPoint(pm_w // 2, pm_h // 2))
+        drag.exec(supported_actions)
 
 
 # ---------------------------------------------------------------------------
@@ -458,13 +524,13 @@ class _AddTracksDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self._add_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; font-weight: 400; border-radius: 6px; border: none; }'
-            'QPushButton:hover { background-color: #4f9688; }'
+            'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
         self._cancel_btn.setStyleSheet(
-            'QPushButton { background-color: #3a3a3a; color: #f1e3c8; font-weight: 400; border-radius: 6px; border: none; }'
-            'QPushButton:hover { background-color: #4a4a4a; }'
-            'QPushButton:pressed { background-color: #2a2a2a; }'
+            'QPushButton { background-color: #C75B5B; color: #ffffff; font-weight: 400; border-radius: 6px; border: none; }'
+            'QPushButton:hover { background-color: #b24c4c; }'
+            'QPushButton:pressed { background-color: #9c3b3b; }'
         )
         layout.addWidget(buttons)
 
@@ -533,8 +599,9 @@ class _NameInputDialog(QDialog):
         cancel = QPushButton('Cancel')
         cancel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         cancel.setStyleSheet(
-            'QPushButton { background-color: #3a3a3a; color: #f1e3c8; }'
-            'QPushButton:hover { background-color: #4a4a4a; }'
+            'QPushButton { background-color: #C75B5B; color: #ffffff; border-radius: 6px; border: none; }'
+            'QPushButton:hover { background-color: #b24c4c; }'
+            'QPushButton:pressed { background-color: #9c3b3b; }'
         )
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
@@ -544,7 +611,7 @@ class _NameInputDialog(QDialog):
         ok.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         ok.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; }'
-            'QPushButton:hover { background-color: #4f9688; }'
+            'QPushButton:hover { background-color: #38706a; }'
         )
         ok.clicked.connect(self.accept)
         btn_row.addWidget(ok)
@@ -600,6 +667,10 @@ class CrateManagerView(QWidget):
         self._expanded_paths: set[str] = set()
         self._last_selected_path: Optional[str] = None
         self._last_scroll_pos: int = 0
+
+        # Drop target highlight for track-onto-crate drag
+        self._track_drop_target_key:   Optional[str] = None
+        self._track_drop_prior_state:  str            = CrateItemDelegate.STATE_A
 
         # Manual crate drag state (Fix 3)
         self._crate_drag_item:   Optional[QTreeWidgetItem] = None
@@ -672,11 +743,21 @@ class CrateManagerView(QWidget):
         inv_paths = {rec.path for rec in self._inventory}
         self._crate_library = CrateReader(serato_dir).read(inv_paths)
 
-        restore_sel = self._last_selected_path or self._current_crate_path
+        # First visit: default to All Tracks. Return visit: restore prior selection.
+        # Both reset to All Tracks on app restart (in-memory only, not persisted).
+        restore_sel = self._last_selected_path or self._current_crate_path or _ALL_TRACKS_KEY
         self._rebuild_crate_tree(
             restore_expanded=self._expanded_paths if self._expanded_paths else None,
             restore_selected=restore_sel,
         )
+
+        # Load tracks for the selected/default crate
+        if restore_sel == _ALL_TRACKS_KEY:
+            self._load_all_tracks()
+        elif self._crate_library and restore_sel in self._crate_library.crates:
+            self._current_crate_path = restore_sel
+            self._load_crate_tracks(restore_sel)
+
         # Restore scroll position after tree is rebuilt
         QTimer.singleShot(0, lambda: self._crate_tree.verticalScrollBar().setValue(self._last_scroll_pos))
         self._set_status('')
@@ -686,6 +767,23 @@ class CrateManagerView(QWidget):
         # Reapply selection state after returning to the Crates tab
         if self._prev_selected_item and self._crate_delegate:
             self._on_tree_selection_changed(self._prev_selected_item, None)
+
+    def _on_new_crate(self) -> None:
+        self._crate_new(parent_path=None)
+
+    def _on_new_smart_crate(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle('Smart Crates')
+        box.setText(
+            'Smart Crates is a Pro feature.\n\n'
+            'Create rule-based dynamic crates that automatically update '
+            'based on metadata filters (e.g. genre, BPM, year).'
+        )
+        box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
+        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
+        if box.layout():
+            box.layout().setContentsMargins(20, 20, 20, 20)
+        box.exec()
 
     # ── Empty state ───────────────────────────────────────────────────
 
@@ -734,6 +832,7 @@ class CrateManagerView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # ── Search ────────────────────────────────────────────────────────
         self._crate_search = QLineEdit()
         self._crate_search.setPlaceholderText('Search crates…')
         self._crate_search.setClearButtonEnabled(True)
@@ -745,7 +844,42 @@ class CrateManagerView(QWidget):
         )
         self._crate_search.textChanged.connect(self._filter_crates)
         layout.addWidget(self._crate_search)
-        layout.addSpacing(2)
+
+        # ── New crate buttons — fixed height matches track table header ──────
+        btn_container = QWidget()
+        btn_container.setFixedHeight(45)
+        btn_row = QHBoxLayout(btn_container)
+        btn_row.setContentsMargins(8, 5, 8, 5)
+        btn_row.setSpacing(6)
+
+        new_crate_btn = QPushButton('＋ New Crate')
+        new_crate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_crate_btn.setStyleSheet(
+            f'QPushButton {{ background: {_ORANGE}; color: #ffffff; font-size: 12px; '
+            f'font-weight: 600; border: none; border-radius: 5px; padding: 0 10px; }}'
+            f'QPushButton:hover {{ background: #b8682a; }}'
+            f'QPushButton:pressed {{ background: #9c5520; }}'
+        )
+        new_crate_btn.clicked.connect(self._on_new_crate)
+        btn_row.addWidget(new_crate_btn)
+
+        smart_crate_btn = QPushButton('✦ Smart Crate')
+        smart_crate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        smart_crate_btn.setStyleSheet(
+            f'QPushButton {{ background: {_TEAL}; color: #ffffff; font-size: 12px; '
+            f'font-weight: 600; border: none; border-radius: 5px; padding: 0 10px; }}'
+            f'QPushButton:hover {{ background: #38706a; }}'
+            f'QPushButton:pressed {{ background: #2d6358; }}'
+        )
+        smart_crate_btn.clicked.connect(self._on_new_smart_crate)
+        btn_row.addWidget(smart_crate_btn)
+
+        layout.addWidget(btn_container)
+
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f'background: {_BORDER}; border: none;')
+        layout.addWidget(sep)
 
         self._crate_tree = QTreeWidget()
         self._crate_delegate = CrateItemDelegate(self._crate_tree)
@@ -758,11 +892,13 @@ class CrateManagerView(QWidget):
         # Double-click expands/collapses; single click only selects
         self._crate_tree.setExpandsOnDoubleClick(True)
 
-        # Fix 3: disable Qt built-in drag-drop; use manual implementation
+        # setDragDropMode(NoDragDrop) internally calls setAcceptDrops(false) and
+        # propagates it to the viewport — so setAcceptDrops(True) must come after.
         self._crate_tree.setDragEnabled(False)
-        self._crate_tree.setAcceptDrops(False)
         self._crate_tree.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self._crate_tree.setDropIndicatorShown(False)
+        self._crate_tree.setAcceptDrops(True)
+        self._crate_tree.viewport().setAcceptDrops(True)
 
         from PyQt6.QtGui import QPalette
         pal = self._crate_tree.palette()
@@ -879,7 +1015,7 @@ class CrateManagerView(QWidget):
         self._track_table.verticalHeader().setDefaultSectionSize(36)
         self._track_table.verticalHeader().setMinimumSectionSize(36)
         self._track_table.verticalHeader().setMaximumSectionSize(36)
-        self._track_table.horizontalHeader().setFixedHeight(36)
+        self._track_table.horizontalHeader().setFixedHeight(45)
 
         self._track_table.setSortingEnabled(True)
         self._track_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1530,15 +1666,42 @@ class CrateManagerView(QWidget):
                     if target:
                         key = target.data(0, Qt.ItemDataRole.UserRole)
                         if key and key != _ALL_TRACKS_KEY:
-                            self._crate_tree.setCurrentItem(target)
+                            if key != self._track_drop_target_key:
+                                if self._track_drop_target_key:
+                                    self._crate_delegate.set_item_state(
+                                        self._track_drop_target_key,
+                                        self._track_drop_prior_state)
+                                self._track_drop_prior_state = \
+                                    self._crate_delegate.get_item_state(key)
+                                self._track_drop_target_key = key
+                                self._crate_delegate.set_item_state(key, CrateItemDelegate.STATE_E)
                             event.acceptProposedAction()
                             return True
+                # Not over a valid crate — clear any active highlight
+                if self._track_drop_target_key:
+                    self._crate_delegate.set_item_state(
+                        self._track_drop_target_key, self._track_drop_prior_state)
+                    self._track_drop_target_key  = None
+                    self._track_drop_prior_state = CrateItemDelegate.STATE_A
                 event.ignore()
                 return True
+
+            elif event.type() == QEvent.Type.DragLeave:
+                if self._track_drop_target_key:
+                    self._crate_delegate.set_item_state(
+                        self._track_drop_target_key, self._track_drop_prior_state)
+                    self._track_drop_target_key  = None
+                    self._track_drop_prior_state = CrateItemDelegate.STATE_A
+                return False
 
             elif event.type() == QEvent.Type.Drop:
                 pt     = event.position().toPoint()
                 target = self._crate_tree.itemAt(pt)
+                if self._track_drop_target_key:
+                    self._crate_delegate.set_item_state(
+                        self._track_drop_target_key, self._track_drop_prior_state)
+                    self._track_drop_target_key  = None
+                    self._track_drop_prior_state = CrateItemDelegate.STATE_A
                 if event.mimeData().hasFormat(_TRACKS_MIME):
                     if target:
                         key = target.data(0, Qt.ItemDataRole.UserRole)
@@ -2034,7 +2197,7 @@ class CrateManagerView(QWidget):
         box.setText(msg)
         del_btn = box.addButton('Delete', QMessageBox.ButtonRole.DestructiveRole)
         box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setStyleSheet(_MSGBOX_STYLE)
+        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
         if box.layout():
             box.layout().setContentsMargins(20, 20, 20, 20)
         box.exec()
@@ -2307,7 +2470,7 @@ class CrateManagerView(QWidget):
         box.setText(msg)
         remove_btn = box.addButton('Remove', QMessageBox.ButtonRole.AcceptRole)
         box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setStyleSheet(_MSGBOX_STYLE)
+        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
         if box.layout():
             box.layout().setContentsMargins(20, 20, 20, 20)
         box.exec()
@@ -2330,7 +2493,7 @@ class CrateManagerView(QWidget):
         box.setText(msg)
         del_btn = box.addButton('Delete', QMessageBox.ButtonRole.DestructiveRole)
         box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setStyleSheet(_MSGBOX_STYLE)
+        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
         if box.layout():
             box.layout().setContentsMargins(20, 20, 20, 20)
         box.exec()

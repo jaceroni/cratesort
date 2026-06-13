@@ -243,9 +243,15 @@ class FilenameCleaner:
                 changes.append(
                     f"title tag mismatch: proposed '{working}' ≠ tag '{record.title}'"
                 )
-                # Prefer title tag when no changes were made yet (title tag is better starting point)
+                # Prefer title tag when no changes were made yet, but strip any
+                # artist prefix first — the title tag may still have "Artist - Title" format.
                 if not changes or all('mismatch' in c for c in changes):
-                    working = record.title
+                    candidate = record.title
+                    if record.artist:
+                        stripped_t, _, _ = _strip_artist_prefix(record.title, record.artist)
+                        if stripped_t != record.title:
+                            candidate = stripped_t
+                    working = candidate
 
         # Step 6: Sanitize for cross-platform safety
         proposed_stem = sanitize_filename(working)

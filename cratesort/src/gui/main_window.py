@@ -24,6 +24,8 @@ from cratesort.src.gui.dashboard import DashboardWidget
 from cratesort.src.gui.classifier_view import ClassifierView
 from cratesort.src.gui.library_browser import LibraryBrowserView
 from cratesort.src.gui.crate_manager import CrateManagerView
+from cratesort.src.gui.organize_view import OrganizeView
+from cratesort.src.gui.settings_view import SettingsView
 from cratesort.src.utils.undo_manager import UndoManager
 
 _ASSETS = Path(__file__).parent.parent.parent / 'assets'
@@ -38,11 +40,12 @@ _SIDEBAR_W = 196
 
 # Nav items: (id, label, emoji_icon)
 _NAV_ITEMS = [
-    ('dashboard', 'Dashboard',  '◆'),
-    ('library',   'Library',    '≡'),
-    ('crates',    'Crates',     '⊞'),
-    ('organize',  'Organize',   '⟳'),
-    ('settings',  'Settings',   '⚙'),
+    ('dashboard', 'Dashboard',      '⌂'),
+    ('classification',  'Classification', '🔍'),
+    ('library',   'Library',        '📚'),
+    ('crates',    'Crates',         '📦'),
+    ('organize',  'Organize',       '📁'),
+    ('settings',  'Settings',       '⚙'),
 ]
 
 
@@ -109,27 +112,37 @@ class MainWindow(QMainWindow):
         self._dashboard.new_smart_crate_requested.connect(self._on_new_smart_crate_requested)
         self._content.addWidget(self._dashboard)
 
-        # Library Browser — index 1 (real view)
-        self._library_browser = LibraryBrowserView()
-        self._library_browser.album_art_requested.connect(self._update_album_art)
-        self._content.addWidget(self._library_browser)
-
-        # Crate Manager — index 2
-        self._crate_manager = CrateManagerView(undo_manager=self._undo_manager)
-        self._crate_manager.track_selected.connect(self._update_album_art)
-        self._crate_manager.album_art_requested.connect(self._update_album_art)
-        self._content.addWidget(self._crate_manager)
-
-        # Placeholder views — indices 3–4 (Organize, Settings)
-        for _, label, _ in _NAV_ITEMS[3:]:
-            self._content.addWidget(self._placeholder(label))
-
-        # Classifier view — index 5 (navigated to programmatically)
+        # Classifier view — index 1
         self._classifier_view = ClassifierView()
         self._classifier_view.done.connect(self._on_classifier_done)
         self._classifier_view.back.connect(self._on_classifier_back)
         self._classifier_view.track_selected.connect(self._update_album_art)
         self._content.addWidget(self._classifier_view)
+
+        # Library Browser — index 2
+        self._library_browser = LibraryBrowserView()
+        self._library_browser.album_art_requested.connect(self._update_album_art)
+        self._content.addWidget(self._library_browser)
+
+        # Crate Manager — index 3
+        self._crate_manager = CrateManagerView(undo_manager=self._undo_manager)
+        self._crate_manager.track_selected.connect(self._update_album_art)
+        self._crate_manager.album_art_requested.connect(self._update_album_art)
+        self._content.addWidget(self._crate_manager)
+
+        # Organize view — index 4
+        self._organize_view = OrganizeView()
+        self._organize_view.navigate_to_classifier.connect(self._on_classify_requested)
+        self._organize_view.navigate_to_dashboard.connect(lambda: self._on_nav_by_id('dashboard'))
+        self._organize_view.reorg_completed.connect(self._on_reorg_completed)
+        self._organize_view.status_message.connect(self._update_status)
+        self._content.addWidget(self._organize_view)
+
+        # Settings — index 5
+        self._settings_view = SettingsView(self._settings)
+        self._settings_view.library_changed.connect(self._on_library_changed_from_settings)
+        self._settings_view.repair_requested.connect(self._on_repair_crate_paths)
+        self._content.addWidget(self._settings_view)
 
         root.addWidget(self._content)
 
@@ -178,12 +191,20 @@ class MainWindow(QMainWindow):
         self._nav_group.setExclusive(True)
         self._nav_btns: dict[str, QPushButton] = {}
 
-        for i, (nav_id, label, icon) in enumerate(_NAV_ITEMS):
-            btn = QPushButton(f'  {icon}  {label}')
+        for i, (nav_id, label, _icon) in enumerate(_NAV_ITEMS):
+            btn = QPushButton(f'   {label}')
             btn.setObjectName('nav_btn')
             btn.setCheckable(True)
             btn.setChecked(i == 0)
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+            icon_path = _ASSETS / 'icons' / f'icon-{nav_id}.svg'
+            if _SVG_AVAILABLE and icon_path.exists():
+                from PyQt6.QtGui import QIcon
+                from PyQt6.QtCore import QSize
+                btn.setIcon(QIcon(str(icon_path)))
+                btn.setIconSize(QSize(16, 16))
+
             btn.clicked.connect(lambda checked, idx=i: self._on_nav(idx))
             self._nav_group.addButton(btn, i)
             self._nav_btns[nav_id] = btn
@@ -307,17 +328,42 @@ class MainWindow(QMainWindow):
 
     # ── Slots ─────────────────────────────────────────────────────────
 
+    def _show_sync_warning(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle('Sync Required')
+        box.setText('Please review and sync the detected Serato changes on the Dashboard first.')
+        box.exec()
+
     def _on_nav(self, index: int) -> None:
+        if index != 0 and hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
+            self._show_sync_warning()
+            self._nav_btns['dashboard'].setChecked(True)
+            self._content.setCurrentIndex(0)
+            return
+
         self._content.setCurrentIndex(index)
         inv = self._dashboard._inventory
         lib = self._dashboard._library_path
-        if index == 1:   # Library Browser
+        if index == 1:   # Classifier
+            if not inv or not lib:
+                self._nav_btns['dashboard'].setChecked(True)
+                self._content.setCurrentIndex(0)
+                self._update_status('Load a library first.', 'amber')
+                return
+            self._classifier_view.start(inv, lib)
+            self._update_status('Classifying library…', 'amber')
+        elif index == 2:  # Library Browser
             if inv and lib:
                 self._library_browser.load(inv, lib)
-        elif index == 2:  # Crate Manager
+        elif index == 3:  # Crate Manager
             if inv and lib:
                 self._crate_manager.load(inv, lib)
-        if index not in (1, 2, 5):  # Clear art when leaving media views
+        elif index == 4:  # Organize
+            if inv and lib:
+                self._organize_view.load(inv, lib, lib / '_Serato_')
+        elif index == 5:  # Settings
+            self._settings_view.load(lib)
+        if index not in (1, 2, 3):  # Clear art when leaving media views
             self._art_panel.clear()
 
     def _on_nav_by_id(self, nav_id: str) -> None:
@@ -337,7 +383,7 @@ class MainWindow(QMainWindow):
             'QPushButton { background: #428175; color: #ffffff; border: none;'
             ' border-radius: 6px; font-size: 13px; font-weight: 400; padding: 6px 8px;'
             ' min-height: 28px; cursor: pointer; }'
-            'QPushButton:hover { background: #4f9688; }'
+            'QPushButton:hover { background: #38706a; }'
             'QPushButton:pressed { background: #2d6358; }'
         )
         _inactive = (
@@ -417,19 +463,13 @@ class MainWindow(QMainWindow):
         )
 
     def _on_classify_requested(self) -> None:
-        inv = self._dashboard._inventory
-        lib = self._dashboard._library_path
-        if not inv or not lib:
+        if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
+            self._show_sync_warning()
             return
-        self._content.setCurrentIndex(5)  # switch to classifier view
-        self._classifier_view.start(inv, lib)
-        self._update_status('Classifying library…', 'amber')
+        self._on_nav_by_id('classification')
 
     def _on_classifier_back(self) -> None:
-        self._content.setCurrentIndex(0)
-        for btn in self._nav_btns.values():
-            btn.setChecked(False)
-        self._nav_btns['dashboard'].setChecked(True)
+        self._on_nav_by_id('dashboard')
 
     def _on_classifier_done(self, _count: int = 0) -> None:
         inv = self._dashboard._inventory
@@ -446,19 +486,97 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             QTimer.singleShot(3000, _restore_count)
-        self._content.setCurrentIndex(1)
-        for btn in self._nav_btns.values():
-            btn.setChecked(False)
         self._nav_btns['library'].setChecked(True)
+        self._content.setCurrentIndex(2)  # library is now index 2
         self._update_status('Classification complete. Ready.', 'green')
 
     def _on_crates_requested(self) -> None:
+        if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
+            self._show_sync_warning()
+            return
         self._on_nav_by_id('crates')
 
     def _on_organize_requested(self) -> None:
+        if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
+            self._show_sync_warning()
+            return
         self._on_nav_by_id('organize')
 
+    def _on_library_changed_from_settings(self, path: Path) -> None:
+        self._on_library_changed(path)
+        self._dashboard.start_scan(path)
+        self._on_nav_by_id('dashboard')
+
+    def _on_repair_crate_paths(self) -> None:
+        lib = self._dashboard._library_path
+        if not lib:
+            return
+        serato_dir = lib / '_Serato_'
+        logs_dir   = lib / '_CrateSort'
+        if not serato_dir.exists() or not logs_dir.exists():
+            return
+
+        import json as _json
+        from cratesort.src.serato.path_rewriter import PathRewriter, PathChange
+
+        current_loc: dict[str, str] = {}
+        for log_file in sorted(logs_dir.glob('reorganization_log_*.json')):
+            with open(log_file) as f:
+                log = _json.load(f)
+            moves   = [m for m in log.get('moves', []) if m.get('status') == 'completed']
+            rolled  = bool(log.get('rolled_back_at'))
+            if not rolled:
+                for m in moves:
+                    src, dst = m['source'], m['destination']
+                    key = next((k for k, v in current_loc.items() if v == src), None)
+                    if key:
+                        current_loc[key] = dst
+                    else:
+                        current_loc[src] = dst
+            else:
+                for m in reversed(moves):
+                    src, dst = m['source'], m['destination']
+                    key = next((k for k, v in current_loc.items() if v == dst), None)
+                    if key:
+                        current_loc[key] = src
+
+        changes = []
+        for orig, curr in current_loc.items():
+            if orig == curr:
+                continue
+            orig_p, curr_p = Path(orig), Path(curr)
+            try:
+                rel_old = orig_p.relative_to(lib).as_posix()
+                rel_new = curr_p.relative_to(lib).as_posix()
+            except ValueError:
+                continue
+            changes.append(PathChange(old_path=rel_old,  new_path=rel_new))
+            changes.append(PathChange(old_path=orig, new_path=curr))
+
+        if not changes:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, 'Repair Crate Paths', 'No stale paths found — crates are up to date.')
+            return
+
+        result = PathRewriter(serato_dir).rewrite(changes, dry_run=False)
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.information(
+            self, 'Repair Crate Paths',
+            f'Done.\n\n{result.crates_modified} crate(s) updated, '
+            f'{result.paths_rewritten} track path(s) fixed.',
+        )
+
+    def _on_reorg_completed(self) -> None:
+        """Re-scan the library after a reorganization or rollback so the in-memory
+        inventory and crate manager reflect the new file locations immediately."""
+        lib = self._dashboard._library_path
+        if lib:
+            self._dashboard.start_scan(lib)
+
     def _on_new_crate_requested(self) -> None:
+        if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
+            self._show_sync_warning()
+            return
         self._on_nav_by_id('crates')
         inv = self._dashboard._inventory
         lib = self._dashboard._library_path
@@ -468,6 +586,9 @@ class MainWindow(QMainWindow):
             self._crate_manager._on_new_crate()
 
     def _on_new_smart_crate_requested(self) -> None:
+        if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
+            self._show_sync_warning()
+            return
         self._on_nav_by_id('crates')
         inv = self._dashboard._inventory
         lib = self._dashboard._library_path

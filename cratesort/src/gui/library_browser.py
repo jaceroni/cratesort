@@ -193,6 +193,7 @@ class LibraryBrowserView(QWidget):
 
         # Load classification session
         self._session_genre = {}
+        self._session_artists = {}   # track_path (str) → entry.artist (str)
         self._track_overrides = {}
         self._has_classification = False
         session_file = library_path / '_CrateSort' / 'classification_session.json'
@@ -203,10 +204,9 @@ class LibraryBrowserView(QWidget):
                 )
                 session = ClassificationSession.load(session_file)
                 for entry in session.entries:
-                    # Fix 4: artist-level enrichment keyed by sort-form name
                     self._session_genre[entry.artist] = (entry.display_genre, entry.confidence)
-                    # Fix 2: per-track genre overrides from session TrackInfo
                     for track in entry.tracks:
+                        self._session_artists[track.path] = entry.artist
                         if track.genre_tag:
                             self._track_overrides[track.path] = track.genre_tag
                 self._has_classification = bool(self._session_genre)
@@ -378,6 +378,8 @@ class LibraryBrowserView(QWidget):
             edits = self._edits.get(str(rec.path), {})
             if 'reassign_artist' in edits:
                 canonical = edits['reassign_artist']
+            elif str(rec.path) in self._session_artists:
+                canonical = self._session_artists[str(rec.path)]
             else:
                 primary, _ = _extract_primary_artist(rec.artist or 'Unknown Artist')
                 canonical  = _canonical_artist(primary)
@@ -869,7 +871,7 @@ class LibraryBrowserView(QWidget):
         action = menu.exec(self._tree.viewport().mapToGlobal(pos))
         path = str(rec.path)
         if action == reassign:
-            self._reassign_track(item, rec)
+            self._reassign_track(item)
         elif action == chg_g:
             self._change_genre_for_selection(rec.filename, rec.genre or '')
         elif action == edit_t:
@@ -903,11 +905,25 @@ class LibraryBrowserView(QWidget):
         child.setSelected(False)
         self._flash_row_text(child)
 
-    def _reassign_track(self, child: QTreeWidgetItem, rec) -> None:
-        """Move a track to a different (existing or new) artist group."""
+    def _reassign_track(self, child: QTreeWidgetItem) -> None:
+        """Move one or more selected tracks to a different (existing or new) artist group."""
         from cratesort.src.gui.classifier_view import _ReassignArtistDialog
 
-        # Collect existing artist names from top-level tree items
+        # 1. Collect all selected track items; fall back to right-clicked item only
+        selected = [item for item in self._tree.selectedItems() if item.parent()]
+        if child not in selected:
+            selected = [child]
+
+        # 2. Gather (child_item, track_rec, parent_item) — drop rows with no record
+        tracks_to_move = [
+            (item, item.data(LC_PATH, Qt.ItemDataRole.UserRole), item.parent())
+            for item in selected
+        ]
+        tracks_to_move = [(ci, tr, pi) for ci, tr, pi in tracks_to_move if tr is not None]
+        if not tracks_to_move:
+            return
+
+        # 3. Show artist-picker dialog once
         existing_artists = []
         for i in range(self._tree.topLevelItemCount()):
             top = self._tree.topLevelItem(i)
@@ -921,59 +937,76 @@ class LibraryBrowserView(QWidget):
         if not new_artist:
             return
 
-        parent_item = child.parent()
-        parent_data = parent_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-        parent_tracks = parent_data.get('tracks', [])
-
-        # Remove rec from source group
-        try:
-            parent_tracks.remove(rec)
-        except ValueError:
-            pass
-        parent_item.setText(LC_TRACKS, str(len(parent_tracks)))
-        idx = parent_item.indexOfChild(child)
-        parent_item.takeChild(idx)
-
-        # Remove source artist group if now empty
-        if not parent_tracks:
-            top_idx = self._tree.indexOfTopLevelItem(parent_item)
-            self._tree.takeTopLevelItem(top_idx)
-
-        # Find or create destination artist group
+        # 4. Find or create destination artist group
         dest_item = None
+        dest_tracks: list = []
         for i in range(self._tree.topLevelItemCount()):
             top = self._tree.topLevelItem(i)
             top_data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
             if top_data.get('artist', '') == new_artist:
                 dest_item = top
+                dest_tracks = top_data.get('tracks', [])
                 break
 
-        if dest_item is not None:
-            dest_data = dest_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            dest_tracks = dest_data.get('tracks', [])
-            dest_tracks.append(rec)
+        # 5. Move each track: tree removal + path-based list removal + edit persistence
+        modified_parents: list[QTreeWidgetItem] = []
+        for child_item, track_rec, parent_item in tracks_to_move:
+            parent_data = parent_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            parent_tracks = parent_data.get('tracks', [])
+            original_artist = parent_data.get('artist', '')
+
+            # Remove child from tree
+            parent_item.takeChild(parent_item.indexOfChild(child_item))
+
+            # Path-based removal — avoids ValueError when dataclass fields have changed
+            for r in list(parent_tracks):
+                if str(r.path) == str(track_rec.path):
+                    parent_tracks.remove(r)
+                    break
+
+            parent_item.setText(LC_TRACKS, str(len(parent_tracks)))
+            parent_data['tracks'] = parent_tracks
+            parent_item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, parent_data)
+
+            if parent_item not in modified_parents:
+                modified_parents.append(parent_item)
+
+            # Persist edit
+            self._edits.setdefault(str(track_rec.path), {})['reassign_artist'] = new_artist
+            self._edits.setdefault(str(track_rec.path), {})['original_artist'] = original_artist
+
+            dest_tracks.append(track_rec)
+
+        # 6. Update or create the destination group
+        if dest_item is None:
+            genre, _ = self._classify_lookup(new_artist)
+            dest_item = self._make_artist_item(new_artist, dest_tracks, genre)
+            self._tree.addTopLevelItem(dest_item)
+        else:
             dest_item.setText(LC_TRACKS, str(len(dest_tracks)))
-            # Ensure children are loaded then add the track
+            dest_data = dest_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            dest_data['tracks'] = dest_tracks
+            dest_item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, dest_data)
+
             if dest_item.childCount() == 1 and dest_item.child(0).text(0) == _DUMMY:
                 dest_item.takeChild(0)
                 for t in dest_tracks:
                     self._make_track_child(dest_item, t)
             else:
-                self._make_track_child(dest_item, rec)
-        else:
-            # Create new artist group for this track
-            genre, _ = self._classify_lookup(new_artist)
-            dest_item = self._make_artist_item(new_artist, [rec], genre)
-            self._tree.addTopLevelItem(dest_item)
+                for _, track_rec, _ in tracks_to_move:
+                    self._make_track_child(dest_item, track_rec)
+
+        # 7. Remove any parent groups that are now empty
+        for parent_item in modified_parents:
+            parent_data = parent_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            if not parent_data.get('tracks', []):
+                top_idx = self._tree.indexOfTopLevelItem(parent_item)
+                if top_idx >= 0:
+                    self._tree.takeTopLevelItem(top_idx)
 
         dest_item.setExpanded(True)
         dest_item.setSelected(False)
         self._flash_row_text(dest_item)
-
-        # Persist reassignment so it survives app restart
-        original_artist = parent_data.get('artist', '')
-        self._edits.setdefault(str(rec.path), {})['reassign_artist'] = new_artist
-        self._edits.setdefault(str(rec.path), {})['original_artist'] = original_artist
         self._save_edits()
 
     def _change_artist_genre(self, item: QTreeWidgetItem, artist: str) -> None:

@@ -249,6 +249,67 @@ class ClassificationSession:
             created_at=data['created_at'],
         )
 
+    def apply_library_edits(self) -> None:
+        """Apply genre overrides and artist reassignments from library_edits.json."""
+        edits_file = self.library_path / '_CrateSort' / 'library_edits.json'
+        if not edits_file.exists():
+            return
+        try:
+            with open(edits_file, encoding='utf-8') as f:
+                edits = json.load(f)
+        except Exception:
+            return
+
+        # 1. Handle artist reassignments
+        reassignments: dict[str, str] = {}
+        for path, track_edit in edits.items():
+            if 'reassign_artist' in track_edit:
+                reassignments[path] = track_edit['reassign_artist']
+
+        if reassignments:
+            for entry in list(self.entries):
+                moved_tracks = []
+                for track in list(entry.tracks):
+                    if track.path in reassignments:
+                        moved_tracks.append((track, reassignments[track.path]))
+                        entry.tracks.remove(track)
+
+                if moved_tracks and entry.state == 'pending':
+                    entry.state = 'edited'
+
+                if not entry.tracks:
+                    self.entries.remove(entry)
+
+                for track, new_artist in moved_tracks:
+                    dest_entry = next(
+                        (e for e in self.entries if e.artist == new_artist), None
+                    )
+                    if dest_entry:
+                        dest_entry.tracks.append(track)
+                        dest_entry.state = 'edited'
+                    else:
+                        self.entries.append(ArtistEntry(
+                            artist=new_artist,
+                            proposed_genre=track.genre_tag or 'Unclassified',
+                            confidence='LOW',
+                            reason='Manually reassigned in Library',
+                            tracks=[track],
+                            original_genres=[track.genre_tag] if track.genre_tag else [],
+                            state='edited',
+                        ))
+
+        # 2. Apply genre overrides (artist-level and track-level)
+        for entry in self.entries:
+            artist_key = f'__artist__{entry.artist}'
+            if 'genre' in edits.get(artist_key, {}):
+                new_genre = edits[artist_key]['genre']
+                entry.final_genre = new_genre
+                if entry.state in ('pending', 'flagged'):
+                    entry.state = 'edited'
+            for track in entry.tracks:
+                if 'genre' in edits.get(track.path, {}):
+                    track.genre_tag = edits[track.path]['genre']
+
 
 # ---------------------------------------------------------------------------
 # Background worker
@@ -443,7 +504,7 @@ class _ChangeGenreDialog(QDialog):
                 padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
                 background-color: #428175; color: #ffffff;
             }
-            QPushButton:hover { background-color: #4f9688; }
+            QPushButton:hover { background-color: #38706a; }
         """)
 
         layout = QVBoxLayout(self)
@@ -464,6 +525,13 @@ class _ChangeGenreDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        _c = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if _c:
+            _c.setStyleSheet(
+                'QPushButton { background-color: #C75B5B; color: #ffffff; border-radius: 6px; border: none; padding: 8px 24px; min-width: 80px; }'
+                'QPushButton:hover { background-color: #b24c4c; }'
+                'QPushButton:pressed { background-color: #9c3b3b; }'
+            )
         layout.addWidget(buttons)
 
     @property
@@ -497,7 +565,7 @@ class _ReassignArtistDialog(QDialog):
                 padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
                 background-color: #428175; color: #ffffff;
             }
-            QPushButton:hover { background-color: #4f9688; }
+            QPushButton:hover { background-color: #38706a; }
         """)
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -531,6 +599,13 @@ class _ReassignArtistDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        _c = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if _c:
+            _c.setStyleSheet(
+                'QPushButton { background-color: #C75B5B; color: #ffffff; border-radius: 6px; border: none; padding: 8px 24px; min-width: 80px; }'
+                'QPushButton:hover { background-color: #b24c4c; }'
+                'QPushButton:pressed { background-color: #9c3b3b; }'
+            )
         layout.addWidget(buttons)
 
     @property
@@ -561,7 +636,7 @@ class _EditTagsDialog(QDialog):
                 padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
                 background-color: #428175; color: #ffffff;
             }
-            QPushButton:hover { background-color: #4f9688; }
+            QPushButton:hover { background-color: #38706a; }
         """)
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -882,6 +957,7 @@ class ClassifierView(QWidget):
         layout.addWidget(back_btn)
 
         done_btn = QPushButton('Accept && Go to Library')
+        done_btn.setProperty('secondary', 'true')
         done_btn.clicked.connect(self._on_done)
         layout.addWidget(done_btn)
 
@@ -914,7 +990,7 @@ class ClassifierView(QWidget):
 
     def _load_session(self, session: ClassificationSession) -> None:
         self._session = session
-        self._apply_library_edits()
+        self._session.apply_library_edits()
         self._selected_genre = 'All'
         self._rebuild_genre_list()
         self._rebuild_tree()
@@ -1416,6 +1492,25 @@ class ClassifierView(QWidget):
             QTimer.singleShot(3500, lambda: self._update_approval_display())
 
         if self._session:
+            # Persist reassignment to library_edits.json so it propagates to plan and library browser
+            edits_file = self._session.library_path / '_CrateSort' / 'library_edits.json'
+            edits = {}
+            if edits_file.exists():
+                try:
+                    with open(edits_file, encoding='utf-8') as f:
+                        edits = json.load(f)
+                except Exception:
+                    pass
+            edits.setdefault(track.path, {})['reassign_artist'] = new_artist
+            edits.setdefault(track.path, {})['original_artist'] = parent_entry.artist
+
+            edits_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(edits_file, 'w', encoding='utf-8') as f:
+                    json.dump(edits, f, indent=2)
+            except Exception as exc:
+                print(f'[ClassifierView] Failed to save edits: {exc}')
+
             self._session.save()
         self._rebuild_genre_list()
         self._update_approval_display()
