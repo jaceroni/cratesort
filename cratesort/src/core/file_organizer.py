@@ -24,7 +24,12 @@ from cratesort.src.utils.the_handler import TheProposal
 from cratesort.src.core.artist_consolidator import ConsolidationCandidate
 from cratesort.src.utils.sanitizer import sanitize_path_component
 
-sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
+# Ensure serato_crate (Homebrew install) is on the path in non-venv dev environments.
+import sysconfig as _sysconfig
+_brew_sp = '/opt/homebrew/lib/python' + _sysconfig.get_python_version() + '/site-packages'
+if _brew_sp not in sys.path:
+    sys.path.insert(0, _brew_sp)
+del _sysconfig, _brew_sp
 
 logger = logging.getLogger(__name__)
 
@@ -231,19 +236,35 @@ class RollbackLog:
                 errors.append(f"Failed to revert metadata for {orig_path.name}: {exc}")
 
         # Restore Serato crate backups
+        serato_dir_str = self._data.get('serato_dir', '')
+        backup_root   = (Path(serato_dir_str) / '_CrateSort_Backups') if serato_dir_str else None
+        subcrates_root = (Path(serato_dir_str) / 'Subcrates') if serato_dir_str else None
         for backup_str in self._data.get('crate_backup_paths', []):
             backup = Path(backup_str)
             if not backup.exists():
                 continue
-            # Strip _CrateSort_Backups/<name>_TIMESTAMP.crate.bak → original
-            original_name = '_'.join(backup.stem.split('_')[:-2]) + '.crate'
-            subcrates_dir = backup.parent.parent / 'Subcrates'
-            original = subcrates_dir / original_name
             try:
+                original = None
+                if backup_root and subcrates_root:
+                    try:
+                        # New layout: _CrateSort_Backups/Blues/Rock_20240613_123456.crate.bak
+                        rel  = backup.relative_to(backup_root)
+                        bare = rel.with_suffix('').with_suffix('')   # Blues/Rock_20240613_123456
+                        # rsplit from the right (max 2) so underscores in crate names are preserved
+                        parts = bare.name.rsplit('_', 2)
+                        stem  = parts[0] if len(parts) == 3 else bare.name
+                        original = subcrates_root / bare.parent / (stem + '.crate')
+                    except ValueError:
+                        pass  # backup path outside known backup_root — fall through
+                if original is None:
+                    # Legacy fallback for old flat backups (no subdirectory info)
+                    stem = '_'.join(backup.stem.split('_')[:-2])
+                    original = backup.parent.parent / 'Subcrates' / (stem + '.crate')
+                original.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(backup), str(original))
-                logger.info("Restored crate: %s", original.name)
+                logger.info("Restored crate: %s", original)
             except Exception as exc:
-                errors.append(f"Failed to restore crate {original}: {exc}")
+                errors.append(f"Failed to restore crate backup {backup.name}: {exc}")
 
         # Cleanup: remove any now-empty directories that were created
         library_root = Path(self._data.get('library_root', ''))
@@ -361,10 +382,12 @@ class FileOrganizer:
             # Record destination for conflict detection
             destination_map[destination].append(record.path)
 
-            # Filename change?
-            fname_change: Optional[tuple[str, str]] = None
-            if fp and fp.has_changes:
-                fname_change = (record.filename, fp.proposed_filename)
+            # Filename change? Compare actual source vs destination names directly —
+            # destination may have been driven by a title override, not just FilenameCleaner.
+            fname_change: Optional[tuple[str, str]] = (
+                (record.filename, destination.name)
+                if destination.name != record.filename else None
+            )
 
             # Metadata changes
             mp = meta_proposals.get(record.path)
@@ -435,8 +458,16 @@ class FileOrganizer:
                 ))
 
             # Crates affected
-            crate_rel = record.path.as_posix().lstrip('/')
-            crates_affected = crate_lookup.get(crate_rel, [])
+            # Serato stores paths as relative-to-library-root or absolute — try both,
+            # consistent with how _update_crate_paths() supplies both variants.
+            try:
+                crate_key = record.path.relative_to(self._library_root).as_posix()
+            except ValueError:
+                crate_key = record.path.as_posix()
+            crates_affected = (
+                crate_lookup.get(crate_key)
+                or crate_lookup.get(record.path.as_posix(), [])
+            )
 
             operations.append(FileMoveOp(
                 source_path=record.path,
@@ -456,14 +487,15 @@ class FileOrganizer:
 
         # Detect destination files that already exist (not from our moves)
         all_moving_sources = {op.source_path for op in operations}
+        conflict_destinations = {c.destination_path for c in conflicts}
         for op in operations:
             if op.destination_path.exists() and op.destination_path not in all_moving_sources:
-                existing = ConflictReport(
-                    destination_path=op.destination_path,
-                    sources=[op.source_path, op.destination_path],
-                )
-                if op.destination_path not in {c.destination_path for c in conflicts}:
-                    conflicts.append(existing)
+                if op.destination_path not in conflict_destinations:
+                    conflicts.append(ConflictReport(
+                        destination_path=op.destination_path,
+                        sources=[op.source_path, op.destination_path],
+                    ))
+                    conflict_destinations.add(op.destination_path)
 
         # New folders to create
         new_folders = sorted({
@@ -724,12 +756,32 @@ class FileOrganizer:
             tmp_stems_dest = stems_dest.with_suffix(stems_dest.suffix + '.tmp')
             if stems_source.is_dir():
                 shutil.copytree(str(stems_source), str(tmp_stems_dest))
+                # Verify directory contents by relative path + size before destroying source
+                src_manifest = sorted(
+                    (str(f.relative_to(stems_source)), f.stat().st_size)
+                    for f in stems_source.rglob('*') if f.is_file()
+                )
+                dst_manifest = sorted(
+                    (str(f.relative_to(tmp_stems_dest)), f.stat().st_size)
+                    for f in tmp_stems_dest.rglob('*') if f.is_file()
+                )
+                if src_manifest != dst_manifest:
+                    shutil.rmtree(str(tmp_stems_dest), ignore_errors=True)
+                    raise RuntimeError(
+                        f'Stems directory copy verification failed: {stems_source.name}'
+                    )
                 if stems_dest.exists():
                     shutil.rmtree(str(stems_dest))
                 tmp_stems_dest.replace(stems_dest)
                 shutil.rmtree(str(stems_source))
             else:
+                stems_hash = _sha256(stems_source)
                 shutil.copy2(str(stems_source), str(tmp_stems_dest))
+                if _sha256(tmp_stems_dest) != stems_hash:
+                    tmp_stems_dest.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f'Stems file hash mismatch: {stems_source.name}'
+                    )
                 tmp_stems_dest.replace(stems_dest)
                 stems_source.unlink()
             logger.info("Moved stems: %s → %s", stems_source.name, stems_dest)
@@ -857,8 +909,19 @@ class FileOrganizer:
                 / sanitize_path_component(folder)
             )
 
-        # Filename: use cleaned proposal if available, else original
-        if filename_proposal and filename_proposal.has_changes:
+        # Filename priority order:
+        # 1. Explicit in-app title override → derive filename from the new title
+        #    (project rule: filename = song title only; FilenameCleaner only sees the
+        #    disk filename, so it can't know the user renamed the track in-app).
+        # 2. FilenameCleaner proposal (artist strip, encoding fix, etc.)
+        # 3. Original filename unchanged
+        if (
+            hasattr(record, '_original_title')
+            and record.title
+            and record.title != record._original_title
+        ):
+            filename = record.title + record.path.suffix
+        elif filename_proposal and filename_proposal.has_changes:
             filename = filename_proposal.proposed_filename
         else:
             filename = record.filename

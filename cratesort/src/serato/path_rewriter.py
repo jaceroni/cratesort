@@ -8,7 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
+# Ensure serato_crate (Homebrew install) is on the path in non-venv dev environments.
+import sysconfig as _sysconfig
+_brew_sp = '/opt/homebrew/lib/python' + _sysconfig.get_python_version() + '/site-packages'
+if _brew_sp not in sys.path:
+    sys.path.insert(0, _brew_sp)
+del _sysconfig, _brew_sp
 from serato_crate.crate_file import read_crate_file, write_crate_file
 
 logger = logging.getLogger(__name__)
@@ -183,9 +188,17 @@ class PathRewriter:
             return crate_file.name
 
     def _backup(self, file_path: Path) -> Path:
-        self._backup_dir.mkdir(exist_ok=True)
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_path = self._backup_dir / f'{file_path.stem}_{ts}.crate.bak'
+        # Mirror the Subcrates subdirectory so Blues/Rock.crate → _CrateSort_Backups/Blues/Rock_ts.crate.bak.
+        # This avoids filename collisions between same-name crates in different subdirs and
+        # preserves enough path info for rollback to reconstruct the original location.
+        try:
+            rel_dir = file_path.parent.relative_to(self._subcrates_dir)
+        except ValueError:
+            rel_dir = Path('.')
+        target_dir = self._backup_dir / rel_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = target_dir / f'{file_path.stem}_{ts}.crate.bak'
         shutil.copy2(file_path, backup_path)
         return backup_path
 

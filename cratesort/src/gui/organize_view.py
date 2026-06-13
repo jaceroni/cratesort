@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime
 from pathlib import Path
@@ -92,8 +93,13 @@ class _PlanWorker(QThread):
                 for track in entry.tracks:
                     session_artists[Path(track.path)] = entry.artist
 
+            # Per-run shallow copies so the shared inventory is never mutated.
+            # _original_* attributes and field overrides are local to this planning run,
+            # preventing re-plan from capturing already-overridden values as the baseline.
+            inventory = [copy.copy(r) for r in self._inventory]
+
             # Apply all edits and reassignments to inventory
-            for record in self._inventory:
+            for record in inventory:
                 record._original_artist  = record.artist
                 record._original_title   = record.title
                 record._original_album   = record.album
@@ -135,27 +141,27 @@ class _PlanWorker(QThread):
 
             # 3. Reconstruct (TrackRecord, ClassificationResult) pairs
             results = []
-            for record in self._inventory:
+            for record in inventory:
                 cls = classifications.get(record.path)
                 if cls:
                     results.append((record, cls))
 
             # 4. Generate all proposals
-            fn_list = FilenameCleaner().clean_all(self._inventory)
+            fn_list = FilenameCleaner().clean_all(inventory)
             filename_proposals = {
                 record.path: prop
-                for record, prop in zip(self._inventory, fn_list)
+                for record, prop in zip(inventory, fn_list)
             }
 
             the_list = TheHandler().analyze_all(
-                {r.artist for r in self._inventory if r.artist}
+                {r.artist for r in inventory if r.artist}
             )
             the_proposals = {p.original_name: p for p in the_list}
 
             meta_list = MetadataFixer().analyze_all(results)
             meta_proposals = {p.file_path: p for p in meta_list}
 
-            consolidation_list = ArtistConsolidator().analyze(self._inventory)
+            consolidation_list = ArtistConsolidator().analyze(inventory)
             consolidation: dict = {}
             for cand in consolidation_list:
                 for name in [cand.primary_name] + cand.variant_names:
@@ -167,7 +173,7 @@ class _PlanWorker(QThread):
             plan = FileOrganizer(
                 self._library_root, self._serato_dir
             ).build_plan(
-                inventory=self._inventory,
+                inventory=inventory,
                 classifications=classifications,
                 filename_proposals=filename_proposals,
                 the_proposals=the_proposals,
@@ -923,6 +929,12 @@ class OrganizeView(QWidget):
     # ── Worker management ─────────────────────────────────────────────
 
     def _start_plan_worker(self, session_path: Path) -> None:
+        if self._plan_worker is not None:
+            try:
+                self._plan_worker.finished.disconnect()
+                self._plan_worker.errored.disconnect()
+            except RuntimeError:
+                pass
         self._plan_worker = _PlanWorker(
             self._library_path,
             self._serato_dir,
@@ -985,7 +997,9 @@ class OrganizeView(QWidget):
         if failed:
             detail += f'  {failed:,} file{"s" if failed != 1 else ""} failed.'
         self._done_detail.setText(detail)
+        self._rollback_btn.setVisible(True)
         self._rollback_btn.setEnabled(bool(self._rollback_log_path))
+        self._done_back_btn.setEnabled(True)
         self._stack.setCurrentIndex(_STATE_DONE)
         self.status_message.emit(
             f'Reorganization complete. {moved:,} files moved.', 'green'
@@ -1018,6 +1032,8 @@ class OrganizeView(QWidget):
     def _on_rollback_requested(self, log_path: Optional[Path] = None) -> None:
         active_log = log_path if isinstance(log_path, Path) else self._rollback_log_path
         if not active_log:
+            return
+        if self._rb_worker is not None and self._rb_worker.isRunning():
             return
 
         reply = QMessageBox.question(
