@@ -26,7 +26,7 @@ from cratesort.src.serato.crate_writer import (
 from cratesort.src.utils.undo_manager import (
     UndoManager, AddTracksCommand, RemoveTracksCommand, ReorderTracksCommand,
     CreateCrateCommand, DeleteCrateCommand, RenameCrateCommand,
-    ReorderCratesCommand, ReparentCrateCommand,
+    ReorderCratesCommand, ReparentCrateCommand, EditTrackMetadataCommand,
 )
 
 # ---------------------------------------------------------------------------
@@ -1579,15 +1579,22 @@ class CrateManagerView(QWidget):
         if rec is None:
             return
 
-        cell = self._track_table.item(row, col)
-        if cell:
-            cell.setText(new_val)
-
         field_name = _EDITABLE_FIELDS.get(col)
-        if field_name:
+        if not field_name:
+            return
+
+        if self._undo_manager:
+            cmd = EditTrackMetadataCommand(
+                self, str(rec.path), field_name, col, original, new_val,
+            )
+            self._undo_manager.push(cmd)  # execute() updates cell + saves
+        else:
+            cell = self._track_table.item(row, col)
+            if cell:
+                cell.setText(new_val)
             self._edits.setdefault(str(rec.path), {})[field_name] = new_val
-        self._save_edits()
-        self._flash_row(row)
+            self._save_edits()
+            self._flash_row(row)
 
     def _cancel_editor(self) -> None:
         if self._edit_widget is None:

@@ -220,6 +220,48 @@ class ReorderCratesCommand(Command):
         self.view._refresh(select=self.view._current_crate_path)
 
 
+class EditTrackMetadataCommand(Command):
+    """Undoable in-place track metadata edit (title, album, tags, BPM, year, comment)."""
+    source_tab = 'crates'
+
+    def __init__(
+        self,
+        view,
+        file_path: str,
+        field: str,
+        field_col: int,
+        old_val: str,
+        new_val: str,
+    ):
+        self.view      = view
+        self.file_path = file_path
+        self.field     = field
+        self.field_col = field_col
+        self.old_val   = old_val
+        self.new_val   = new_val
+        self.description = f"Edited {field} on '{file_path.rsplit('/', 1)[-1]}'"
+
+    def _apply(self, val: str) -> None:
+        self.view._edits.setdefault(self.file_path, {})[self.field] = val
+        self.view._save_edits()
+        # Update the table cell regardless of current sort order
+        table = self.view._track_table
+        for r in range(table.rowCount()):
+            path_cell = table.item(r, 13)  # TC_PATH = 13
+            if path_cell and path_cell.text() == self.file_path:
+                cell = table.item(r, self.field_col)
+                if cell:
+                    cell.setText(val)
+                self.view._flash_row(r)
+                break
+
+    def execute(self) -> None:
+        self._apply(self.new_val)
+
+    def undo(self) -> None:
+        self._apply(self.old_val)
+
+
 class ReparentCrateCommand(Command):
     def __init__(self, view, drag_path: str, new_parent_path: str):
         self.view           = view

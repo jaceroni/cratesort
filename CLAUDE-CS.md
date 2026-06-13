@@ -231,7 +231,7 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 - **State 1: Planning Screen** — `_PlanWorker` thread builds the plan.
 - **State 2: Preview Screen** — animated stat cards + operations table.
 - **State 3: Executing Screen** — copy-verify-delete progress.
-- **State 4: Done Screen** — success or rollback-in-progress state. Has `self._done_back_btn` (re-enabled after rollback finishes) and `self._rollback_btn`.
+- **State 4: Done Screen** — success or rollback-in-progress state. Has `self._done_back_btn` (re-enabled after rollback finishes) and `self._rollback_btn`. The detail line now shows crate path update status: "N crate(s) updated" on success, or "Crate paths not updated — use Repair Crate Paths in Settings" if `paths_rewritten == 0`.
 
 ### Operations table action labels:
 
@@ -256,6 +256,16 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 ## File Organizer — Current Architecture
 
 `src/core/file_organizer.py`
+
+### Crate path update after reorg
+
+`_update_crate_paths()` in `FileOrganizer.execute()` supplies both relative-to-library-root and absolute path variants for every moved file. If `paths_rewritten == 0` after a non-zero move count, the crate files were not updated — the Done screen now surfaces this with a prompt to use Repair Crate Paths in Settings.
+
+**Two serato_crate API paths (important):**
+- `CrateReader` uses `SeratoCrate.load()` → returns `Path` objects, calls `.as_posix()` → normalized POSIX strings
+- `PathRewriter` uses `read_crate_file()` → returns raw UTF-16 decoded strings directly
+
+For typical POSIX paths these are equivalent. Mismatch can occur if the raw string has non-standard Unicode representation (e.g., a superscript character stored with different NFC/NFD encoding than Python's Path derives from the filesystem). If crate paths are not updating, use Repair Crate Paths in Settings to replay all reorg logs through the PathRewriter.
 
 ### Path rewriter fix (critical)
 
@@ -389,9 +399,18 @@ Called after every execute and rollback. Updates `classification_session.json` a
 ## Undo/Redo System
 
 - `src/utils/undo_manager.py` — Command pattern, 10-state stack, global across tabs
-- 8 command classes: `AddTracksCommand`, `RemoveTracksCommand`, `ReorderTracksCommand`, `CreateCrateCommand`, `DeleteCrateCommand`, `RenameCrateCommand`, `ReorderCratesCommand`, `ReparentCrateCommand`
+- 9 command classes: `AddTracksCommand`, `RemoveTracksCommand`, `ReorderTracksCommand`, `CreateCrateCommand`, `DeleteCrateCommand`, `RenameCrateCommand`, `ReorderCratesCommand`, `ReparentCrateCommand`, `EditTrackMetadataCommand`
 - Undo/Redo buttons in sidebar below album art — teal when active, gray when inactive
 - Cmd+Z / Cmd+Shift+Z keyboard shortcuts
+
+### EditTrackMetadataCommand
+
+Covers inline track metadata edits (title, album, tags, BPM, year, comment) made via the double-click editor in the Crate Manager track table.
+
+- Stores: `file_path` (str), `field` (str), `field_col` (int = `TC_*` constant), `old_val`, `new_val`
+- `execute()` / `undo()` both call `_apply(val)` which updates `_edits` dict, calls `_save_edits()`, finds the row by `TC_PATH` lookup (sort-order safe), updates the cell text, and flashes the row
+- Wired into `_commit_editor()` in `crate_manager.py` — if `_undo_manager` is present the command is pushed instead of applying inline; if no undo manager (e.g., standalone use) it falls back to direct application
+- **Artist reassignment and genre overrides are not yet covered** — those go through separate context-menu paths and still write directly to `library_edits.json` without undo
 
 ---
 

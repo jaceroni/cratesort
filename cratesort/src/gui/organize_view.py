@@ -996,6 +996,12 @@ class OrganizeView(QWidget):
         detail = f'{moved:,} file{"s" if moved != 1 else ""} moved successfully.'
         if failed:
             detail += f'  {failed:,} file{"s" if failed != 1 else ""} failed.'
+        if moved > 0:
+            summary = result.crate_rewrite_summary
+            if summary and summary.get('paths_rewritten', 0) > 0:
+                detail += f'  {summary["crates_modified"]:,} crate(s) updated.'
+            else:
+                detail += '  Crate paths not updated — use Repair Crate Paths in Settings.'
         self._done_detail.setText(detail)
         self._rollback_btn.setVisible(True)
         self._rollback_btn.setEnabled(bool(self._rollback_log_path))
