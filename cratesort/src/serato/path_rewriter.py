@@ -109,12 +109,35 @@ class PathRewriter:
             dry_run=dry_run,
         )
 
+        # Snapshot each crate's bytes before modification so we can restore all
+        # already-written crates if the loop fails mid-way (atomic set guarantee).
+        written_originals: list[tuple[Path, bytes]] = []
+
         for crate_file in sorted(self._subcrates_dir.rglob('*.crate')):
+            mods_before = result.crates_modified
+            pre_bytes   = crate_file.read_bytes() if not dry_run else b''
             try:
                 self._process_crate(crate_file, change_map, result, dry_run)
+                if not dry_run and result.crates_modified > mods_before:
+                    written_originals.append((crate_file, pre_bytes))
             except Exception as exc:
                 logger.error("Error processing %s: %s", crate_file.name, exc)
                 result.errors.append((crate_file, str(exc)))
+                if not dry_run and written_originals:
+                    logger.warning(
+                        "Rewrite failed — restoring %d crate(s) to pre-rewrite state",
+                        len(written_originals),
+                    )
+                    for orig_path, orig_bytes in written_originals:
+                        try:
+                            orig_path.write_bytes(orig_bytes)
+                            logger.info("Restored: %s", orig_path.name)
+                        except Exception as restore_exc:
+                            logger.error(
+                                "CRITICAL: could not restore %s: %s",
+                                orig_path.name, restore_exc,
+                            )
+                break
 
         mode = 'DRY RUN' if dry_run else 'APPLIED'
         logger.info(

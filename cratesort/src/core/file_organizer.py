@@ -50,8 +50,10 @@ class FileMoveOp:
     filename_change: Optional[tuple[str, str]] = None  # (old_name, new_name)
     metadata_changes: list[MetadataChange] = field(default_factory=list)
     crates_affected: list[str] = field(default_factory=list)  # crate full_paths
+    # Set during planning
+    path_too_long: bool = False       # Windows MAX_PATH warning (path > 240 chars)
     # Filled during execution
-    status: str = 'pending'   # 'completed' | 'failed' | 'skipped'
+    status: str = 'pending'   # 'completed' | 'failed' | 'skipped' | 'destination_written'
     error: Optional[str] = None
     sha256_source: Optional[str] = None
     sha256_copy: Optional[str] = None
@@ -77,6 +79,7 @@ class PlanSummary:
     empty_folders_after: int
     protected_skipped: int
     conflict_count: int
+    path_warnings: int = 0            # Windows MAX_PATH candidates (path > 240 chars)
 
 
 @dataclass
@@ -133,14 +136,17 @@ class RollbackLog:
         self._data['serato_dir'] = str(serato_dir) if serato_dir else ''
         self._data['executed_at'] = datetime.now().isoformat()
 
-    def log_move(self, op: FileMoveOp) -> None:
-        self._data['moves'].append({
+    def log_move(self, op: FileMoveOp, duplicate: bool = False) -> None:
+        entry: dict = {
             'source': str(op.source_path),
             'destination': str(op.destination_path),
             'sha256': op.sha256_source or '',
             'executed_at': op.executed_at or '',
             'status': op.status,
-        })
+        }
+        if duplicate:
+            entry['duplicate'] = True
+        self._data['moves'].append(entry)
 
     def log_metadata(
         self,
@@ -185,12 +191,29 @@ class RollbackLog:
         # Reverse file moves: destination → source
         dest_to_src = {}
         for entry in reversed(self._data['moves']):
-            if entry['status'] != 'completed':
+            status = entry['status']
+
+            if status == 'destination_written':
+                # Destination was written but source was never deleted (interrupted move).
+                # Rollback: remove the orphaned destination; source is still intact.
+                dest = Path(entry['destination'])
+                try:
+                    if dest.exists():
+                        dest.unlink()
+                        logger.info("Removed orphaned destination: %s", dest.name)
+                except Exception as exc:
+                    errors.append(f"Failed to remove orphaned destination {dest}: {exc}")
+                    failed += 1
+                continue
+
+            if status != 'completed':
                 skipped += 1
                 continue
+
             src = Path(entry['destination'])
             dst = Path(entry['source'])
             dest_to_src[entry['destination']] = entry['source']
+            is_duplicate = entry.get('duplicate', False)
             try:
                 if not src.exists():
                     errors.append(f"Rollback source missing: {src}")
@@ -198,20 +221,28 @@ class RollbackLog:
                     continue
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-                # Rollback stems if they exist
-                stems_src = _find_stems_file(src)
-                if stems_src:
-                    stems_dst = dst.parent / (dst.stem + stems_src.name[len(src.stem):])
-                    if stems_dst.exists():
-                        if stems_dst.is_dir():
-                            shutil.rmtree(str(stems_dst))
-                        else:
-                            stems_dst.unlink()
-                    shutil.move(str(stems_src), str(stems_dst))
-                    logger.info("Rolled back stems: %s → %s", stems_src.name, stems_dst)
+                if is_duplicate:
+                    # Consolidated duplicate: source was the redundant copy; destination
+                    # is the surviving file. Restore source via copy — never move the
+                    # destination, which may be referenced by other crates.
+                    shutil.copy2(str(src), str(dst))
+                    logger.info("Restored duplicate source (copy): %s", dst.name)
+                else:
+                    # Normal move: rollback stems first, then move file back
+                    stems_src = _find_stems_file(src)
+                    if stems_src:
+                        stems_dst = dst.parent / (dst.stem + stems_src.name[len(src.stem):])
+                        if stems_dst.exists():
+                            if stems_dst.is_dir():
+                                shutil.rmtree(str(stems_dst))
+                            else:
+                                stems_dst.unlink()
+                        shutil.move(str(stems_src), str(stems_dst))
+                        logger.info("Rolled back stems: %s → %s", stems_src.name, stems_dst)
 
-                shutil.move(str(src), str(dst))
-                logger.info("Rolled back: %s → %s", src.name, dst)
+                    shutil.move(str(src), str(dst))
+                    logger.info("Rolled back: %s → %s", src.name, dst)
+
                 restored += 1
             except Exception as exc:
                 errors.append(f"Failed to roll back {src}: {exc}")
@@ -469,6 +500,10 @@ class FileOrganizer:
                 or crate_lookup.get(record.path.as_posix(), [])
             )
 
+            path_too_long = (
+                sys.platform == 'win32' and len(str(destination)) > 240
+            )
+
             operations.append(FileMoveOp(
                 source_path=record.path,
                 destination_path=destination,
@@ -476,6 +511,7 @@ class FileOrganizer:
                 filename_change=fname_change,
                 metadata_changes=meta_changes,
                 crates_affected=crates_affected,
+                path_too_long=path_too_long,
             ))
 
         # Detect conflicts (two sources → same destination)
@@ -530,6 +566,7 @@ class FileOrganizer:
             empty_folders_after=len(empty_after),
             protected_skipped=len(protected_skipped),
             conflict_count=len(conflicts),
+            path_warnings=sum(1 for op in operations if op.path_too_long),
         )
 
         return ReorganizationPlan(
@@ -564,6 +601,9 @@ class FileOrganizer:
         log_path = self._data_dir / f'reorganization_log_{ts}.json'
         rlog = RollbackLog(log_path)
         rlog.set_context(plan.library_root, plan.serato_dir)
+        # Establish the log file on disk before any file operations begin.
+        # If the process is killed mid-reorg, at least an empty (or partial) log exists.
+        rlog.save()
 
         completed: list[FileMoveOp] = []
         failed: list[FileMoveOp] = []
@@ -587,7 +627,8 @@ class FileOrganizer:
                         op.source_path.unlink()
                         op.status = 'completed'
                         op.executed_at = datetime.now().isoformat()
-                        rlog.log_move(op)
+                        rlog.log_move(op, duplicate=True)
+                        rlog.save()  # persist after each operation
                         logger.info("Consolidated duplicate: %s (deleted) -> %s", op.source_path.name, op.destination_path)
                         completed.append(op)
                         continue
@@ -603,34 +644,39 @@ class FileOrganizer:
             try:
                 self._execute_move(op, rlog)
                 completed.append(op)
+                rlog.save()  # persist after each successful move
             except Exception as exc:
                 op.status = 'failed'
                 op.error = str(exc)
                 failed.append(op)
                 logger.error("Failed to move %s: %s", op.source_path.name, exc)
 
-        # Apply metadata changes to moved files
-        for op in completed:
-            if op.metadata_changes:
-                try:
-                    self._apply_metadata(op.destination_path, op.metadata_changes, rlog)
-                except Exception as exc:
-                    logger.warning("Metadata write failed for %s: %s", op.destination_path.name, exc)
+        # Wrap post-move steps in try/finally so the log is always saved even if
+        # crate rewriting or metadata sync throws an unexpected exception.
+        try:
+            # Apply metadata changes to moved files
+            for op in completed:
+                if op.metadata_changes:
+                    try:
+                        self._apply_metadata(op.destination_path, op.metadata_changes, rlog)
+                    except Exception as exc:
+                        logger.warning("Metadata write failed for %s: %s", op.destination_path.name, exc)
 
-        # Update Serato crate paths
-        crate_result = None
-        if plan.serato_dir and plan.serato_dir.exists() and completed:
-            crate_result = self._update_crate_paths(completed, plan.serato_dir, rlog)
+            # Update Serato crate paths
+            crate_result = None
+            if plan.serato_dir and plan.serato_dir.exists() and completed:
+                crate_result = self._update_crate_paths(completed, plan.serato_dir, rlog)
 
-        # Clean up empty folders recursively up to library root
-        for folder in plan.empty_folders_after:
-            self._clean_empty_dir_recursive(folder)
+            # Clean up empty folders recursively up to library root
+            for folder in plan.empty_folders_after:
+                self._clean_empty_dir_recursive(folder)
 
-        # Sync classification_session.json and library_edits.json to new paths
-        path_mapping = {op.source_path: op.destination_path for op in completed}
-        _sync_metadata_files(self._library_root, path_mapping)
+            # Sync classification_session.json and library_edits.json to new paths
+            path_mapping = {op.source_path: op.destination_path for op in completed}
+            _sync_metadata_files(self._library_root, path_mapping)
+        finally:
+            rlog.save()  # always write the final log state
 
-        rlog.save()
         duration = time.time() - start
 
         logger.info(
@@ -786,12 +832,19 @@ class FileOrganizer:
                 stems_source.unlink()
             logger.info("Moved stems: %s → %s", stems_source.name, stems_dest)
 
+        # Register destination in the log BEFORE deleting the source.
+        # If the process is killed after this point but before the unlink, rollback
+        # knows the destination file exists and can clean it up (source still intact).
+        op.status = 'destination_written'
+        op.executed_at = datetime.now().isoformat()
+        rlog.log_move(op)
+
         # Delete original
         op.source_path.unlink()
 
+        # Promote log entry to completed now that source is gone
         op.status = 'completed'
-        op.executed_at = datetime.now().isoformat()
-        rlog.log_move(op)
+        rlog._data['moves'][-1]['status'] = 'completed'
         logger.info("Moved: %s → %s", op.source_path.name, op.destination_path)
 
     # ── Internal: metadata writer ─────────────────────────────────────────────
@@ -873,11 +926,14 @@ class FileOrganizer:
     ) -> Path:
         artist = record.artist or 'Unknown Artist'
 
-        # macOS visual slash replacement for genre path component
+        # macOS visual slash replacement for genre path component, then sanitize
+        # any remaining illegal characters (?, *, ", etc.) without stripping the colon
+        # (which Finder renders as / in directory names on macOS).
         if sys.platform == 'darwin':
             genre_folder = genre.replace('/', ':')
         else:
             genre_folder = genre.replace('/', ' - ')
+        genre_folder = sanitize_path_component(genre_folder)
 
         # Consolidation: determine the folder hierarchy
         candidate = consolidation.get(artist)
@@ -983,6 +1039,18 @@ class FileOrganizer:
 # Utility
 # ---------------------------------------------------------------------------
 
+def _write_json_atomic(path: Path, data) -> None:
+    """Write JSON to path via a .tmp file to prevent truncation on interrupted writes."""
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _sync_metadata_files(library_root: Path, path_mapping: dict) -> None:
     """Update file paths in classification_session.json and library_edits.json after moves."""
     if not path_mapping:
@@ -1004,8 +1072,7 @@ def _sync_metadata_files(library_root: Path, path_mapping: dict) -> None:
                         track['path'] = str(norm[tp])
                         updated = True
             if updated:
-                with open(session_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2)
+                _write_json_atomic(session_file, data)
                 logger.info("Synced classification_session.json with moved file paths.")
         except Exception as exc:
             logger.error("Failed to sync classification_session.json: %s", exc)
@@ -1025,8 +1092,7 @@ def _sync_metadata_files(library_root: Path, path_mapping: dict) -> None:
                 else:
                     new_edits[k] = v
             if updated:
-                with open(edits_file, 'w', encoding='utf-8') as f:
-                    json.dump(new_edits, f, indent=2)
+                _write_json_atomic(edits_file, new_edits)
                 logger.info("Synced library_edits.json with moved file paths.")
         except Exception as exc:
             logger.error("Failed to sync library_edits.json: %s", exc)

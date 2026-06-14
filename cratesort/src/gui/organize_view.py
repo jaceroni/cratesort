@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -786,6 +787,9 @@ class OrganizeView(QWidget):
             else:
                 action_text = 'Move Only'
                 action_color = '#e89ebb'
+            if getattr(op, 'path_too_long', False):
+                action_text += ' ⚠ Path'
+                action_color = _ORANGE
 
             proposed_filename = op.destination_path.name
             try:
@@ -964,9 +968,54 @@ class OrganizeView(QWidget):
 
     # ── Slots ─────────────────────────────────────────────────────────
 
+    def _warn_serato_running(self) -> bool:
+        """Show a branded blocking modal if Serato is open. Returns True if user should abort."""
+        try:
+            from cratesort.src.utils.serato_guard import is_serato_running
+            if not is_serato_running():
+                return False
+        except Exception:
+            return False
+        box = QMessageBox(self)
+        box.setWindowTitle('Serato DJ Pro is Running')
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
+            '<b>Serato DJ Pro is currently open.</b><br><br>'
+            'Close Serato before reorganizing your library. '
+            'If Serato is open during reorganization, it will overwrite '
+            "CrateSort's changes when it closes."
+        )
+        ok_btn = box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
+        ok_btn.setStyleSheet(
+            f'QPushButton {{ background-color: {_DANGER}; color: #ffffff; '
+            f'border: none; border-radius: 5px; padding: 7px 20px; '
+            f'font-size: 13px; font-weight: 600; }}'
+            f'QPushButton:hover {{ background-color: #b24c4c; }}'
+            f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
+        )
+        box.setStyleSheet(
+            f'QMessageBox {{ background-color: {_BG}; }} '
+            f'QLabel {{ color: {_CREAM}; font-size: 13px; }}'
+        )
+        box.exec()
+        return True
+
     def _on_execute(self) -> None:
         if not self._plan:
             return
+        if self._warn_serato_running():
+            return
+        if sys.platform == 'win32' and self._plan.summary.path_warnings > 0:
+            n = self._plan.summary.path_warnings
+            reply = QMessageBox.question(
+                self, 'Path Length Warning',
+                f'{n:,} operation(s) have destination paths that may exceed '
+                f"Windows' 260-character path limit and could fail.\n\nProceed anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self._stack.setCurrentIndex(_STATE_EXEC)
         self._exec_bar.setValue(0)
         self._exec_step.setText('')
@@ -1040,6 +1089,8 @@ class OrganizeView(QWidget):
         if not active_log:
             return
         if self._rb_worker is not None and self._rb_worker.isRunning():
+            return
+        if self._warn_serato_running():
             return
 
         reply = QMessageBox.question(
