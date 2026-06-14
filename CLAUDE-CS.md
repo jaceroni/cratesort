@@ -312,6 +312,17 @@ For typical POSIX paths these are equivalent. Mismatch can occur if the raw stri
 - `_will_be_empty()` ignores stems (file or dir) when checking if a source directory is empty.
 - `_clean_empty_dir_recursive()` quarantines orphaned stems to `_CrateSort/orphaned_stems/` (preserving relative path structure) before removing empty dirs. Uses `_quarantine_stems_in()` which checks `child.name.lower().endswith('.serato-stems')` — NOT `child.is_dir()`.
 
+#### Known gap — subdirectory stems (Phase A fix)
+
+Current stems pairing logic only looks for `.serato-stems` files sitting **directly alongside** the audio file in the same directory. If stems are nested in a subdirectory relative to the audio file, they are not found during `_execute_move()` and end up quarantined to `_CrateSort/orphaned_stems/` rather than traveling with their parent.
+
+**Fix requirements (Phase A):**
+- Stems search must recurse into subdirectories of the audio file's parent directory, not just check the same level
+- When stems are found in a subdirectory, the full relative path relationship between audio file and stems must be preserved at the destination — stems move to the same relative position alongside the audio file at its new location
+- Rollback must move stems back to their original location alongside their parent file — not leave them at the destination
+- Path length must be checked for stems destination paths on Windows (same MAX_PATH guard as audio files)
+- The rollback log must explicitly record stems moves alongside their parent audio file move so recovery is complete
+
 ### Title tag sync
 
 When `build_plan()` generates an operation, it also adds a `MetadataChange(field='title')` to sync the ID3 title tag with the clean destination filename stem. This prevents `FilenameCleaner` from re-proposing the same rename on every subsequent run.

@@ -631,6 +631,7 @@ class _NameInputDialog(QDialog):
 class CrateManagerView(QWidget):
     track_selected      = pyqtSignal(str)
     album_art_requested = pyqtSignal(str)
+    navigate_to_settings = pyqtSignal()   # emitted by "Load Library" on empty-state screen
 
     def __init__(self, undo_manager: Optional['UndoManager'] = None, parent=None):
         super().__init__(parent)
@@ -791,16 +792,34 @@ class CrateManagerView(QWidget):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(0)
         h = QLabel('Crate Manager')
         h.setProperty('role', 'heading')
         h.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        s = QLabel('No Serato library found. Load a library that contains a _Serato_ folder.')
+        s = QLabel(
+            'No Serato library found. Go to Settings to load a library '
+            'that contains a _Serato_ folder.'
+        )
         s.setProperty('role', 'muted')
         s.setAlignment(Qt.AlignmentFlag.AlignCenter)
         s.setWordWrap(True)
         layout.addWidget(h)
         layout.addSpacing(8)
         layout.addWidget(s)
+        layout.addSpacing(16)
+        load_btn = QPushButton('Load Library')
+        load_btn.setFixedWidth(160)
+        load_btn.setMinimumHeight(38)
+        load_btn.setStyleSheet(
+            f'QPushButton {{ background-color: {_TEAL}; color: #ffffff; '
+            f'border: none; border-radius: 5px; padding: 6px 16px; '
+            f'font-size: 13px; font-weight: 600; }}'
+            f'QPushButton:hover {{ background-color: #38706a; }}'
+            f'QPushButton:pressed {{ background-color: #2d6358; }}'
+        )
+        load_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        load_btn.clicked.connect(self.navigate_to_settings.emit)
+        layout.addWidget(load_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         return w
 
     # ── Main layout ───────────────────────────────────────────────────

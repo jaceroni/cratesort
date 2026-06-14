@@ -727,6 +727,26 @@ class DashboardWidget(QWidget):
             btn.setMinimumHeight(42)
             btn.clicked.connect(self._on_select_library)
             layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        elif not saved_path.exists():
+            # Returning user whose library path was deleted or moved.
+            not_found = QLabel('Your previous library could not be found.')
+            not_found.setStyleSheet('font-size: 14px; color: #f1e3c8;')
+            not_found.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(not_found)
+
+            path_text = QLabel(str(saved_path))
+            path_text.setWordWrap(True)
+            path_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            path_text.setStyleSheet('font-size: 12px; color: #7a6a55;')
+            layout.addWidget(path_text)
+
+            btn = QPushButton('Select Music Library…')
+            btn.setFixedWidth(220)
+            btn.setMinimumHeight(42)
+            btn.clicked.connect(self._on_select_library)
+            layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
         else:
             last_lbl = QLabel('Last library:')
             last_lbl.setProperty('role', 'muted')

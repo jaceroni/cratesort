@@ -83,6 +83,10 @@ class MainWindow(QMainWindow):
         else:
             self._update_status('', '')
 
+        # Apply initial nav state (must come after sidebar is built)
+        self._app_state = self._get_app_state()
+        self._apply_nav_state(self._app_state)
+
     # ── UI construction ───────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -110,6 +114,7 @@ class MainWindow(QMainWindow):
         self._dashboard.organize_requested.connect(self._on_organize_requested)
         self._dashboard.new_crate_requested.connect(self._on_new_crate_requested)
         self._dashboard.new_smart_crate_requested.connect(self._on_new_smart_crate_requested)
+        self._dashboard.scan_finished.connect(lambda: self._apply_nav_state(self._get_app_state()))
         self._content.addWidget(self._dashboard)
 
         # Classifier view — index 1
@@ -128,6 +133,7 @@ class MainWindow(QMainWindow):
         self._crate_manager = CrateManagerView(undo_manager=self._undo_manager)
         self._crate_manager.track_selected.connect(self._update_album_art)
         self._crate_manager.album_art_requested.connect(self._update_album_art)
+        self._crate_manager.navigate_to_settings.connect(lambda: self._on_nav_by_id('settings'))
         self._content.addWidget(self._crate_manager)
 
         # Organize view — index 4
@@ -335,6 +341,10 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def _on_nav(self, index: int) -> None:
+        # Fix 5: silent no-op for nav items disabled in States 1 and 2
+        if index in (1, 2, 3, 4) and getattr(self, '_app_state', 3) < 3:
+            return
+
         if index != 0 and hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
             self._show_sync_warning()
             self._nav_btns['dashboard'].setChecked(True)
@@ -346,8 +356,9 @@ class MainWindow(QMainWindow):
         lib = self._dashboard._library_path
         if index == 1:   # Classifier
             if not inv or not lib:
-                self._nav_btns['dashboard'].setChecked(True)
-                self._content.setCurrentIndex(0)
+                # Fix 4: redirect to Settings (recovery path) not Dashboard
+                self._nav_btns['settings'].setChecked(True)
+                self._content.setCurrentIndex(5)
                 self._update_status('Load a library first.', 'amber')
                 return
             self._classifier_view.start(inv, lib)
@@ -377,6 +388,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue('library_path', str(path))
         self._status_library.setText(str(path))
         self._undo_manager.clear()
+        self._apply_nav_state(self._get_app_state())
 
     def _update_undo_buttons(self) -> None:
         _active = (
@@ -399,6 +411,43 @@ class MainWindow(QMainWindow):
         self._undo_btn.setStyleSheet(_active if can_undo else _inactive)
         self._redo_btn.setEnabled(can_redo)
         self._redo_btn.setStyleSheet(_active if can_redo else _inactive)
+
+    # ── App state (library / Serato availability) ──────────────────────
+
+    def _get_app_state(self) -> int:
+        """
+        1 — No library path saved, or saved path no longer exists on disk.
+        2 — Library path exists but contains no _Serato_ folder.
+        3 — Library path exists AND _Serato_ folder is present. Normal operation.
+        """
+        saved = self._settings.value('library_path', None)
+        if not saved:
+            return 1
+        lib = Path(saved)
+        if not lib.exists():
+            return 1
+        if not (lib / '_Serato_').exists():
+            return 2
+        return 3
+
+    def _apply_nav_state(self, state: int) -> None:
+        """Enable/disable nav buttons and set tooltips based on app state."""
+        self._app_state = state
+        disabled = state < 3  # States 1 and 2 disable items 1-4
+        tip = (
+            'Load a library to get started' if state == 1
+            else 'Serato folder not found at this library location'
+        )
+        for i, (nav_id, _, _) in enumerate(_NAV_ITEMS):
+            btn = self._nav_btns.get(nav_id)
+            if btn is None:
+                continue
+            if i in (1, 2, 3, 4):
+                btn.setEnabled(not disabled)
+                btn.setToolTip(tip if disabled else '')
+            else:
+                btn.setEnabled(True)
+                btn.setToolTip('')
 
     def _switch_to_command_tab(self, cmd) -> None:
         """Switch to the tab where the command originated if not already there."""
