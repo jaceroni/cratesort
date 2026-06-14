@@ -1662,6 +1662,29 @@ class ClassifierView(QWidget):
         self._progress_count.setText(message)
 
     def _on_done(self) -> None:
+        # Approve every entry before navigating — "Accept" means accepting the
+        # current proposed state of everything, not just the items the user touched.
         if self._session:
-            self._session.save()
+            self._approve_all()  # approves pending/flagged/edited in place; saves via _on_state_changed
         self.done.emit(0)
+
+    def refresh_track_display(self, file_path: str, field: str, new_value: str) -> None:
+        """
+        Update the displayed value for a specific track after an inline edit in Library.
+        Only updates the display — does not touch genre assignments or classification state.
+        """
+        for i in range(self._tree.topLevelItemCount()):
+            parent = self._tree.topLevelItem(i)
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                track: TrackInfo = child.data(COL_PATH, Qt.ItemDataRole.UserRole)
+                if track and track.path == file_path:
+                    if field == 'title':
+                        track.title = new_value
+                        child.setText(COL_ARTIST, f'  {new_value}' if new_value else f'  {track.filename}')
+                    elif field == 'comment':
+                        track.comment = new_value
+                        snippet = (new_value[:50] + '…') if len(new_value) > 50 else new_value
+                        child.setText(COL_COMMENT, snippet)
+                        child.setToolTip(COL_COMMENT, new_value if new_value else '')
+                    return

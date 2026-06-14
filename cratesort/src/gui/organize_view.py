@@ -507,27 +507,25 @@ class OrganizeView(QWidget):
         session_path = self._library_path / '_CrateSort' / 'classification_session.json'
         has_session  = session_path.exists()
 
-        # Count tracks in the session that have no usable genre assignment.
-        # These block planning — the user must classify them first.
-        unclassified_tracks = 0
+        # Gate requires all session entries to be in an approved state —
+        # same definition as _is_library_classified() in MainWindow.
+        is_classified = False
+        unapproved_count = 0
         if has_session:
             try:
                 from cratesort.src.gui.classifier_view import ClassificationSession as _CS
                 _session = _CS.load(session_path)
-                _UC = {'Unclassified', 'Untagged', ''}
-                for e in _session.entries:
-                    g = e.final_genre or e.proposed_genre
-                    if not g or g in _UC:
-                        unclassified_tracks += len(e.tracks)
+                unapproved_count = _session.total_count - _session.approved_count
+                is_classified = _session.total_count > 0 and unapproved_count == 0
             except Exception:
                 pass
 
-        if not has_session or unclassified_tracks > 0:
-            if unclassified_tracks > 0:
-                n = unclassified_tracks
+        if not has_session or not is_classified:
+            if unapproved_count > 0:
+                n = unapproved_count
                 self._gate_unclassified_lbl.setText(
-                    f'{n:,} track{"s" if n != 1 else ""} still need'
-                    f'{"" if n == 1 else "s"} classification before you can organize.'
+                    f'{n:,} artist{"s" if n != 1 else ""} still need'
+                    f'{"" if n == 1 else "s"} approval before you can organize.'
                 )
             else:
                 self._gate_unclassified_lbl.setText('')

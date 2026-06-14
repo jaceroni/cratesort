@@ -150,6 +150,8 @@ class LibraryBrowserView(QWidget):
     # Emitted when a track is selected (for album art panel)
     track_selected   = pyqtSignal(str)   # file path
     album_art_requested = pyqtSignal(str)
+    # Emitted after an inline edit is committed (file_path, field, new_value)
+    track_field_changed = pyqtSignal(str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -592,7 +594,9 @@ class LibraryBrowserView(QWidget):
 
         rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
         if rec and col in _EDITABLE:
-            self._edits.setdefault(str(rec.path), {})[_EDITABLE[col]] = new_val
+            field = _EDITABLE[col]
+            self._edits.setdefault(str(rec.path), {})[field] = new_val
+            self.track_field_changed.emit(str(rec.path), field, new_val)
         self._save_edits()
 
         # Deselect the row before flashing: selected state applies dark text on

@@ -139,6 +139,9 @@ class MainWindow(QMainWindow):
         # Library Browser — index 2
         self._library_browser = LibraryBrowserView()
         self._library_browser.album_art_requested.connect(self._update_album_art)
+        self._library_browser.track_field_changed.connect(
+            lambda path, field, val: self._classifier_view.refresh_track_display(path, field, val)
+        )
         self._content.addWidget(self._library_browser)
 
         # Crate Manager — index 3
@@ -353,8 +356,11 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def _on_nav(self, index: int) -> None:
-        # Fix 5: silent no-op for nav items disabled in States 1 and 2
-        if index in (1, 2, 3, 4) and getattr(self, '_app_state', 3) < 3:
+        # Silent no-op for nav items disabled by current app state
+        _state = getattr(self, '_app_state', 4)
+        if _state <= 2 and index in (1, 2, 3, 4):
+            return
+        if _state == 3 and index in (2, 4):   # Library and Organize need full classification
             return
 
         if index != 0 and hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
@@ -424,13 +430,33 @@ class MainWindow(QMainWindow):
         self._redo_btn.setEnabled(can_redo)
         self._redo_btn.setStyleSheet(_active if can_redo else _inactive)
 
-    # ── App state (library / Serato availability) ──────────────────────
+    # ── App state (library / Serato / classification) ───────────────────
+
+    def _is_library_classified(self) -> bool:
+        """
+        True when a classification session exists on disk and every entry is in
+        an approved state (approved / changed / edited). Matches the gate check
+        in OrganizeView._refresh_gate_screen() exactly.
+        """
+        saved = self._settings.value('library_path', None)
+        if not saved or not Path(saved).exists():
+            return False
+        session_path = Path(saved) / '_CrateSort' / 'classification_session.json'
+        if not session_path.exists():
+            return False
+        try:
+            from cratesort.src.gui.classifier_view import ClassificationSession
+            session = ClassificationSession.load(session_path)
+            return session.total_count > 0 and session.approved_count == session.total_count
+        except Exception:
+            return False
 
     def _get_app_state(self) -> int:
         """
         1 — No library path saved, or saved path no longer exists on disk.
         2 — Library path exists but contains no _Serato_ folder.
-        3 — Library path exists AND _Serato_ folder is present. Normal operation.
+        3 — Library + _Serato_ present, but classification is incomplete.
+        4 — Library + _Serato_ + all tracks fully classified (approved).
         """
         saved = self._settings.value('library_path', None)
         if not saved:
@@ -440,24 +466,44 @@ class MainWindow(QMainWindow):
             return 1
         if not (lib / '_Serato_').exists():
             return 2
-        return 3
+        if not self._is_library_classified():
+            return 3
+        return 4
 
     def _apply_nav_state(self, state: int) -> None:
-        """Enable/disable nav buttons and set tooltips based on app state."""
+        """
+        Enable/disable nav buttons and tooltips based on app state.
+
+        State 1,2  — No library or no Serato: items 1-4 disabled
+        State 3    — Library+Serato, unclassified: Library(2) and Organize(4) disabled
+        State 4    — Fully classified: all enabled
+        """
         self._app_state = state
-        disabled = state < 3  # States 1 and 2 disable items 1-4
-        tip = (
-            'Load a library to get started' if state == 1
-            else 'Serato folder not found at this library location'
-        )
         for i, (nav_id, _, _) in enumerate(_NAV_ITEMS):
             btn = self._nav_btns.get(nav_id)
             if btn is None:
                 continue
-            if i in (1, 2, 3, 4):
-                btn.setEnabled(not disabled)
-                btn.setToolTip(tip if disabled else '')
-            else:
+            if state <= 2:
+                if i in (1, 2, 3, 4):
+                    btn.setEnabled(False)
+                    btn.setToolTip(
+                        'Load a library to get started' if state == 1
+                        else 'Serato folder not found at this library location'
+                    )
+                else:
+                    btn.setEnabled(True)
+                    btn.setToolTip('')
+            elif state == 3:
+                if i == 2:
+                    btn.setEnabled(False)
+                    btn.setToolTip('Complete classification before browsing your library.')
+                elif i == 4:
+                    btn.setEnabled(False)
+                    btn.setToolTip('Complete classification before organizing your library.')
+                else:
+                    btn.setEnabled(True)
+                    btn.setToolTip('')
+            else:  # state 4 — fully classified
                 btn.setEnabled(True)
                 btn.setToolTip('')
 
@@ -550,6 +596,7 @@ class MainWindow(QMainWindow):
         self._nav_btns['library'].setChecked(True)
         self._content.setCurrentIndex(2)  # library is now index 2
         self._update_status('Classification complete. Ready.', 'green')
+        self._apply_nav_state(self._get_app_state())
 
     def _on_crates_requested(self) -> None:
         if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():

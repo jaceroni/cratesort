@@ -112,7 +112,7 @@ All track listing tables across the entire app must use:
 
 SVG icons live in `cratesort/assets/icons/` as `icon-{nav_id}.svg`. All are filled orange (`#D17D34`).
 
-Nav buttons load SVGs via `QIcon(str(icon_path))` at `16×16`. The `_on_nav(index)` handler calls `.load()` on the appropriate view. Classification (index 1) guards against "no library loaded" and redirects to Dashboard with a status message.
+Nav buttons load SVGs via `QIcon(str(icon_path))` at `16×16`. The `_on_nav(index)` handler calls `.load()` on the appropriate view. `_on_nav()` guards against disabled nav items in States 1 and 2 (no library or Serato missing) — clicks on Classification, Library, Crates, and Organize are silent no-ops. When no-library is detected mid-session, redirects to Settings (index 5) as the recovery path.
 
 After reorg or rollback completes, `OrganizeView.reorg_completed` fires → `MainWindow._on_reorg_completed()` → `_dashboard.start_scan(lib)` to rebuild inventory with new file paths.
 
@@ -138,6 +138,18 @@ The launch screen is a context-aware single screen — no popup dialog. It lives
 - `_LaunchDialog` has been deleted — do not recreate it
 - No popup modal on launch under any circumstances
 - `always_load_last` preference stored in QSettings key `always_load_last` (bool)
+
+### Three app states (nav availability)
+
+Evaluated on every launch and whenever library path changes via `_get_app_state()` → `_apply_nav_state()` in `main_window.py`.
+
+| State | Condition | Nav available |
+|-------|-----------|---------------|
+| 1 — No Library | No path saved, or saved path no longer exists on disk | Dashboard, Settings |
+| 2 — Serato Missing | Library path exists but contains no `_Serato_` folder | Dashboard, Settings |
+| 3 — Fully Loaded | Library path exists and `_Serato_` folder present | All six items |
+
+States 1 and 2: Classification, Library, Crates, Organize are **visible but disabled** — reduced opacity, no hover response, tooltip explaining why. Never hidden. Visible-but-inactive creates the correct FOMO signal and establishes the pattern for paid tier gating later.
 
 ---
 
@@ -273,20 +285,6 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 
 `src/core/file_organizer.py`
 
-### Serato running guard
-
-`src/utils/serato_guard.py` — `is_serato_running() -> bool`. Uses `pgrep`/`tasklist`; never raises (returns False on failure). Called from `OrganizeView._warn_serato_running()` before both execute and rollback. Shows a branded dark modal (`#1a1a1a` bg, `#f1e3c8` text, red dismiss) and blocks the operation if Serato is detected.
-
-### Transaction integrity hardening
-
-- **Incremental rollback log saves**: `execute()` saves the log to disk before any file operations begin, after every successful `_execute_move()`, and in a `try/finally` that covers the crate-rewrite and `_sync_metadata_files()` tail. A crash mid-reorg always has a recoverable log.
-- **Log-before-delete (`destination_written` status)**: `_execute_move()` logs the operation with `status='destination_written'` immediately after `tmp_dest.replace(destination)` — before `source_path.unlink()`. If the process is killed between those two, rollback knows the destination file exists and removes it (source never deleted). After the unlink succeeds, the last log entry is updated in-memory to `'completed'`.
-- **Duplicate consolidation rollback uses copy**: consolidated duplicates are logged with `'duplicate': True`. Rollback uses `shutil.copy2` (not `shutil.move`) so the surviving destination file stays intact.
-- **Atomic JSON writes**: `_write_json_atomic(path, data)` is a module-level helper in `file_organizer.py` that writes to `.tmp` then renames. Used by `_sync_metadata_files()` for both `classification_session.json` and `library_edits.json`.
-- **Genre folder sanitization**: `_build_destination()` passes `genre_folder` through `sanitize_path_component()` after the slash-to-colon replacement. Preserves the macOS colon (Finder renders as `/`); strips `?`, `*`, `"`, `<>` etc. that would cause OS exceptions.
-- **Windows MAX_PATH warning**: on `win32`, `build_plan()` sets `FileMoveOp.path_too_long = True` for destinations > 240 chars. The operations table appends `⚠ Path` to the action label. `_on_execute()` shows a confirmation dialog before starting the worker if any warnings exist.
-- **PathRewriter atomic set**: `rewrite()` snapshots each crate's bytes before modification. On any exception mid-loop, all already-written crates are restored from their snapshots and the loop breaks — Serato never sees a partially-applied rewrite.
-
 ### Crate path update after reorg
 
 `_update_crate_paths()` in `FileOrganizer.execute()` supplies both relative-to-library-root and absolute path variants for every moved file. If `paths_rewritten == 0` after a non-zero move count, the crate files were not updated — the Done screen now surfaces this with a prompt to use Repair Crate Paths in Settings.
@@ -312,16 +310,9 @@ For typical POSIX paths these are equivalent. Mismatch can occur if the raw stri
 - `_will_be_empty()` ignores stems (file or dir) when checking if a source directory is empty.
 - `_clean_empty_dir_recursive()` quarantines orphaned stems to `_CrateSort/orphaned_stems/` (preserving relative path structure) before removing empty dirs. Uses `_quarantine_stems_in()` which checks `child.name.lower().endswith('.serato-stems')` — NOT `child.is_dir()`.
 
-#### Known gap — subdirectory stems (Phase A fix)
+#### Subdirectory stems — implemented (commit 4bad7b9)
 
-Current stems pairing logic only looks for `.serato-stems` files sitting **directly alongside** the audio file in the same directory. If stems are nested in a subdirectory relative to the audio file, they are not found during `_execute_move()` and end up quarantined to `_CrateSort/orphaned_stems/` rather than traveling with their parent.
-
-**Fix requirements (Phase A):**
-- Stems search must recurse into subdirectories of the audio file's parent directory, not just check the same level
-- When stems are found in a subdirectory, the full relative path relationship between audio file and stems must be preserved at the destination — stems move to the same relative position alongside the audio file at its new location
-- Rollback must move stems back to their original location alongside their parent file — not leave them at the destination
-- Path length must be checked for stems destination paths on Windows (same MAX_PATH guard as audio files)
-- The rollback log must explicitly record stems moves alongside their parent audio file move so recovery is complete
+`_find_stems_files()` (new, replaces singular `_find_stems_file()` for active moves) performs a recursive search from the audio file's parent directory. Returns `list[tuple[Path, Path]]` — absolute path + relative path from the audio file's parent. Stems destination is reconstructed as `destination_parent / stems_rel`, preserving the original subdirectory relationship. `RollbackLog.log_move()` stores stems moves under a `stems` key — rollback reverses audio file first, then stems to their original relative position. Old-format rollback log entries fall back to same-directory search. Missing stems at rollback time log a warning and don't fail. Windows MAX_PATH check applied to stems destination paths. Singular `_find_stems_file()` retained unchanged — still used by legacy rollback fallback.
 
 ### Title tag sync
 
@@ -422,6 +413,19 @@ These are the only folder-level categories. Style distinctions live in metadata 
 - No file deletion outside user-approved duplicate consolidation (quarantine, not permanent delete)
 - No independent file moves outside user-triggered reorganization
 
+### Root directory structure (locked)
+
+Whatever location is designated as the library root — external drive, thumb drive, internal Music directory — contains exactly three sibling folders:
+
+```
+[Library Root]/
+  Media/         ← all audio and video files, Genre/Artist/Track hierarchy
+  _Serato_/      ← Serato's crate and database files (must exist — wizard confirms before proceeding)
+  _CrateSort/    ← CrateSort internal data, logs, checkpoints (auto-created if absent)
+```
+
+`Media/`, `_Serato_/`, and `_CrateSort/` are always siblings. Nothing is nested inside another. The root is fully portable — the entire DJ library travels as one self-contained unit.
+
 ---
 
 ## Serato integration rules
@@ -432,6 +436,10 @@ These are the only folder-level categories. Style distinctions live in metadata 
 - **CrateSort owns crate structure.** Crate order, hierarchy, names — all controlled by CrateSort.
 - **The `_Serato_` folder must live on the same drive as the media files.**
 - **CrateSort never auto-creates the `_Serato_/` folder structure.**
+
+### Session-scoped writes (locked rule)
+
+CrateSort writes exclusively to the `_Serato_` folder found within the designated library root for the current session. It never reaches outside that root. It never touches any `_Serato_` folder it was not explicitly pointed at. This makes the app safe for use on a friend's drive — plug in any drive, load it as the session root, do the work, eject. The host machine's own Serato library is never touched.
 
 ### Startup sync (built)
 
@@ -715,7 +723,7 @@ The only things that change between products are the product name, the mascot ge
 
 The mascot is drawn in the **rubber hose** style — the defining animation aesthetic of 1920s and 1930s cartoons. Characterized by flexible, jointless limbs that bend like tubes, bold shapes, large expressive faces, and exaggerated bouncy movement. Iconic references: Felix the Cat, Betty Boop, Cuphead. This style is a hard constraint — not a loose inspiration.
 
-The character is a monkey with headphones, sitting in or emerging from an orange milk crate. The character design is consistent across all CrateSuite products. The expression and hand gesture communicate each product's personality.
+The character is an anthropomorphic vinyl record with arms and legs, wearing headphones, with its face protruding from the center of the record label, sitting in or emerging from an orange milk crate. The character design is consistent across all CrateSuite products. The expression and hand gesture communicate each product's personality.
 
 **CrateView mascot**: Rock horns gesture, eyes up, expressive. Personality: discovery, browsing, "dig deeper." The DJ finding something great.
 

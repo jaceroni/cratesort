@@ -759,7 +759,7 @@ class DashboardWidget(QWidget):
             path_text.setStyleSheet('font-size: 12px; color: #f1e3c8;')
             layout.addWidget(path_text)
 
-            load_btn = QPushButton('Load Library')
+            load_btn = QPushButton('Manage Last Library')
             load_btn.setMinimumHeight(42)
 
             choose_btn = QPushButton('Choose Different Library')
