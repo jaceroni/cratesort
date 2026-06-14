@@ -835,12 +835,14 @@ class FileOrganizer:
         # Atomic rename
         tmp_dest.replace(op.destination_path)
 
-        # Move all associated stems files, preserving their relative position under
-        # the audio file's parent directory (handles subdirectory stems packages).
+        # Move all associated stems files flat into the same directory as the audio
+        # file — no subdirectory at the destination, ever.  The recursive search in
+        # _find_stems_files() still finds stems in subdirs at the SOURCE, but they
+        # always land at destination_parent/stem_filename.  The destination parent dir
+        # was already created above for the audio file, so no extra mkdir is needed.
         moved_stems: list[dict] = []
         for stems_source, stems_rel in _find_stems_files(op.source_path):
-            stems_dest = op.destination_path.parent / stems_rel
-            stems_dest.parent.mkdir(parents=True, exist_ok=True)
+            stems_dest = op.destination_path.parent / stems_source.name
 
             if sys.platform == 'win32' and len(str(stems_dest)) > 240:
                 logger.warning("Stems destination path too long (>240 chars): %s", stems_dest)

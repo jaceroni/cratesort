@@ -158,7 +158,11 @@ class ArtistEntry:
 
     @property
     def display_genre(self) -> str:
-        return self.final_genre if self.state in ('approved', 'changed', 'edited') else self.proposed_genre
+        if self.state in ('approved', 'changed', 'edited'):
+            # final_genre may be '' if state was set to 'edited' via reassignment
+            # without an explicit genre change — fall back to proposed_genre in that case
+            return self.final_genre or self.proposed_genre
+        return self.proposed_genre
 
     @property
     def track_count(self) -> int:
@@ -419,6 +423,16 @@ class _ClassifyWorker(QThread):
                     reason         = 'No genre could be determined'
 
                 original_genres = sorted({rec.genre for rec in tracks if rec.genre})
+
+                # If the classifier returned 'Unclassified' but every file already
+                # carries a single valid taxonomy genre, honour it at HIGH confidence.
+                # CrateSort defers to the existing tags when it has no conflicting opinion.
+                if proposed_genre == 'Unclassified' and original_genres:
+                    tag_genres = {g for g in original_genres if g in PARENT_GENRES}
+                    if len(tag_genres) == 1:
+                        proposed_genre = next(iter(tag_genres))
+                        overall_conf   = 'HIGH'
+                        reason         = f'Existing genre tag: {proposed_genre}'
 
                 # Collaboration detection (fix 7): check if any track in group
                 # had feat./ft. or comma-list in the original artist tag
@@ -1402,7 +1416,34 @@ class ClassifierView(QWidget):
         action = menu.exec(self._tree.viewport().mapToGlobal(pos))
 
         if action == reassign_act:
-            self._reassign_track(child, track, parent_item, parent_entry)
+            selected_tracks = [
+                it for it in self._context_selection if it.parent() is not None
+            ]
+            if len(selected_tracks) <= 1:
+                # Single track — _reassign_track shows its own dialog
+                self._reassign_track(child, track, parent_item, parent_entry)
+            else:
+                # Multi-select: show dialog once, apply new artist to all selected tracks
+                existing = [e.artist for e in self._session.entries] if self._session else []
+                dlg = _ReassignArtistDialog(existing, self)
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    return
+                new_artist = dlg.artist_name.strip()
+                if not new_artist:
+                    return
+                # Snapshot parent references before any tree modifications so
+                # indices stay valid across iterations (items move as children are removed)
+                to_reassign = []
+                for sel_item in selected_tracks:
+                    t: TrackInfo = sel_item.data(COL_PATH, Qt.ItemDataRole.UserRole)
+                    p_item = sel_item.parent()
+                    if p_item is None:
+                        continue
+                    p_entry: ArtistEntry = p_item.data(COL_ARTIST, Qt.ItemDataRole.UserRole)
+                    if t and p_entry:
+                        to_reassign.append((sel_item, t, p_item, p_entry))
+                for sel_item, t, p_item, p_entry in to_reassign:
+                    self._reassign_track(sel_item, t, p_item, p_entry, new_artist=new_artist)
         elif action == chg_genre_act:
             self._change_genre_for_selection(track.filename, track.genre_tag or '')
         elif action == edit_tags_act:
@@ -1416,13 +1457,15 @@ class ClassifierView(QWidget):
         track: TrackInfo,
         parent_item: QTreeWidgetItem,
         parent_entry: ArtistEntry,
+        new_artist: Optional[str] = None,
     ) -> None:
-        existing = [e.artist for e in self._session.entries] if self._session else []
-        # Items 9 + 12: custom dialog with autocomplete and protection notice
-        dlg = _ReassignArtistDialog(existing, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        new_artist = dlg.artist_name.strip()
+        if new_artist is None:
+            existing = [e.artist for e in self._session.entries] if self._session else []
+            # Items 9 + 12: custom dialog with autocomplete and protection notice
+            dlg = _ReassignArtistDialog(existing, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            new_artist = dlg.artist_name.strip()
         if not new_artist:
             return
 
