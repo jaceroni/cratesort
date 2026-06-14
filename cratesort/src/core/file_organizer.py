@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import sys
+import unicodedata
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -360,13 +361,34 @@ class RollbackLog:
         }
 
     def _remove_empty_dirs(self, root: Path) -> None:
-        """Remove any empty directories under root (bottom-up)."""
+        """Remove any empty directories under root (bottom-up).
+
+        Directories containing only hidden system files (.DS_Store, .Spotlight-V100, etc.)
+        are treated as empty: those files are unlinked first so rmdir() succeeds.
+        """
+        _HIDDEN_SYSTEM = {'.ds_store', '.spotlight-v100', '.trashes', '.fseventsd'}
         for dirpath in sorted(root.rglob('*'), reverse=True):
-            if dirpath.is_dir():
-                try:
-                    dirpath.rmdir()  # only succeeds if empty
-                except OSError:
-                    pass
+            if not dirpath.is_dir():
+                continue
+            try:
+                children = list(dirpath.iterdir())
+            except OSError:
+                continue
+            # Unlink any hidden system files that are the only occupants
+            only_hidden = all(
+                c.is_file() and c.name.lower() in _HIDDEN_SYSTEM
+                for c in children
+            )
+            if only_hidden and children:
+                for c in children:
+                    try:
+                        c.unlink()
+                    except OSError:
+                        pass
+            try:
+                dirpath.rmdir()  # only succeeds if now empty
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1109,8 +1131,11 @@ def _sync_metadata_files(library_root: Path, path_mapping: dict) -> None:
     if not path_mapping:
         return
 
-    # Normalise to Path → Path so lookups work regardless of how caller built the dict
-    norm: dict[Path, Path] = {Path(k): Path(v) for k, v in path_mapping.items()}
+    def _nfc_path(p) -> Path:
+        return Path(unicodedata.normalize('NFC', str(p)))
+
+    # Normalise to NFC Path → Path so macOS accent/case variants don't miss entries
+    norm: dict[Path, Path] = {_nfc_path(k): Path(v) for k, v in path_mapping.items()}
 
     session_file = library_root / '_CrateSort' / 'classification_session.json'
     if session_file.exists():
@@ -1120,7 +1145,7 @@ def _sync_metadata_files(library_root: Path, path_mapping: dict) -> None:
             updated = False
             for entry in data.get('entries', []):
                 for track in entry.get('tracks', []):
-                    tp = Path(track['path'])
+                    tp = _nfc_path(track['path'])
                     if tp in norm:
                         track['path'] = str(norm[tp])
                         updated = True
@@ -1138,7 +1163,7 @@ def _sync_metadata_files(library_root: Path, path_mapping: dict) -> None:
             new_edits: dict = {}
             updated = False
             for k, v in edits.items():
-                kp = Path(k)
+                kp = _nfc_path(k)
                 if kp in norm:
                     new_edits[str(norm[kp])] = v
                     updated = True
@@ -1219,6 +1244,12 @@ def _sha256(path: Path) -> str:
 
 # ── Mutagen Tag Writing Helpers ───────────────────────────────────────────
 
+def _ensure_mp4_tags(audio, ext: str) -> None:
+    """Initialize the MP4/M4A tag container if the file has no tags yet."""
+    if ext in {'.mp4', '.m4v', '.mov', '.m4a'} and audio.tags is None:
+        audio.add_tags()
+
+
 def _write_metadata_tag(audio, ext: str, field: str, value: Optional[str]) -> None:
     if field == 'genre':
         _write_genre(audio, ext, value)
@@ -1246,6 +1277,7 @@ def _write_genre(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['TCON'] = mutagen.id3.TCON(encoding=3, text=[value])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('©gen', None)
@@ -1266,6 +1298,7 @@ def _write_sort_artist(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['TSOP'] = mutagen.id3.TSOP(encoding=3, text=[value])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('soar', None)
@@ -1281,6 +1314,7 @@ def _write_artist(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['TPE1'] = mutagen.id3.TPE1(encoding=3, text=[value])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('©ART', None)
@@ -1301,6 +1335,7 @@ def _write_title(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['TIT2'] = mutagen.id3.TIT2(encoding=3, text=[value])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('©nam', None)
@@ -1321,6 +1356,7 @@ def _write_album(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['TALB'] = mutagen.id3.TALB(encoding=3, text=[value])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('©alb', None)
@@ -1341,6 +1377,7 @@ def _write_bpm(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['TBPM'] = mutagen.id3.TBPM(encoding=3, text=[str(value)])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('tmpo', None)
@@ -1364,6 +1401,7 @@ def _write_year(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['TDRC'] = mutagen.id3.TDRC(encoding=3, text=[value])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('©day', None)
@@ -1384,6 +1422,7 @@ def _write_comment(audio, ext: str, value: Optional[str]) -> None:
         else:
             audio.tags['COMM::eng'] = mutagen.id3.COMM(encoding=3, lang='eng', desc='', text=[value])
     elif ext in {'.m4a', '.mp4', '.m4v', '.mov'}:
+        _ensure_mp4_tags(audio, ext)
         if audio.tags is not None:
             if value is None:
                 audio.tags.pop('©cmt', None)

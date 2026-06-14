@@ -141,15 +141,25 @@ The launch screen is a context-aware single screen — no popup dialog. It lives
 
 ### Three app states (nav availability)
 
-Evaluated on every launch and whenever library path changes via `_get_app_state()` → `_apply_nav_state()` in `main_window.py`.
+Evaluated on every launch and whenever library path changes via `_get_app_state()` → `_apply_nav_state()` in `main_window.py`. Classification completion evaluated via `_is_library_classified()` — returns `True` only when every track has an approved valid genre with no pending, flagged, or unclassified entries remaining.
 
-| State | Condition | Nav available |
-|-------|-----------|---------------|
-| 1 — No Library | No path saved, or saved path no longer exists on disk | Dashboard, Settings |
-| 2 — Serato Missing | Library path exists but contains no `_Serato_` folder | Dashboard, Settings |
-| 3 — Fully Loaded | Library path exists and `_Serato_` folder present | All six items |
+| Nav Item | No Library | Library+Serato, Unclassified | Fully Classified |
+|---|---|---|---|
+| Dashboard | Active | Active | Active |
+| Classification | Disabled | Active | Active |
+| Library | Disabled | **Disabled** | Active |
+| Crates | Disabled | Active | Active |
+| Organize | Disabled | **Disabled** | Active |
+| Settings | Active | Active | Active |
 
-States 1 and 2: Classification, Library, Crates, Organize are **visible but disabled** — reduced opacity, no hover response, tooltip explaining why. Never hidden. Visible-but-inactive creates the correct FOMO signal and establishes the pattern for paid tier gating later.
+**Key rules:**
+- Library and Organize are gated on classification completion — not just library/Serato presence
+- Crates is accessible without classification — crate management is independent
+- Disabled items are always **visible** — reduced opacity, no hover, tooltip explaining why. Never hidden.
+- Tooltip for disabled Library: `"Complete classification before browsing your library."`
+- Tooltip for disabled Organize: `"Complete classification before organizing your library."`
+- `_apply_nav_state()` called on launch, library path change, and classification session save
+- Stale library path (saved in QSettings but no longer exists on disk): path and `always_load_last` both cleared from QSettings immediately; welcome screen shown in first-launch state (commit 739c97e)
 
 ---
 
@@ -187,6 +197,40 @@ When changes are detected on launch, an amber banner appears with a "Review && S
 ### Dashboard layout rule:
 
 `_dashboard_layout` uses `addStretch()` at the end — do NOT add `setAlignment(AlignTop)` to it. The stretch absorbs extra space. Adding AlignTop conflicts with addStretch and causes gaps at large window sizes. Section widgets must use `setMinimumHeight`, not `setFixedHeight`, so they don't over-constrain the layout.
+
+---
+
+## Classification View — Current Architecture
+
+`src/gui/classifier_view.py`
+
+### Classification flow (locked)
+
+Classification must be completed before Library or Organize are accessible. The correct linear flow is:
+
+**Classification → Library → Crates → Organize**
+
+Classification is the proposal step — CrateSort tells the DJ what it thinks about genre, style, and naming. Library is the editing surface where the DJ confirms or overrides. Organize executes only after both are complete.
+
+### "Accept and Go to Library" behavior (commit e7391b3)
+
+When clicked, marks **every entry in the classification session as `approved`** regardless of selection state. Entries never touched by the user are approved as-is (proposal stands). Entries marked `modified` or `edited` are approved with their current values. Session is saved to disk before navigating to Library. This button means "I accept the current state of everything" — no select-all required.
+
+### Multi-select reassign (commit 056883e)
+
+`_reassign_track()` accepts `new_artist: Optional[str] = None`. When provided, the dialog is skipped. `_track_context_menu()` detects multi-select via `_context_selection`, shows the dialog once, snapshots all `(item, track, parent_item, parent_entry)` tuples before any tree modification (indices stay valid as items are removed), then calls `_reassign_track(..., new_artist=new_artist)` for each. Drag-and-drop reassignment is not implemented in `ClassifierView`.
+
+### Proposed genre display (commit 056883e)
+
+Two fixes applied:
+- When `state='edited'` but `final_genre=''`, the `display_genre` property now returns `final_genre or proposed_genre` — falls back to the classifier's proposal instead of blank.
+- After `original_genres` is computed, if `proposed_genre='Unclassified'` but all files carry a single valid `PARENT_GENRES` genre tag, that tag is adopted as the proposal at HIGH confidence. Only fires when CrateSort has no conflicting opinion.
+
+Blank proposed genre must only occur when the current genre is not a valid taxonomy genre AND CrateSort cannot determine the correct genre. `'Pop'`, `'Unclassified'`, `'Untagged'`, and empty string are never valid proposed genres.
+
+### Library rename → Classification sync (commit e7391b3)
+
+When a track title is committed via inline edit in Library, `ClassifierView` receives the signal and updates the affected row's displayed title in place. Does not trigger re-classification — only updates display text. Genre assignments, style tags, and classification state are unaffected.
 
 ---
 
@@ -285,7 +329,23 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 
 `src/core/file_organizer.py`
 
-### Crate path update after reorg
+### Serato running guard
+
+`src/utils/serato_guard.py` — `is_serato_running() -> bool`. Uses `pgrep`/`tasklist`; never raises (returns False on failure). Called from `OrganizeView._warn_serato_running()` before both execute and rollback. Shows a branded dark modal (`#1a1a1a` bg, `#f1e3c8` text, red dismiss) and blocks the operation if Serato is detected. (commit ac301c3)
+
+### Transaction integrity hardening (commit ac301c3)
+
+- **Incremental rollback log saves**: `execute()` saves the log to disk before any file operations begin, after every successful `_execute_move()`, and in a `try/finally` that covers the crate-rewrite and `_sync_metadata_files()` tail. A crash mid-reorg always has a recoverable log.
+- **Log-before-delete (`destination_written` status)**: `_execute_move()` logs the operation with `status='destination_written'` immediately after `tmp_dest.replace(destination)` — before `source_path.unlink()`. Rollback knows the destination file exists and removes it if the process was killed between those two steps.
+- **Duplicate consolidation rollback uses copy**: consolidated duplicates logged with `'duplicate': True`. Rollback uses `shutil.copy2` (not `shutil.move`) so the surviving destination file stays intact.
+- **Atomic JSON writes**: `_write_json_atomic(path, data)` module-level helper writes to `.tmp` then renames. Used by `_sync_metadata_files()` for both `classification_session.json` and `library_edits.json`.
+- **Genre folder sanitization**: `_build_destination()` passes `genre_folder` through `sanitize_path_component()` after slash-to-colon replacement.
+- **Windows MAX_PATH warning**: on `win32`, `build_plan()` sets `FileMoveOp.path_too_long = True` for destinations > 240 chars. Operations table appends `⚠ Path` to action label. `_on_execute()` shows confirmation dialog before starting worker if any warnings exist.
+- **PathRewriter atomic set**: `rewrite()` snapshots each crate's bytes before modification. On any exception mid-loop, all already-written crates are restored from snapshots — Serato never sees a partially-applied rewrite.
+
+### build_plan() scope (commit a1891e6)
+
+`build_plan()` considers **every file in the library** as a plan candidate — not just files with session edits. Source of truth is a full library scan compared against the target Genre/Artist/Track structure. State filter was removed — all entries where `final_genre or proposed_genre` is a real genre (not empty/`'Unclassified'`/`'Untagged'`) are included. Files already in the correct structure are excluded as no-ops. Unclassified files are gated out at the Organize gate screen before `build_plan()` runs.
 
 `_update_crate_paths()` in `FileOrganizer.execute()` supplies both relative-to-library-root and absolute path variants for every moved file. If `paths_rewritten == 0` after a non-zero move count, the crate files were not updated — the Done screen now surfaces this with a prompt to use Repair Crate Paths in Settings.
 
@@ -310,9 +370,15 @@ For typical POSIX paths these are equivalent. Mismatch can occur if the raw stri
 - `_will_be_empty()` ignores stems (file or dir) when checking if a source directory is empty.
 - `_clean_empty_dir_recursive()` quarantines orphaned stems to `_CrateSort/orphaned_stems/` (preserving relative path structure) before removing empty dirs. Uses `_quarantine_stems_in()` which checks `child.name.lower().endswith('.serato-stems')` — NOT `child.is_dir()`.
 
-#### Subdirectory stems — implemented (commit 4bad7b9)
+#### Subdirectory stems — implemented (commit 4bad7b9), flat destination fixed (commit 056883e)
 
-`_find_stems_files()` (new, replaces singular `_find_stems_file()` for active moves) performs a recursive search from the audio file's parent directory. Returns `list[tuple[Path, Path]]` — absolute path + relative path from the audio file's parent. Stems destination is reconstructed as `destination_parent / stems_rel`, preserving the original subdirectory relationship. `RollbackLog.log_move()` stores stems moves under a `stems` key — rollback reverses audio file first, then stems to their original relative position. Old-format rollback log entries fall back to same-directory search. Missing stems at rollback time log a warning and don't fail. Windows MAX_PATH check applied to stems destination paths. Singular `_find_stems_file()` retained unchanged — still used by legacy rollback fallback.
+`_find_stems_files()` (new, replaces singular `_find_stems_file()` for active moves) performs a recursive search from the audio file's parent directory. Returns `list[tuple[Path, Path]]` — absolute path + relative path from the audio file's parent. Stems destination is always **flat alongside the parent audio file**: `stems_dest = destination_parent / stems_source.name` — no subdirectory reconstruction at destination. `RollbackLog.log_move()` stores stems moves under a `stems` key — rollback reverses audio file first, then stems to their original relative position (which may include a subdirectory pre-reorg). Old-format rollback log entries fall back to same-directory search. Missing stems at rollback time log a warning and don't fail. Windows MAX_PATH check applied to stems destination paths. Singular `_find_stems_file()` retained unchanged — still used by legacy rollback fallback.
+
+**Stems contract (locked):**
+- Stems always land **flat** in the same directory as their parent audio file — no subdirectory at destination, ever
+- Stems travel with their parent file wherever it goes — if the parent moves, the stem moves with it
+- Stems are **never displayed** anywhere in CrateSort — Library, Crates, Classification, Organize operations table. Invisible to the user. Wrong file extension means the audio scanner never picks them up.
+- The recursive search logic in `_find_stems_files()` is correct — only the destination calculation was changed
 
 ### Title tag sync
 

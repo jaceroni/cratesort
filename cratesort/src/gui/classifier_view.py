@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import sys as _sys
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -254,7 +255,7 @@ class ClassificationSession:
         )
 
     def apply_library_edits(self) -> None:
-        """Apply genre overrides and artist reassignments from library_edits.json."""
+        """Apply genre overrides, artist reassignments, and metadata edits from library_edits.json."""
         edits_file = self.library_path / '_CrateSort' / 'library_edits.json'
         if not edits_file.exists():
             return
@@ -264,9 +265,15 @@ class ClassificationSession:
         except Exception:
             return
 
+        def _nfc(s: str) -> str:
+            return unicodedata.normalize('NFC', s)
+
+        # NFC-normalize all keys so macOS accent/case variants don't bypass lookups
+        nfc_edits = {_nfc(k): v for k, v in edits.items()}
+
         # 1. Handle artist reassignments
         reassignments: dict[str, str] = {}
-        for path, track_edit in edits.items():
+        for path, track_edit in nfc_edits.items():
             if 'reassign_artist' in track_edit:
                 reassignments[path] = track_edit['reassign_artist']
 
@@ -274,8 +281,8 @@ class ClassificationSession:
             for entry in list(self.entries):
                 moved_tracks = []
                 for track in list(entry.tracks):
-                    if track.path in reassignments:
-                        moved_tracks.append((track, reassignments[track.path]))
+                    if _nfc(track.path) in reassignments:
+                        moved_tracks.append((track, reassignments[_nfc(track.path)]))
                         entry.tracks.remove(track)
 
                 if moved_tracks and entry.state == 'pending':
@@ -302,17 +309,24 @@ class ClassificationSession:
                             state='edited',
                         ))
 
-        # 2. Apply genre overrides (artist-level and track-level)
+        # 2. Apply genre overrides and metadata edits (artist-level and track-level)
         for entry in self.entries:
-            artist_key = f'__artist__{entry.artist}'
-            if 'genre' in edits.get(artist_key, {}):
-                new_genre = edits[artist_key]['genre']
+            artist_key = _nfc(f'__artist__{entry.artist}')
+            if 'genre' in nfc_edits.get(artist_key, {}):
+                new_genre = nfc_edits[artist_key]['genre']
                 entry.final_genre = new_genre
                 if entry.state in ('pending', 'flagged'):
                     entry.state = 'edited'
             for track in entry.tracks:
-                if 'genre' in edits.get(track.path, {}):
-                    track.genre_tag = edits[track.path]['genre']
+                track_edit = nfc_edits.get(_nfc(track.path), {})
+                if 'genre' in track_edit:
+                    track.genre_tag = track_edit['genre']
+                if 'title' in track_edit:
+                    track.title = track_edit['title']
+                if 'comment' in track_edit:
+                    track.comment = track_edit['comment']
+                if 'tags' in track_edit:
+                    track.tags = track_edit['tags']
 
 
 # ---------------------------------------------------------------------------
@@ -979,29 +993,6 @@ class ClassifierView(QWidget):
 
     # ── Session loading ───────────────────────────────────────────────
 
-    def _apply_library_edits(self) -> None:
-        """Apply any genre overrides from library_edits.json on top of the loaded session."""
-        if not self._session:
-            return
-        edits_file = self._session.library_path / '_CrateSort' / 'library_edits.json'
-        if not edits_file.exists():
-            return
-        try:
-            with open(edits_file, encoding='utf-8') as f:
-                edits = json.load(f)
-        except Exception:
-            return
-        for entry in self._session.entries:
-            artist_key = f'__artist__{entry.artist}'
-            if 'genre' in edits.get(artist_key, {}):
-                new_genre = edits[artist_key]['genre']
-                entry.final_genre = new_genre
-                if entry.state in ('pending', 'flagged'):
-                    entry.state = 'edited'
-            for track in entry.tracks:
-                if 'genre' in edits.get(track.path, {}):
-                    track.genre_tag = edits[track.path]['genre']
-
     def _load_session(self, session: ClassificationSession) -> None:
         self._session = session
         self._session.apply_library_edits()
@@ -1133,7 +1124,8 @@ class ClassifierView(QWidget):
             CONFIDENCE_COLORS.get(entry.confidence, '#a89b85')
         )))
         item.setText(COL_GENRE,   entry.display_genre)
-        item.setText(COL_CURRENT, ', '.join(entry.original_genres) or '—')
+        current_genres = sorted({t.genre_tag for t in entry.tracks if t.genre_tag})
+        item.setText(COL_CURRENT, ', '.join(current_genres) or '—')
         item.setText(COL_COMMENT, '')
         if entry.state in ('edited', 'changed'):
             item.setText(COL_STATUS, 'Modified')
@@ -1338,6 +1330,26 @@ class ClassifierView(QWidget):
         else:
             self._artist_context_menu(item, pos)
 
+    def _write_library_edit(self, track_path: str, updates: dict) -> None:
+        """Persist track field updates to library_edits.json so Library tab stays in sync."""
+        if not self._session:
+            return
+        edits_file = self._session.library_path / '_CrateSort' / 'library_edits.json'
+        edits: dict = {}
+        if edits_file.exists():
+            try:
+                with open(edits_file, encoding='utf-8') as f:
+                    edits = json.load(f)
+            except Exception:
+                pass
+        edits.setdefault(track_path, {}).update(updates)
+        edits_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(edits_file, 'w', encoding='utf-8') as f:
+                json.dump(edits, f, indent=2)
+        except Exception as exc:
+            print(f'[ClassifierView] Failed to save library edits: {exc}')
+
     def _change_genre_for_selection(self, hint_label: str = '', hint_genre: str = '') -> None:
         """Apply a single genre change to every currently selected item (artist or track)."""
         selected = getattr(self, '_context_selection', None) or list(self._tree.selectedItems())
@@ -1357,11 +1369,13 @@ class ClassifierView(QWidget):
                     entry.state = 'edited'
                     entry.final_genre = new_genre
                     self._refresh_item_display(item, entry)
+                    self._write_library_edit(f'__artist__{entry.artist}', {'genre': new_genre})
             else:
                 track: TrackInfo = item.data(COL_PATH, Qt.ItemDataRole.UserRole)
                 if track:
                     track.genre_tag = new_genre
                     item.setText(COL_GENRE, new_genre)
+                    self._write_library_edit(track.path, {'genre': new_genre})
         self._on_state_changed()
 
     def _artist_context_menu(self, item: QTreeWidgetItem, pos) -> None:
@@ -1601,6 +1615,7 @@ class ClassifierView(QWidget):
                 if t:
                     t.genre_tag = new_genre
                     sel.setText(COL_GENRE, new_genre)
+                    self._write_library_edit(t.path, {'genre': new_genre})
             if self._session:
                 self._session.save()
 
@@ -1608,6 +1623,7 @@ class ClassifierView(QWidget):
         """Item 13: open Edit Tags dialog."""
         dlg = _EditTagsDialog(track, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._write_library_edit(track.path, {'tags': track.tags})
             if self._session:
                 self._session.save()
 

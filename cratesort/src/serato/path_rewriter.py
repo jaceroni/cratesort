@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shutil
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,11 @@ from serato_crate.crate_file import read_crate_file, write_crate_file
 logger = logging.getLogger(__name__)
 
 SUBCRATES_DIR = 'Subcrates'
+
+
+def _nfc_posix(s: str) -> str:
+    """NFC-normalize and convert backslashes to forward slashes for consistent path comparison."""
+    return unicodedata.normalize('NFC', s.replace('\\', '/'))
 BACKUP_DIR = '_CrateSort_Backups'
 
 
@@ -164,15 +170,40 @@ class PathRewriter:
         new_data: list[tuple[str, Any]] = []
         crate_changes: list[PathChangeRecord] = []
 
+        # Build NFC-normalised change_map for consistent lookups
+        nfc_map: dict[str, str] = {_nfc_posix(k): v for k, v in change_map.items()}
+
         for tag, value in raw_data:
             if tag == 'otrk':
                 inner_records: list[tuple[str, Any]] = []
                 for inner_tag, inner_val in value:
-                    # Serato inconsistently stores ':' as U+F022 in some crates.
-                    # Normalise before lookup so both variants match the same key.
-                    normalised = inner_val.replace('', ':') if inner_tag == 'ptrk' else inner_val
-                    if inner_tag == 'ptrk' and normalised in change_map:
-                        new_path = change_map[normalised]
+                    if inner_tag != 'ptrk':
+                        inner_records.append((inner_tag, inner_val))
+                        continue
+
+                    # Normalise: U+F022 → ':', NFC, backslash → /
+                    normalised = _nfc_posix(inner_val.replace('', ':'))
+
+                    # 1. Exact match
+                    new_path: str | None = nfc_map.get(normalised)
+
+                    # 2. Suffix match — handles absolute crate paths vs relative change keys.
+                    #    e.g. crate stores "/Volumes/Drive/Library/Media/Blues/track.mp3"
+                    #    but change_map has "Media/Blues/track.mp3" as a relative key.
+                    if new_path is None:
+                        for old_nfc_key, new_val in nfc_map.items():
+                            if normalised.endswith('/' + old_nfc_key):
+                                suffix_len = len('/' + old_nfc_key)
+                                prefix = normalised[:-suffix_len]
+                                new_path = prefix + '/' + _nfc_posix(new_val)
+                                # Preserve the original leading-slash preference
+                                if inner_val.startswith('/') and not new_path.startswith('/'):
+                                    new_path = '/' + new_path
+                                elif not inner_val.startswith('/') and new_path.startswith('/'):
+                                    new_path = new_path.lstrip('/')
+                                break
+
+                    if new_path is not None:
                         crate_changes.append(PathChangeRecord(
                             crate_full_path=crate_display,
                             crate_file=crate_file,

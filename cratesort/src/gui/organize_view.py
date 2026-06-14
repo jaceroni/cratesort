@@ -10,9 +10,9 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QProgressBar,
+    QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QProgressBar,
     QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from cratesort.src.core.classifier import ClassificationResult, Confidence
@@ -250,6 +250,8 @@ class _RollbackWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class _OrganizeStatCard(QFrame):
+    clicked = pyqtSignal()
+
     def __init__(self, icon: str, suffix: str, label: str, is_warning_type: bool = False, parent=None):
         super().__init__(parent)
         self._target   = 0
@@ -325,7 +327,83 @@ class _OrganizeStatCard(QFrame):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.start_animation(1400)
+            self.clicked.emit()
         super().mousePressEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# _WarningsDetailDialog — expandable details for conflicts / path warnings / skipped
+# ---------------------------------------------------------------------------
+
+class _WarningsDetailDialog(QDialog):
+    def __init__(self, plan: ReorganizationPlan, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Warnings && Conflicts')
+        self.setMinimumWidth(620)
+        self.setMinimumHeight(440)
+        self.setStyleSheet(f'QDialog {{ background-color: {_PANEL}; }}')
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel('Plan Warnings && Conflicts')
+        title_lbl.setStyleSheet(
+            f'color: {_CREAM}; font-size: 15px; font-weight: 600; '
+            f'background: transparent; border: none;'
+        )
+        layout.addWidget(title_lbl)
+
+        lines: list[str] = []
+
+        if plan.conflicts:
+            lines.append(f'CONFLICTS  ({len(plan.conflicts)})')
+            lines.append('─' * 60)
+            for c in plan.conflicts:
+                lines.append(f'  Destination: {c.destination_path.name}')
+                for s in c.sources:
+                    lines.append(f'    From: {s}')
+            lines.append('')
+
+        path_warns = [op for op in plan.operations if getattr(op, 'path_too_long', False)]
+        if path_warns:
+            lines.append(f'PATH LENGTH WARNINGS  ({len(path_warns)})')
+            lines.append('─' * 60)
+            for op in path_warns:
+                lines.append(f'  {op.destination_path}')
+            lines.append('')
+
+        if plan.protected_skipped:
+            lines.append(f'PROTECTED / SKIPPED  ({len(plan.protected_skipped)})')
+            lines.append('─' * 60)
+            for file_path, reason in plan.protected_skipped:
+                lines.append(f'  {reason}: {file_path.name}')
+            lines.append('')
+
+        if not lines:
+            lines.append('No warnings or conflicts.')
+
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText('\n'.join(lines))
+        text_edit.setStyleSheet(
+            f'QTextEdit {{ background-color: {_BG}; color: {_CREAM}; '
+            f'border: 1px solid #444; border-radius: 4px; '
+            f'font-size: 12px; font-family: monospace; padding: 8px; }}'
+        )
+        layout.addWidget(text_edit, stretch=1)
+
+        close_btn = QPushButton('Close')
+        close_btn.setFixedWidth(100)
+        close_btn.setStyleSheet(
+            f'QPushButton {{ background-color: {_TEAL}; color: #ffffff; '
+            f'border: none; border-radius: 5px; padding: 7px 16px; '
+            f'font-size: 13px; font-weight: 600; }}'
+            f'QPushButton:hover {{ background-color: #38706a; }}'
+            f'QPushButton:pressed {{ background-color: #2d6358; }}'
+        )
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +877,8 @@ class OrganizeView(QWidget):
         self._card_stay.update_target(summary.files_staying)
         self._card_folders.update_target(summary.new_folders)
         self._card_crates.update_target(summary.crates_to_update)
-        self._card_warnings.update_target(summary.conflict_count)
+        total_warnings = summary.conflict_count + summary.path_warnings + summary.protected_skipped
+        self._card_warnings.update_target(total_warnings)
 
         # Trigger animations with visual cascade offsets
         QTimer.singleShot(100, lambda: self._card_move.start_animation(1600))
@@ -995,10 +1074,21 @@ class OrganizeView(QWidget):
         self._plan = plan
         self._populate_stats(plan.summary)
         self._populate_ops_table(plan)
+        try:
+            self._card_warnings.clicked.disconnect()
+        except RuntimeError:
+            pass
+        self._card_warnings.clicked.connect(self._show_warnings_dialog)
         self._stack.setCurrentIndex(_STATE_PREVIEW)
         self.status_message.emit(
             'Reorganization plan ready. Review before executing.', 'green'
         )
+
+    def _show_warnings_dialog(self) -> None:
+        if not self._plan:
+            return
+        dlg = _WarningsDetailDialog(self._plan, self)
+        dlg.exec()
 
     def _on_plan_error(self, message: str) -> None:
         self.status_message.emit('Plan build failed.', 'error')
@@ -1080,13 +1170,16 @@ class OrganizeView(QWidget):
     def _on_exec_finished(self, result: ExecutionResult) -> None:
         self._exec_result       = result
         self._rollback_log_path = result.rollback_log_path
-        moved  = len(result.completed)
-        failed = len(result.failed)
+        moved   = len(result.completed)
+        failed  = len(result.failed)
+        skipped = len(result.skipped)
 
         self._done_label.setText('Reorganization complete!')
         detail = f'{moved:,} file{"s" if moved != 1 else ""} moved successfully.'
         if failed:
             detail += f'  {failed:,} file{"s" if failed != 1 else ""} failed.'
+        if skipped:
+            detail += f'  {skipped:,} file{"s" if skipped != 1 else ""} skipped.'
         if moved > 0:
             summary = result.crate_rewrite_summary
             if summary and summary.get('paths_rewritten', 0) > 0:
