@@ -430,8 +430,8 @@ class FileOrganizer:
                 continue
 
             cls = classifications.get(record.path)
-            if not cls or not cls.genre:
-                # Can't classify → stays put
+            if not cls or not cls.genre or cls.genre in ('Unclassified', 'Untagged'):
+                # No genre or placeholder genre — cannot organize without a real destination
                 stays_put.append(record.path)
                 continue
 

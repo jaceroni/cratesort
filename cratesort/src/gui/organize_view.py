@@ -128,17 +128,23 @@ class _PlanWorker(QThread):
                 if 'comment' in track_edit:
                     record.comment = track_edit['comment']
 
-            # 2. Build classifications dict from approved entries
+            # 2. Build classifications dict from ALL entries with a valid genre.
+            # 'pending' and 'flagged' entries carry a classifier-proposed genre that
+            # is valid for organizing even before the user explicitly approves it.
+            # The gate screen already blocks planning when truly unclassified tracks
+            # exist, so by the time we reach here every entry should have a real genre.
+            _UC_GENRES = {'Unclassified', 'Untagged', ''}
             classifications: dict = {}
             for entry in session.entries:
-                if entry.state in ('approved', 'changed', 'edited'):
-                    genre = entry.final_genre or entry.proposed_genre
-                    for track in entry.tracks:
-                        classifications[Path(track.path)] = ClassificationResult(
-                            genre=genre,
-                            confidence=Confidence.HIGH,
-                            reason=f'Approved: {genre}',
-                        )
+                genre = entry.final_genre or entry.proposed_genre
+                if not genre or genre in _UC_GENRES:
+                    continue  # no valid genre — gate screen should have blocked this
+                for track in entry.tracks:
+                    classifications[Path(track.path)] = ClassificationResult(
+                        genre=genre,
+                        confidence=Confidence.HIGH,
+                        reason=f'Classified ({entry.state}): {genre}',
+                    )
 
             # 3. Reconstruct (TrackRecord, ClassificationResult) pairs
             results = []
@@ -427,6 +433,15 @@ class OrganizeView(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet(f'color: {_MUTED}; font-size: 12px;')
         needs_layout.addWidget(note)
+
+        # Dynamic label — set by _refresh_gate_screen() when unclassified tracks exist
+        self._gate_unclassified_lbl = QLabel('')
+        self._gate_unclassified_lbl.setWordWrap(True)
+        self._gate_unclassified_lbl.setStyleSheet(
+            f'color: {_ORANGE}; font-size: 13px; font-weight: 500;'
+        )
+        needs_layout.addWidget(self._gate_unclassified_lbl)
+
         layout.addWidget(self._gate_needs_class_widget)
 
         # ── "Ready to plan" panel ─────────────────────────────────────
@@ -491,8 +506,37 @@ class OrganizeView(QWidget):
 
         session_path = self._library_path / '_CrateSort' / 'classification_session.json'
         has_session  = session_path.exists()
-        self._gate_needs_class_widget.setVisible(not has_session)
-        self._gate_ready_widget.setVisible(has_session)
+
+        # Count tracks in the session that have no usable genre assignment.
+        # These block planning — the user must classify them first.
+        unclassified_tracks = 0
+        if has_session:
+            try:
+                from cratesort.src.gui.classifier_view import ClassificationSession as _CS
+                _session = _CS.load(session_path)
+                _UC = {'Unclassified', 'Untagged', ''}
+                for e in _session.entries:
+                    g = e.final_genre or e.proposed_genre
+                    if not g or g in _UC:
+                        unclassified_tracks += len(e.tracks)
+            except Exception:
+                pass
+
+        if not has_session or unclassified_tracks > 0:
+            if unclassified_tracks > 0:
+                n = unclassified_tracks
+                self._gate_unclassified_lbl.setText(
+                    f'{n:,} track{"s" if n != 1 else ""} still need'
+                    f'{"" if n == 1 else "s"} classification before you can organize.'
+                )
+            else:
+                self._gate_unclassified_lbl.setText('')
+            self._gate_needs_class_widget.setVisible(True)
+            self._gate_ready_widget.setVisible(False)
+        else:
+            self._gate_unclassified_lbl.setText('')
+            self._gate_needs_class_widget.setVisible(False)
+            self._gate_ready_widget.setVisible(True)
 
         # Clear previous history rows
         while self._history_layout.count():
