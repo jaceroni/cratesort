@@ -55,6 +55,18 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._settings = QSettings(ORG, APP)
 
+        # Before building the UI, remove any stale 'library_path' whose directory
+        # no longer exists on disk.  DashboardWidget.__init__() reads this key
+        # during _build_ui(); if it sees a valid-looking path, it passes it to
+        # _build_welcome() *and* the always_load_last block later calls start_scan()
+        # on the deleted directory — resulting in a blank dashboard with no welcome
+        # screen.  Clearing here means the widget sees None and shows the clean
+        # first-launch UI.  QSettings key: 'library_path'.
+        _stored_lib = self._settings.value('library_path', None)
+        if _stored_lib and not Path(_stored_lib).exists():
+            self._settings.remove('library_path')
+            self._settings.setValue('always_load_last', False)
+
         self.setWindowTitle(f'CrateSort  {VERSION}')
         self.setMinimumSize(900, 600)
 
