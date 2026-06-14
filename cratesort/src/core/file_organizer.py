@@ -136,7 +136,12 @@ class RollbackLog:
         self._data['serato_dir'] = str(serato_dir) if serato_dir else ''
         self._data['executed_at'] = datetime.now().isoformat()
 
-    def log_move(self, op: FileMoveOp, duplicate: bool = False) -> None:
+    def log_move(
+        self,
+        op: FileMoveOp,
+        duplicate: bool = False,
+        stems: Optional[list[dict]] = None,
+    ) -> None:
         entry: dict = {
             'source': str(op.source_path),
             'destination': str(op.destination_path),
@@ -146,6 +151,8 @@ class RollbackLog:
         }
         if duplicate:
             entry['duplicate'] = True
+        if stems:
+            entry['stems'] = stems
         self._data['moves'].append(entry)
 
     def log_metadata(
@@ -228,20 +235,53 @@ class RollbackLog:
                     shutil.copy2(str(src), str(dst))
                     logger.info("Restored duplicate source (copy): %s", dst.name)
                 else:
-                    # Normal move: rollback stems first, then move file back
-                    stems_src = _find_stems_file(src)
-                    if stems_src:
-                        stems_dst = dst.parent / (dst.stem + stems_src.name[len(src.stem):])
-                        if stems_dst.exists():
-                            if stems_dst.is_dir():
-                                shutil.rmtree(str(stems_dst))
-                            else:
-                                stems_dst.unlink()
-                        shutil.move(str(stems_src), str(stems_dst))
-                        logger.info("Rolled back stems: %s → %s", stems_src.name, stems_dst)
-
+                    # Normal move: audio file back first, then each stems file
                     shutil.move(str(src), str(dst))
                     logger.info("Rolled back: %s → %s", src.name, dst)
+
+                    stems_log = entry.get('stems', [])
+                    if stems_log:
+                        # New format: logged stems paths with full source/destination info
+                        for stem_entry in stems_log:
+                            stem_src = Path(stem_entry['destination'])  # current location
+                            stem_dst = Path(stem_entry['source'])        # original location
+                            if not stem_src.exists():
+                                logger.warning(
+                                    "Stems rollback source missing (skipping): %s", stem_src
+                                )
+                                continue
+                            try:
+                                stem_dst.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(stem_src), str(stem_dst))
+                                logger.info(
+                                    "Rolled back stems: %s → %s", stem_src.name, stem_dst
+                                )
+                            except Exception as exc:
+                                errors.append(
+                                    f"Failed to roll back stems {stem_src.name}: {exc}"
+                                )
+                    else:
+                        # Legacy fallback: same-directory search for old log entries
+                        stems_src_found = _find_stems_file(src)
+                        if stems_src_found:
+                            stems_dst = dst.parent / (
+                                dst.stem + stems_src_found.name[len(src.stem):]
+                            )
+                            if stems_dst.exists():
+                                if stems_dst.is_dir():
+                                    shutil.rmtree(str(stems_dst))
+                                else:
+                                    stems_dst.unlink()
+                            try:
+                                shutil.move(str(stems_src_found), str(stems_dst))
+                                logger.info(
+                                    "Rolled back stems (legacy): %s → %s",
+                                    stems_src_found.name, stems_dst,
+                                )
+                            except Exception as exc:
+                                errors.append(
+                                    f"Failed to roll back stems {stems_src_found.name}: {exc}"
+                                )
 
                 restored += 1
             except Exception as exc:
@@ -795,14 +835,19 @@ class FileOrganizer:
         # Atomic rename
         tmp_dest.replace(op.destination_path)
 
-        # Check and move stems file if present
-        stems_source = _find_stems_file(op.source_path)
-        if stems_source:
-            stems_dest = op.destination_path.parent / (op.destination_path.stem + stems_source.name[len(op.source_path.stem):])
-            tmp_stems_dest = stems_dest.with_suffix(stems_dest.suffix + '.tmp')
+        # Move all associated stems files, preserving their relative position under
+        # the audio file's parent directory (handles subdirectory stems packages).
+        moved_stems: list[dict] = []
+        for stems_source, stems_rel in _find_stems_files(op.source_path):
+            stems_dest = op.destination_path.parent / stems_rel
+            stems_dest.parent.mkdir(parents=True, exist_ok=True)
+
+            if sys.platform == 'win32' and len(str(stems_dest)) > 240:
+                logger.warning("Stems destination path too long (>240 chars): %s", stems_dest)
+
+            tmp_stems_dest = stems_dest.parent / (stems_dest.name + '.tmp')
             if stems_source.is_dir():
                 shutil.copytree(str(stems_source), str(tmp_stems_dest))
-                # Verify directory contents by relative path + size before destroying source
                 src_manifest = sorted(
                     (str(f.relative_to(stems_source)), f.stat().st_size)
                     for f in stems_source.rglob('*') if f.is_file()
@@ -830,14 +875,20 @@ class FileOrganizer:
                     )
                 tmp_stems_dest.replace(stems_dest)
                 stems_source.unlink()
-            logger.info("Moved stems: %s → %s", stems_source.name, stems_dest)
+
+            logger.info("Moved stems: %s → %s", stems_source, stems_dest)
+            moved_stems.append({
+                'source':      str(stems_source),
+                'destination': str(stems_dest),
+                'rel_path':    str(stems_rel),
+            })
 
         # Register destination in the log BEFORE deleting the source.
         # If the process is killed after this point but before the unlink, rollback
         # knows the destination file exists and can clean it up (source still intact).
         op.status = 'destination_written'
         op.executed_at = datetime.now().isoformat()
-        rlog.log_move(op)
+        rlog.log_move(op, stems=moved_stems if moved_stems else None)
 
         # Delete original
         op.source_path.unlink()
@@ -1103,6 +1154,7 @@ def _is_stems_path(path: Path) -> bool:
 
 
 def _find_stems_file(track_path: Path) -> Optional[Path]:
+    """Same-directory stems lookup — retained for legacy rollback log compatibility."""
     if not track_path.parent.exists():
         return None
     track_stem_lower = track_path.stem.lower()
@@ -1117,6 +1169,44 @@ def _find_stems_file(track_path: Path) -> Optional[Path]:
     except Exception:
         pass
     return None
+
+
+def _find_stems_files(track_path: Path) -> list[tuple[Path, Path]]:
+    """
+    Recursively search for .serato-stems packages paired with track_path.
+
+    Returns a list of (abs_path, path_relative_to_track_parent) tuples so the
+    caller can reconstruct the same subdirectory structure at the destination.
+    Does not descend into .serato-stems packages themselves.
+    """
+    if not track_path.parent.exists():
+        return []
+    track_stem_lower = track_path.stem.lower()
+    results: list[tuple[Path, Path]] = []
+
+    def _search(directory: Path) -> None:
+        try:
+            for child in directory.iterdir():
+                if child.name.lower().endswith('.serato-stems'):
+                    name_lower = child.name.lower()
+                    if name_lower.startswith(track_stem_lower):
+                        rest = name_lower[len(track_stem_lower):]
+                        if rest == '.serato-stems' or (
+                            rest.startswith('.') and rest.endswith('.serato-stems')
+                        ):
+                            try:
+                                rel = child.relative_to(track_path.parent)
+                                results.append((child, rel))
+                            except ValueError:
+                                pass
+                    # Never descend into .serato-stems packages
+                elif child.is_dir():
+                    _search(child)
+        except Exception:
+            pass
+
+    _search(track_path.parent)
+    return results
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
