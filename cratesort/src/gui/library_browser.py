@@ -12,6 +12,7 @@ from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem,
     QMenu, QPushButton, QSplitter, QStackedWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -31,10 +32,15 @@ LC_YEAR     = 8   # (blank)     | Year
 LC_BITRATE  = 9   # (blank)     | kbps
 LC_COMMENT  = 10  # (blank)     | Comments
 LC_PATH     = 11  # Common path | Full path
+# Classify mode columns — appended at end, hidden outside classify mode
+LC_CLS_PROPOSED = 12
+LC_CLS_CONF     = 13
+LC_CLS_STATUS   = 14
 
 HEADERS = [
     'Artist', 'Tracks', 'Album', 'Genre', 'Style Tags',
     'Duration', 'Format', 'BPM', 'Year', 'Bitrate', 'Comments', 'File Path',
+    'Proposed Genre', 'Confidence', 'Status',
 ]
 
 _MUTED   = '#a89b85'
@@ -161,14 +167,20 @@ class LibraryBrowserView(QWidget):
         self._library_path: Optional[Path] = None
         self._loaded_inv_id: Optional[int] = None
         self._inventory = []
-        # In-memory edits: {file_path: {field: value}}
         self._edits: dict[str, dict[str, str]] = {}
         self._settings = QSettings('JWBC', 'CrateSort')
+        # Genre sidebar selection
+        self._sidebar_genre: str = 'All'
+        # Classify mode state
+        self._classify_mode: bool = False
+        self._classify_session = None
+        self._classify_results: dict[str, tuple[str, str]] = {}  # artist → (genre, conf)
+        self._classify_worker = None
         # Inline editor state — at most one open at a time
         self._edit_item:     Optional[QTreeWidgetItem] = None
         self._edit_col:      int = -1
         self._edit_widget:   Optional[QLineEdit] = None
-        self._edit_original: str = ''   # original text for Escape-cancel
+        self._edit_original: str = ''
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -219,11 +231,11 @@ class LibraryBrowserView(QWidget):
                 import traceback
                 print(f'[LibraryBrowser] Session load error: {exc}\n{traceback.format_exc()}')
 
-        self._no_class_banner.setVisible(not self._has_classification)
         self._populate_filters()
         self._edits = {}
         self._load_edits()
         self._rebuild_tree()
+        self._populate_genre_sidebar()
         self._stack.setCurrentIndex(1)
 
     # ── Empty state ───────────────────────────────────────────────────
@@ -247,14 +259,25 @@ class LibraryBrowserView(QWidget):
 
     def _build_browser(self) -> QWidget:
         w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        self._no_class_banner = self._build_banner()
-        layout.addWidget(self._no_class_banner)
-        layout.addWidget(self._build_toolbar())
+        # Classify mode banner (hidden outside classify mode)
+        self._classify_banner_frame = self._build_classify_banner()
+        outer.addWidget(self._classify_banner_frame)
 
+        # Toolbar
+        outer.addWidget(self._build_toolbar())
+
+        # Content row: genre sidebar (fixed 180px) + tree
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        content_layout.addWidget(self._build_genre_sidebar())
+
+        # Tree — 15 columns; classify mode columns hidden until needed
         self._tree = QTreeWidget()
         self._tree.setColumnCount(len(HEADERS))
         self._tree.setHeaderLabels(HEADERS)
@@ -293,12 +316,18 @@ class LibraryBrowserView(QWidget):
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.viewport().installEventFilter(self)
 
+        # Hide classify mode columns until classify mode is active
+        self._tree.setColumnHidden(LC_CLS_PROPOSED, True)
+        self._tree.setColumnHidden(LC_CLS_CONF,     True)
+        self._tree.setColumnHidden(LC_CLS_STATUS,   True)
+
         # Restore column order from QSettings
         saved = self._settings.value(_SETTINGS_KEY)
         if saved:
             self._tree.header().restoreState(saved)
 
-        layout.addWidget(self._tree, stretch=1)
+        content_layout.addWidget(self._tree, stretch=1)
+        outer.addWidget(content, stretch=1)
 
         footer = QFrame()
         footer.setStyleSheet('QFrame { background: #2F2F2F; border-top: 1px solid #444; }')
@@ -308,24 +337,48 @@ class LibraryBrowserView(QWidget):
         self._count_label.setStyleSheet('color: #a89b85; font-size: 12px;')
         fl.addWidget(self._count_label)
         fl.addStretch()
-        layout.addWidget(footer)
+        outer.addWidget(footer)
 
         return w
 
-    def _build_banner(self) -> QFrame:
+    def _build_classify_banner(self) -> QFrame:
+        """Teal banner visible only while classify mode is active."""
         frame = QFrame()
         frame.setVisible(False)
-        frame.setStyleSheet('QFrame { background: #2a2520; border-bottom: 1px solid #D4A04A; }')
-        row = QHBoxLayout(frame)
-        row.setContentsMargins(16, 10, 16, 10)
-        msg = QLabel(
-            '⚠  Classification has not been run. '
-            'Genres shown are from file metadata only. '
-            'Run classification from the Dashboard.'
+        frame.setStyleSheet(
+            'QFrame { background: #1e2e2b; border-bottom: 1px solid #2d4a44; }'
         )
-        msg.setWordWrap(True)
-        msg.setStyleSheet('color: #D4A04A; font-size: 13px;')
-        row.addWidget(msg)
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(14, 7, 14, 7)
+        row.setSpacing(12)
+
+        msg = QLabel(
+            'Classify mode — review proposed genres and correct where needed, then accept.'
+        )
+        msg.setStyleSheet(
+            'color: #7bbdad; font-size: 11px; background: transparent; border: none;'
+        )
+        row.addWidget(msg, stretch=1)
+
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #7bbdad; '
+            'border: 1px solid #2d4a44; border-radius: 4px; padding: 4px 12px; font-size: 11px; }'
+            'QPushButton:hover { background: rgba(45,74,68,0.4); }'
+        )
+        cancel_btn.clicked.connect(self._exit_classify_mode_cancel)
+        row.addWidget(cancel_btn)
+
+        accept_btn = QPushButton('Accept Reclassifications')
+        accept_btn.setStyleSheet(
+            'QPushButton { background: #428175; color: #f1e3c8; border: none; '
+            'border-radius: 4px; padding: 4px 14px; font-size: 11px; font-weight: 500; }'
+            'QPushButton:hover { background: #38706a; }'
+            'QPushButton:pressed { background: #2d6358; }'
+        )
+        accept_btn.clicked.connect(self._exit_classify_mode_accept)
+        row.addWidget(accept_btn)
+
         return frame
 
     def _build_toolbar(self) -> QFrame:
@@ -341,11 +394,6 @@ class LibraryBrowserView(QWidget):
         self._search.textChanged.connect(self._apply_filter)
         row.addWidget(self._search)
 
-        self._genre_cb = QComboBox()
-        self._genre_cb.setMinimumWidth(140)
-        self._genre_cb.currentTextChanged.connect(self._apply_filter)
-        row.addWidget(self._genre_cb)
-
         self._format_cb = QComboBox()
         self._format_cb.setMinimumWidth(110)
         self._format_cb.currentTextChanged.connect(self._apply_filter)
@@ -358,7 +406,121 @@ class LibraryBrowserView(QWidget):
         clear.clicked.connect(self._clear_filters)
         row.addWidget(clear)
 
+        self._classify_btn = QPushButton('Classify Library')
+        self._classify_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #f1e3c8; '
+            'font-size: 11px; font-weight: 500; border: none; border-radius: 4px; '
+            'padding: 6px 12px; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+            'QPushButton:disabled { background-color: #2a3a37; color: #5a8a80; }'
+        )
+        self._classify_btn.clicked.connect(self._on_classify_clicked)
+        row.addWidget(self._classify_btn)
+
         return tb
+
+    def _build_genre_sidebar(self) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName('genre_sidebar')
+        frame.setFixedWidth(180)
+        frame.setStyleSheet(
+            'QFrame#genre_sidebar { background-color: #1e1e1e; border: none; '
+            'border-right: 1px solid #2a2a2a; }'
+        )
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QLabel('GENRES')
+        header.setStyleSheet(
+            'color: #666; font-size: 9px; letter-spacing: 0.10em; '
+            'padding-left: 10px; padding-top: 12px; padding-bottom: 8px; '
+            'background: transparent; border: none;'
+        )
+        layout.addWidget(header)
+
+        self._genre_sidebar_list = QListWidget()
+        self._genre_sidebar_list.setStyleSheet(
+            'QListWidget { background: transparent; border: none; outline: none; }'
+            'QListWidget::item { padding: 5px 10px; border: none; '
+            'color: #aaa; font-size: 11px; }'
+            'QListWidget::item:selected { background: #252525; color: #f1e3c8; }'
+            'QListWidget::item:hover:!selected { background: #212121; }'
+        )
+        self._genre_sidebar_list.setSelectionMode(
+            QListWidget.SelectionMode.SingleSelection
+        )
+        self._genre_sidebar_list.currentItemChanged.connect(
+            self._on_sidebar_genre_changed
+        )
+        layout.addWidget(self._genre_sidebar_list, stretch=1)
+
+        return frame
+
+    def _populate_genre_sidebar(self) -> None:
+        self._genre_sidebar_list.blockSignals(True)
+        self._genre_sidebar_list.clear()
+
+        genre_artist_count: dict[str, int] = {}
+        genre_track_count: dict[str, int] = {}
+        unclassified_artists = 0
+        unclassified_tracks = 0
+
+        _UC = {'', '—', 'Unclassified', 'Untagged'}
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            tracks = data.get('tracks', [])
+            genre = top.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+            if genre in _UC:
+                unclassified_artists += 1
+                unclassified_tracks += len(tracks)
+            else:
+                genre_artist_count[genre] = genre_artist_count.get(genre, 0) + 1
+                genre_track_count[genre] = genre_track_count.get(genre, 0) + len(tracks)
+
+        total_artists = self._tree.topLevelItemCount()
+        total_tracks = len(self._inventory)
+
+        all_item = QListWidgetItem(f'All  ({total_artists:,}a · {total_tracks:,}t)')
+        all_item.setData(Qt.ItemDataRole.UserRole, 'All')
+        all_item.setForeground(QBrush(QColor('#f1e3c8')))
+        self._genre_sidebar_list.addItem(all_item)
+
+        for genre in sorted(genre_artist_count.keys()):
+            ac = genre_artist_count[genre]
+            tc = genre_track_count[genre]
+            item = QListWidgetItem(f'● {genre}  {ac}a · {tc}t')
+            item.setData(Qt.ItemDataRole.UserRole, genre)
+            item.setForeground(QBrush(QColor('#aaa')))
+            self._genre_sidebar_list.addItem(item)
+
+        if unclassified_artists > 0:
+            unc_item = QListWidgetItem(
+                f'⚠ Unclassified  {unclassified_artists}a'
+            )
+            unc_item.setData(Qt.ItemDataRole.UserRole, 'Unclassified')
+            unc_item.setForeground(QBrush(QColor('#C75B5B')))
+            self._genre_sidebar_list.addItem(unc_item)
+
+        # Restore current selection
+        for i in range(self._genre_sidebar_list.count()):
+            it = self._genre_sidebar_list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == self._sidebar_genre:
+                self._genre_sidebar_list.setCurrentItem(it)
+                break
+        else:
+            self._genre_sidebar_list.setCurrentRow(0)
+
+        self._genre_sidebar_list.blockSignals(False)
+
+    def _on_sidebar_genre_changed(
+        self, current: QListWidgetItem, _previous: QListWidgetItem
+    ) -> None:
+        if current:
+            self._sidebar_genre = current.data(Qt.ItemDataRole.UserRole) or 'All'
+            self._apply_filter()
 
     # ── Tree population ───────────────────────────────────────────────
 
@@ -675,27 +837,10 @@ class LibraryBrowserView(QWidget):
     # ── Filtering ─────────────────────────────────────────────────────
 
     def _populate_filters(self) -> None:
-        genres = set()
-        formats = set()
+        formats: set[str] = set()
         for rec in self._inventory:
             if rec.extension:
                 formats.add(rec.extension.lstrip('.').upper())
-
-        if self._has_classification:
-            for g, _ in self._session_genre.values():
-                if g and g not in ('Not classified', 'Unclassified'):
-                    genres.add(g)
-
-        self._genre_cb.blockSignals(True)
-        self._genre_cb.clear()
-        self._genre_cb.addItem('All Genres')
-        self._genre_cb.addItems(sorted(genres))
-        if not self._has_classification or any(
-            not g for g, _ in self._session_genre.values()
-        ):
-            self._genre_cb.addItem('Unclassified')
-        self._genre_cb.blockSignals(False)
-
         self._format_cb.blockSignals(True)
         self._format_cb.clear()
         self._format_cb.addItem('All Formats')
@@ -704,13 +849,12 @@ class LibraryBrowserView(QWidget):
 
     def _apply_filter(self) -> None:
         search   = self._search.text().lower().strip()
-        genre_f  = self._genre_cb.currentText()
+        genre_f  = self._sidebar_genre if self._sidebar_genre != 'All' else ''
         format_f = self._format_cb.currentText()
-
-        if genre_f in ('All Genres', ''):
-            genre_f = ''
         if format_f in ('All Formats', ''):
             format_f = ''
+
+        _UC_GENRES = {'', '—', 'Unclassified', 'Untagged'}
 
         visible_count = 0
         for i in range(self._tree.topLevelItemCount()):
@@ -720,10 +864,10 @@ class LibraryBrowserView(QWidget):
             tracks = data.get('tracks', [])
             item_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
 
-            # Genre filter
+            # Genre filter (driven by sidebar selection)
             if genre_f:
                 if genre_f == 'Unclassified':
-                    if item_genre:
+                    if item_genre not in _UC_GENRES:
                         item.setHidden(True)
                         continue
                 elif item_genre != genre_f:
@@ -765,8 +909,10 @@ class LibraryBrowserView(QWidget):
 
     def _clear_filters(self) -> None:
         self._search.clear()
-        self._genre_cb.setCurrentIndex(0)
         self._format_cb.setCurrentIndex(0)
+        self._sidebar_genre = 'All'
+        if self._genre_sidebar_list.count() > 0:
+            self._genre_sidebar_list.setCurrentRow(0)
 
     # ── Context menus ─────────────────────────────────────────────────
 
@@ -1105,6 +1251,166 @@ class LibraryBrowserView(QWidget):
             current = self._tree.columnWidth(col)
             if current < min_w:
                 self._tree.setColumnWidth(col, min_w)
+
+    # ── Classify mode ─────────────────────────────────────────────────
+
+    def _on_classify_clicked(self) -> None:
+        if not self._inventory or not self._library_path:
+            return
+        from cratesort.src.gui.classifier_view import ClassificationSession, _ClassifyWorker
+
+        # If a session already exists, load it directly
+        session_file = self._library_path / '_CrateSort' / 'classification_session.json'
+        if session_file.exists():
+            try:
+                session = ClassificationSession.load(session_file)
+                session.apply_library_edits()
+                self._enter_classify_mode(session)
+                return
+            except Exception:
+                pass
+
+        # Run the classifier in the background
+        self._classify_btn.setEnabled(False)
+        self._classify_btn.setText('Classifying…')
+        self._classify_worker = _ClassifyWorker(self._inventory, self._library_path)
+        self._classify_worker.finished.connect(self._on_classify_finished)
+        self._classify_worker.errored.connect(self._on_classify_error)
+        self._classify_worker.start()
+
+    def _on_classify_finished(self, session) -> None:
+        session.save()
+        session.apply_library_edits()
+        self._classify_btn.setEnabled(True)
+        self._classify_btn.setText('Classify Library')
+        self._enter_classify_mode(session)
+
+    def _on_classify_error(self, message: str) -> None:
+        self._classify_btn.setEnabled(True)
+        self._classify_btn.setText('Classify Library')
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.critical(self, 'Classification Failed', message[:500])
+
+    def _enter_classify_mode(self, session) -> None:
+        self._classify_mode = True
+        self._classify_session = session
+        self._classify_results = {
+            entry.artist: (entry.display_genre, entry.confidence)
+            for entry in session.entries
+        }
+        # Show classify columns
+        self._tree.setColumnHidden(LC_CLS_PROPOSED, False)
+        self._tree.setColumnHidden(LC_CLS_CONF,     False)
+        self._tree.setColumnHidden(LC_CLS_STATUS,   False)
+        self._tree.setColumnWidth(LC_CLS_PROPOSED, 140)
+        self._tree.setColumnWidth(LC_CLS_CONF,      90)
+        self._tree.setColumnWidth(LC_CLS_STATUS,    90)
+        # Teal-tinted column headers
+        for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
+            self._tree.headerItem().setForeground(col, QBrush(QColor('#428175')))
+        self._populate_classify_columns()
+        self._classify_banner_frame.setVisible(True)
+        self._classify_btn.setVisible(False)
+
+    def _populate_classify_columns(self) -> None:
+        _BG_NORMAL = '#1c2825'
+        _BG_UC     = '#221a1a'
+        _UC        = {'Unclassified', 'Untagged', ''}
+
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            artist = data.get('artist', '')
+            current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+            proposed, confidence = self._classify_results.get(
+                artist, ('Unclassified', 'NONE')
+            )
+            is_uc = proposed in _UC
+            changed = not is_uc and proposed != current_genre
+
+            # Proposed Genre
+            item.setText(LC_CLS_PROPOSED, proposed)
+            item.setBackground(LC_CLS_PROPOSED, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
+            if is_uc:
+                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#C75B5B')))
+            elif changed:
+                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#D17D34')))
+            else:
+                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#7bbdad')))
+
+            # Confidence
+            item.setText(LC_CLS_CONF, confidence)
+            item.setBackground(LC_CLS_CONF, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
+            conf_color = {
+                'HIGH': '#428175', 'MEDIUM': '#D4A04A',
+                'LOW': '#D17D34',  'NONE':   '#C75B5B',
+            }.get(confidence, '#aaa')
+            item.setForeground(LC_CLS_CONF, QBrush(QColor(conf_color)))
+
+            # Status
+            status = 'Modified' if changed else ''
+            item.setText(LC_CLS_STATUS, status)
+            item.setBackground(LC_CLS_STATUS, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
+            if status:
+                item.setForeground(LC_CLS_STATUS, QBrush(QColor('#D17D34')))
+
+    def _exit_classify_mode_cancel(self) -> None:
+        self._classify_mode = False
+        self._classify_session = None
+        self._classify_results = {}
+        # Clear classify column text
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
+                item.setText(col, '')
+                item.setData(col, Qt.ItemDataRole.BackgroundRole, None)
+        # Restore header colors and hide columns
+        for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
+            self._tree.headerItem().setForeground(col, QBrush(QColor('#a89b85')))
+            self._tree.setColumnHidden(col, True)
+        self._classify_banner_frame.setVisible(False)
+        self._classify_btn.setVisible(True)
+
+    def _exit_classify_mode_accept(self) -> None:
+        if not self._classify_results or not self._library_path:
+            self._exit_classify_mode_cancel()
+            return
+        edits_path = self._library_path / '_CrateSort' / 'library_edits.json'
+        edits: dict = {}
+        if edits_path.exists():
+            try:
+                with open(edits_path, encoding='utf-8') as f:
+                    edits = json.load(f)
+            except Exception:
+                pass
+
+        _UC = {'Unclassified', 'Untagged', ''}
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            artist = data.get('artist', '')
+            current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+            proposed = item.text(LC_CLS_PROPOSED)
+            if proposed and proposed not in _UC and proposed != current_genre:
+                edits.setdefault(f'__artist__{artist}', {})['genre'] = proposed
+                item.setText(LC_GENRE, proposed)
+                item.setData(LC_GENRE, Qt.ItemDataRole.UserRole + 1, proposed)
+                item.setForeground(LC_GENRE, QBrush(QColor('#f1e3c8')))
+                f = item.font(LC_GENRE)
+                f.setItalic(False)
+                item.setFont(LC_GENRE, f)
+
+        edits_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(edits_path, 'w', encoding='utf-8') as f:
+                json.dump(edits, f, indent=2)
+        except Exception as exc:
+            print(f'[LibraryBrowser] Failed to save accepted classifications: {exc}')
+
+        self._exit_classify_mode_cancel()
+        self._populate_genre_sidebar()
+
+    # ── Persistence ───────────────────────────────────────────────────
 
     def save_state(self) -> None:
         """Call before hiding/destroying the view to persist column order."""

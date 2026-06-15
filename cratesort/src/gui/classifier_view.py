@@ -1,3 +1,7 @@
+# RETIRED — classification functionality moved to LibraryBrowserView
+# ClassifierView is renamed _ClassifierViewLegacy and no longer added to the nav.
+# ClassificationSession, ArtistEntry, TrackInfo, _ClassifyWorker, and the dialog
+# helpers remain importable for use by LibraryBrowserView and _PlanWorker.
 from __future__ import annotations
 
 import json
@@ -701,16 +705,15 @@ class _EditTagsDialog(QDialog):
         self.accept()
 
 
-class ClassifierView(QWidget):
+class _ClassifierViewLegacy(QWidget):
     """
-    Two-state widget:
-      0 — Loading / classifying  (progress bar)
-      1 — Results / approval     (genre list + artist tree)
+    Retired standalone classification view — kept for reference only.
+    Classification is now an inline mode in LibraryBrowserView.
     """
 
-    done             = pyqtSignal(int) # navigate to Library
-    back             = pyqtSignal()    # navigate back to Dashboard
-    track_selected   = pyqtSignal(str) # file path of clicked track row (for album art)
+    done             = pyqtSignal(int)
+    back             = pyqtSignal()
+    track_selected   = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)

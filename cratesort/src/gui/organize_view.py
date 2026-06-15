@@ -129,16 +129,15 @@ class _PlanWorker(QThread):
                     record.comment = track_edit['comment']
 
             # 2. Build classifications dict from ALL entries with a valid genre.
-            # 'pending' and 'flagged' entries carry a classifier-proposed genre that
-            # is valid for organizing even before the user explicitly approves it.
-            # The gate screen already blocks planning when truly unclassified tracks
-            # exist, so by the time we reach here every entry should have a real genre.
-            _UC_GENRES = {'Unclassified', 'Untagged', ''}
+            # 'Unclassified' is now a valid folder destination — tracks without a
+            # real genre go to Media/Unclassified/Artist/. Only truly empty genres
+            # (blank string, 'Untagged') are skipped here.
+            _SKIP_GENRES = {'Untagged', ''}
             classifications: dict = {}
             for entry in session.entries:
                 genre = entry.final_genre or entry.proposed_genre
-                if not genre or genre in _UC_GENRES:
-                    continue  # no valid genre — gate screen should have blocked this
+                if not genre or genre in _SKIP_GENRES:
+                    continue
                 for track in entry.tracks:
                     classifications[Path(track.path)] = ClassificationResult(
                         genre=genre,
@@ -423,7 +422,7 @@ class OrganizeView(QWidget):
     4  Done        — success; offers rollback
     """
 
-    navigate_to_classifier = pyqtSignal()
+    navigate_to_library    = pyqtSignal()
     navigate_to_dashboard  = pyqtSignal()
     reorg_completed        = pyqtSignal()   # emitted after a reorg or rollback finishes
     status_message         = pyqtSignal(str, str)   # (message, state)
@@ -483,59 +482,15 @@ class OrganizeView(QWidget):
         layout.setSpacing(0)
         layout.setContentsMargins(80, 60, 80, 60)
 
-        # ── "Needs classification" panel ──────────────────────────────
-        self._gate_needs_class_widget = QWidget()
-        needs_layout = QVBoxLayout(self._gate_needs_class_widget)
-        needs_layout.setContentsMargins(0, 0, 0, 16)
-        needs_layout.setSpacing(10)
-
-        msg = QLabel(
-            'Before organizing your files, you\'ll need to classify your library '
-            'so CrateSort knows where each track belongs. '
-            f'Go to the <a href="classifier" style="color: {_TEAL}; '
-            'text-decoration: underline;">Classifier tab</a> '
-            'to review and confirm artist and genre assignments, '
-            'then come back here to organize.'
-        )
-        msg.setWordWrap(True)
-        msg.setTextFormat(Qt.TextFormat.RichText)
-        msg.setOpenExternalLinks(False)
-        msg.setStyleSheet(f'color: {_CREAM}; font-size: 14px;')
-        msg.linkActivated.connect(lambda _: self.navigate_to_classifier.emit())
-        needs_layout.addWidget(msg)
-
-        note = QLabel(
-            'Note: file organization is optional. '
-            'The Crates tab is fully functional without it.'
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet(f'color: {_MUTED}; font-size: 12px;')
-        needs_layout.addWidget(note)
-
-        # Dynamic label — set by _refresh_gate_screen() when unclassified tracks exist
-        self._gate_unclassified_lbl = QLabel('')
-        self._gate_unclassified_lbl.setWordWrap(True)
-        self._gate_unclassified_lbl.setStyleSheet(
-            f'color: {_ORANGE}; font-size: 13px; font-weight: 500;'
-        )
-        needs_layout.addWidget(self._gate_unclassified_lbl)
-
-        layout.addWidget(self._gate_needs_class_widget)
-
-        # ── "Ready to plan" panel ─────────────────────────────────────
-        self._gate_ready_widget = QWidget()
-        ready_layout = QVBoxLayout(self._gate_ready_widget)
-        ready_layout.setContentsMargins(0, 0, 0, 16)
-        ready_layout.setSpacing(16)
-        ready_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-
+        # ── Ready-to-plan panel (always shown when library is loaded) ─
         ready_msg = QLabel(
-            'Classification session ready! Click below to analyze your library '
-            'and prepare the reorganization plan.'
+            'Click below to analyze your library and prepare a reorganization plan. '
+            'You can review every proposed change before anything moves on disk.'
         )
         ready_msg.setWordWrap(True)
         ready_msg.setStyleSheet(f'color: {_CREAM}; font-size: 14px;')
-        ready_layout.addWidget(ready_msg)
+        layout.addWidget(ready_msg)
+        layout.addSpacing(16)
 
         plan_btn = QPushButton('Plan Reorganization…')
         plan_btn.setMinimumHeight(40)
@@ -548,11 +503,10 @@ class OrganizeView(QWidget):
             f'QPushButton:pressed {{ background-color: #2d6358; }}'
         )
         plan_btn.clicked.connect(self._on_plan_clicked)
-        ready_layout.addWidget(plan_btn)
-        layout.addWidget(self._gate_ready_widget)
+        layout.addWidget(plan_btn)
 
         # ── Separator ─────────────────────────────────────────────────
-        layout.addSpacing(8)
+        layout.addSpacing(20)
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setStyleSheet(f'background-color: {_SEP}; border: none;')
@@ -581,38 +535,6 @@ class OrganizeView(QWidget):
     def _refresh_gate_screen(self) -> None:
         if not self._library_path:
             return
-
-        session_path = self._library_path / '_CrateSort' / 'classification_session.json'
-        has_session  = session_path.exists()
-
-        # Gate requires all session entries to be in an approved state —
-        # same definition as _is_library_classified() in MainWindow.
-        is_classified = False
-        unapproved_count = 0
-        if has_session:
-            try:
-                from cratesort.src.gui.classifier_view import ClassificationSession as _CS
-                _session = _CS.load(session_path)
-                unapproved_count = _session.total_count - _session.approved_count
-                is_classified = _session.total_count > 0 and unapproved_count == 0
-            except Exception:
-                pass
-
-        if not has_session or not is_classified:
-            if unapproved_count > 0:
-                n = unapproved_count
-                self._gate_unclassified_lbl.setText(
-                    f'{n:,} artist{"s" if n != 1 else ""} still need'
-                    f'{"" if n == 1 else "s"} approval before you can organize.'
-                )
-            else:
-                self._gate_unclassified_lbl.setText('')
-            self._gate_needs_class_widget.setVisible(True)
-            self._gate_ready_widget.setVisible(False)
-        else:
-            self._gate_unclassified_lbl.setText('')
-            self._gate_needs_class_widget.setVisible(False)
-            self._gate_ready_widget.setVisible(True)
 
         # Clear previous history rows
         while self._history_layout.count():
@@ -709,9 +631,91 @@ class OrganizeView(QWidget):
 
             self._history_layout.addWidget(row)
 
+    def _count_unclassified_tracks(self) -> int:
+        """Return how many tracks have no valid genre assignment in the session."""
+        if not self._library_path:
+            return 0
+        session_path = self._library_path / '_CrateSort' / 'classification_session.json'
+        if not session_path.exists():
+            return len(self._inventory)
+        try:
+            from cratesort.src.gui.classifier_view import ClassificationSession
+            session = ClassificationSession.load(session_path)
+            count = 0
+            _UC = {'Unclassified', 'Untagged', ''}
+            for entry in session.entries:
+                genre = entry.final_genre or entry.proposed_genre
+                if not genre or genre in _UC:
+                    count += len(entry.tracks)
+            return count
+        except Exception:
+            return 0
+
+    def _warn_unclassified(self, count: int) -> bool:
+        """Show warning dialog for unclassified tracks. Returns True to proceed."""
+        from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout, QPushButton
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Unclassified Tracks Detected')
+        dlg.setMinimumWidth(440)
+        dlg.setStyleSheet(f'QDialog {{ background-color: {_BG}; }}')
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 16)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel('Unclassified Tracks Detected')
+        title_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 15px; font-weight: 600;')
+        layout.addWidget(title_lbl)
+
+        body = QLabel(
+            f'{count:,} track{"s" if count != 1 else ""} have no genre assignment '
+            f'and will be moved to an Unclassified folder in your Media directory. '
+            f'You can reclassify them later.'
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet(f'color: {_MUTED}; font-size: 13px;')
+        layout.addWidget(body)
+        layout.addSpacing(8)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        go_back_btn = QPushButton('Go Back to Library')
+        go_back_btn.setStyleSheet(
+            f'QPushButton {{ background-color: {_DANGER}; color: #ffffff; border: none; '
+            f'border-radius: 5px; padding: 7px 16px; font-size: 13px; font-weight: 600; }}'
+            f'QPushButton:hover {{ background-color: #b24c4c; }}'
+            f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
+        )
+        go_back_btn.clicked.connect(dlg.reject)
+
+        proceed_btn = QPushButton('Proceed')
+        proceed_btn.setStyleSheet(
+            f'QPushButton {{ background-color: {_TEAL}; color: #ffffff; border: none; '
+            f'border-radius: 5px; padding: 7px 16px; font-size: 13px; font-weight: 600; }}'
+            f'QPushButton:hover {{ background-color: #38706a; }}'
+            f'QPushButton:pressed {{ background-color: #2d6358; }}'
+        )
+        proceed_btn.clicked.connect(dlg.accept)
+
+        btn_row.addWidget(go_back_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(proceed_btn)
+        layout.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.navigate_to_library.emit()
+            return False
+        return True
+
     def _on_plan_clicked(self) -> None:
         if not self._library_path:
             return
+        # Warn if unclassified tracks exist — user may proceed or go back to Library
+        unclassified = self._count_unclassified_tracks()
+        if unclassified > 0:
+            if not self._warn_unclassified(unclassified):
+                return
         session_path = self._library_path / '_CrateSort' / 'classification_session.json'
         self._stack.setCurrentIndex(_STATE_PLANNING)
         self.status_message.emit('Building reorganization plan…', 'amber')

@@ -942,9 +942,9 @@ class DashboardWidget(QWidget):
 
         _icons = _ASSETS / 'icons'
         goto_cards = [
-            ('01', 'Classify Library', 'Reassign artists and genres',       self.classify_requested.emit,    _icons / 'icon-classification.svg'),
-            ('02', 'Manage Crates',    'Build crates and edit tracks',      self.crates_requested.emit,      _icons / 'icon-crates.svg'),
-            ('03', 'Organize Media',   'Manage folders and file locations', self.organize_requested.emit,    _icons / 'icon-organize.svg'),
+            ('01', 'Manage Library',   'Browse and edit your track library', self.classify_requested.emit,    _icons / 'icon-library.svg'),
+            ('02', 'Manage Crates',    'Build crates and edit tracks',       self.crates_requested.emit,      _icons / 'icon-crates.svg'),
+            ('03', 'Organize Media',   'Manage folders and file locations',  self.organize_requested.emit,    _icons / 'icon-organize.svg'),
         ]
 
         goto_widget = QWidget()

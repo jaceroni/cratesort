@@ -21,7 +21,6 @@ except ImportError:
 
 from cratesort.src.gui.theme import apply_theme, C
 from cratesort.src.gui.dashboard import DashboardWidget
-from cratesort.src.gui.classifier_view import ClassifierView
 from cratesort.src.gui.library_browser import LibraryBrowserView
 from cratesort.src.gui.crate_manager import CrateManagerView
 from cratesort.src.gui.organize_view import OrganizeView
@@ -38,14 +37,13 @@ APP = 'CrateSort'
 # Sidebar width
 _SIDEBAR_W = 196
 
-# Nav items: (id, label, emoji_icon)
+# Nav items: (id, label, emoji_icon) — 5 items, indices 0-4
 _NAV_ITEMS = [
-    ('dashboard', 'Dashboard',      '⌂'),
-    ('classification',  'Classification', '🔍'),
-    ('library',   'Library',        '📚'),
-    ('crates',    'Crates',         '📦'),
-    ('organize',  'Organize',       '📁'),
-    ('settings',  'Settings',       '⚙'),
+    ('dashboard', 'Dashboard', '⌂'),
+    ('library',   'Library',   '📚'),
+    ('crates',    'Crates',    '📦'),
+    ('organize',  'Organize',  '📁'),
+    ('settings',  'Settings',  '⚙'),
 ]
 
 
@@ -117,11 +115,11 @@ class MainWindow(QMainWindow):
         self._content = QStackedWidget()
         self._content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        # Dashboard (real) — index 0
+        # Dashboard — index 0
         self._dashboard = DashboardWidget()
         self._dashboard.library_path_changed.connect(self._on_library_changed)
         self._dashboard.status_message.connect(self._update_status)
-        self._dashboard.classify_requested.connect(self._on_classify_requested)
+        self._dashboard.classify_requested.connect(self._on_library_requested)
         self._dashboard.crates_requested.connect(self._on_crates_requested)
         self._dashboard.organize_requested.connect(self._on_organize_requested)
         self._dashboard.new_crate_requested.connect(self._on_new_crate_requested)
@@ -129,37 +127,27 @@ class MainWindow(QMainWindow):
         self._dashboard.scan_finished.connect(lambda: self._apply_nav_state(self._get_app_state()))
         self._content.addWidget(self._dashboard)
 
-        # Classifier view — index 1
-        self._classifier_view = ClassifierView()
-        self._classifier_view.done.connect(self._on_classifier_done)
-        self._classifier_view.back.connect(self._on_classifier_back)
-        self._classifier_view.track_selected.connect(self._update_album_art)
-        self._content.addWidget(self._classifier_view)
-
-        # Library Browser — index 2
+        # Library Browser — index 1
         self._library_browser = LibraryBrowserView()
         self._library_browser.album_art_requested.connect(self._update_album_art)
-        self._library_browser.track_field_changed.connect(
-            lambda path, field, val: self._classifier_view.refresh_track_display(path, field, val)
-        )
         self._content.addWidget(self._library_browser)
 
-        # Crate Manager — index 3
+        # Crate Manager — index 2
         self._crate_manager = CrateManagerView(undo_manager=self._undo_manager)
         self._crate_manager.track_selected.connect(self._update_album_art)
         self._crate_manager.album_art_requested.connect(self._update_album_art)
         self._crate_manager.navigate_to_settings.connect(lambda: self._on_nav_by_id('settings'))
         self._content.addWidget(self._crate_manager)
 
-        # Organize view — index 4
+        # Organize view — index 3
         self._organize_view = OrganizeView()
-        self._organize_view.navigate_to_classifier.connect(self._on_classify_requested)
+        self._organize_view.navigate_to_library.connect(self._on_library_requested)
         self._organize_view.navigate_to_dashboard.connect(lambda: self._on_nav_by_id('dashboard'))
         self._organize_view.reorg_completed.connect(self._on_reorg_completed)
         self._organize_view.status_message.connect(self._update_status)
         self._content.addWidget(self._organize_view)
 
-        # Settings — index 5
+        # Settings — index 4
         self._settings_view = SettingsView(self._settings)
         self._settings_view.library_changed.connect(self._on_library_changed_from_settings)
         self._settings_view.repair_requested.connect(self._on_repair_crate_paths)
@@ -357,10 +345,8 @@ class MainWindow(QMainWindow):
 
     def _on_nav(self, index: int) -> None:
         # Silent no-op for nav items disabled by current app state
-        _state = getattr(self, '_app_state', 4)
-        if _state <= 2 and index in (1, 2, 3, 4):
-            return
-        if _state == 3 and index in (2, 4):   # Library and Organize need full classification
+        _state = getattr(self, '_app_state', 3)
+        if _state <= 2 and index in (1, 2, 3):
             return
 
         if index != 0 and hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
@@ -372,27 +358,22 @@ class MainWindow(QMainWindow):
         self._content.setCurrentIndex(index)
         inv = self._dashboard._inventory
         lib = self._dashboard._library_path
-        if index == 1:   # Classifier
+        if index == 1:   # Library Browser
             if not inv or not lib:
-                # Fix 4: redirect to Settings (recovery path) not Dashboard
                 self._nav_btns['settings'].setChecked(True)
-                self._content.setCurrentIndex(5)
+                self._content.setCurrentIndex(4)
                 self._update_status('Load a library first.', 'amber')
                 return
-            self._classifier_view.start(inv, lib)
-            self._update_status('Classifying library…', 'amber')
-        elif index == 2:  # Library Browser
-            if inv and lib:
-                self._library_browser.load(inv, lib)
-        elif index == 3:  # Crate Manager
+            self._library_browser.load(inv, lib)
+        elif index == 2:  # Crate Manager
             if inv and lib:
                 self._crate_manager.load(inv, lib)
-        elif index == 4:  # Organize
+        elif index == 3:  # Organize
             if inv and lib:
                 self._organize_view.load(inv, lib, lib / '_Serato_')
-        elif index == 5:  # Settings
+        elif index == 4:  # Settings
             self._settings_view.load(lib)
-        if index not in (1, 2, 3):  # Clear art when leaving media views
+        if index not in (1, 2):  # Clear art when leaving media views
             self._art_panel.clear()
 
     def _on_nav_by_id(self, nav_id: str) -> None:
@@ -430,33 +411,13 @@ class MainWindow(QMainWindow):
         self._redo_btn.setEnabled(can_redo)
         self._redo_btn.setStyleSheet(_active if can_redo else _inactive)
 
-    # ── App state (library / Serato / classification) ───────────────────
-
-    def _is_library_classified(self) -> bool:
-        """
-        True when a classification session exists on disk and every entry is in
-        an approved state (approved / changed / edited). Matches the gate check
-        in OrganizeView._refresh_gate_screen() exactly.
-        """
-        saved = self._settings.value('library_path', None)
-        if not saved or not Path(saved).exists():
-            return False
-        session_path = Path(saved) / '_CrateSort' / 'classification_session.json'
-        if not session_path.exists():
-            return False
-        try:
-            from cratesort.src.gui.classifier_view import ClassificationSession
-            session = ClassificationSession.load(session_path)
-            return session.total_count > 0 and session.approved_count == session.total_count
-        except Exception:
-            return False
+    # ── App state (library / Serato availability) ──────────────────────
 
     def _get_app_state(self) -> int:
         """
         1 — No library path saved, or saved path no longer exists on disk.
         2 — Library path exists but contains no _Serato_ folder.
-        3 — Library + _Serato_ present, but classification is incomplete.
-        4 — Library + _Serato_ + all tracks fully classified (approved).
+        3 — Library + _Serato_ present: all nav items active.
         """
         saved = self._settings.value('library_path', None)
         if not saved:
@@ -466,44 +427,28 @@ class MainWindow(QMainWindow):
             return 1
         if not (lib / '_Serato_').exists():
             return 2
-        if not self._is_library_classified():
-            return 3
-        return 4
+        return 3
 
     def _apply_nav_state(self, state: int) -> None:
         """
-        Enable/disable nav buttons and tooltips based on app state.
+        Enable/disable nav buttons based on app state.
 
-        State 1,2  — No library or no Serato: items 1-4 disabled
-        State 3    — Library+Serato, unclassified: Library(2) and Organize(4) disabled
-        State 4    — Fully classified: all enabled
+        State 1/2 — No library or no Serato: Library, Crates, Organize disabled.
+        State 3   — Library + Serato present: all items enabled.
         """
         self._app_state = state
         for i, (nav_id, _, _) in enumerate(_NAV_ITEMS):
             btn = self._nav_btns.get(nav_id)
             if btn is None:
                 continue
-            if state <= 2:
-                if i in (1, 2, 3, 4):
-                    btn.setEnabled(False)
-                    btn.setToolTip(
-                        'Load a library to get started' if state == 1
-                        else 'Serato folder not found at this library location'
-                    )
-                else:
-                    btn.setEnabled(True)
-                    btn.setToolTip('')
-            elif state == 3:
-                if i == 2:
-                    btn.setEnabled(False)
-                    btn.setToolTip('Complete classification before browsing your library.')
-                elif i == 4:
-                    btn.setEnabled(False)
-                    btn.setToolTip('Complete classification before organizing your library.')
-                else:
-                    btn.setEnabled(True)
-                    btn.setToolTip('')
-            else:  # state 4 — fully classified
+            if state <= 2 and i in (1, 2, 3):
+                btn.setEnabled(False)
+                btn.setToolTip(
+                    'Load a library to get started.'
+                    if state == 1 else
+                    'Serato folder not found at this library location.'
+                )
+            else:
                 btn.setEnabled(True)
                 btn.setToolTip('')
 
@@ -569,34 +514,11 @@ class MainWindow(QMainWindow):
             f'&copy; JWBC',
         )
 
-    def _on_classify_requested(self) -> None:
+    def _on_library_requested(self) -> None:
         if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
             self._show_sync_warning()
             return
-        self._on_nav_by_id('classification')
-
-    def _on_classifier_back(self) -> None:
-        self._on_nav_by_id('dashboard')
-
-    def _on_classifier_done(self, _count: int = 0) -> None:
-        inv = self._dashboard._inventory
-        lib = self._dashboard._library_path
-        if inv and lib:
-            self._library_browser.load(inv, lib)
-            self._library_browser._count_label.setText('Classification complete.')
-            def _restore_count():
-                try:
-                    self._library_browser._count_label.setText(
-                        f'{self._library_browser._tree.topLevelItemCount():,} artists · '
-                        f'{len(self._library_browser._inventory):,} tracks'
-                    )
-                except Exception:
-                    pass
-            QTimer.singleShot(3000, _restore_count)
-        self._nav_btns['library'].setChecked(True)
-        self._content.setCurrentIndex(2)  # library is now index 2
-        self._update_status('Classification complete. Ready.', 'green')
-        self._apply_nav_state(self._get_app_state())
+        self._on_nav_by_id('library')
 
     def _on_crates_requested(self) -> None:
         if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():

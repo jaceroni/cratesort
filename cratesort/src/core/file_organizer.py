@@ -452,8 +452,9 @@ class FileOrganizer:
                 continue
 
             cls = classifications.get(record.path)
-            if not cls or not cls.genre or cls.genre in ('Unclassified', 'Untagged'):
-                # No genre or placeholder genre — cannot organize without a real destination
+            if not cls or not cls.genre or cls.genre in ('Untagged',):
+                # No genre — cannot organize without a real destination.
+                # 'Unclassified' is a valid folder: Media/Unclassified/Artist/track.
                 stays_put.append(record.path)
                 continue
 
