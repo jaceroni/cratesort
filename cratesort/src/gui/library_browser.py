@@ -7,14 +7,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QEvent, QSettings, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtCore import Qt, QEvent, QRect, QSettings, QSize, QTimer, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QFont, QPen
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem,
-    QMenu, QPushButton, QSplitter, QStackedWidget, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QMenu, QPushButton, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,113 @@ def _show_in_finder(file_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Genre Sidebar Delegate
+# ---------------------------------------------------------------------------
+
+class GenreSidebarDelegate(QStyledItemDelegate):
+    """
+    Custom-painted delegate for the genre sidebar list.
+    Paints two-line genre items (name + artist/track subline) with correct
+    selection/hover states, orange left bar, and red tint for Unclassified.
+    """
+
+    _HEIGHTS = {'all': 36, 'genre': 48, 'unclassified': 56}
+
+    def sizeHint(self, option, index) -> QSize:
+        item_type = index.data(Qt.ItemDataRole.UserRole + 4) or 'genre'
+        return QSize(0, self._HEIGHTS.get(item_type, 48))
+
+    def paint(self, painter, option, index) -> None:
+        painter.save()
+        try:
+            self._do_paint(painter, option, index)
+        finally:
+            painter.restore()
+
+    def _do_paint(self, painter, option, index) -> None:
+        item_type = index.data(Qt.ItemDataRole.UserRole + 4) or 'genre'
+        name      = index.data(Qt.ItemDataRole.UserRole + 1) or ''
+        artists   = index.data(Qt.ItemDataRole.UserRole + 2) or 0
+        tracks    = index.data(Qt.ItemDataRole.UserRole + 3) or 0
+        is_uc  = item_type == 'unclassified'
+        is_all = item_type == 'all'
+        is_sel = bool(option.state & QStyle.StateFlag.State_Selected)
+        is_hov = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        rect = QRect(option.rect)
+
+        # Separator line for unclassified (1px at top+4, then shift rect down 8px)
+        if is_uc:
+            painter.setPen(QPen(QColor('#2a2a2a'), 1))
+            painter.drawLine(rect.left(), rect.top() + 4, rect.right(), rect.top() + 4)
+            rect = rect.adjusted(0, 8, 0, 0)
+
+        # Background
+        if is_sel:
+            bg = '#2a1515' if is_uc else '#573d26'
+        elif is_hov:
+            bg = '#251a1a' if is_uc else '#252525'
+        elif is_uc:
+            bg = '#1f1a1a'
+        else:
+            bg = None
+        if bg:
+            painter.fillRect(rect, QColor(bg))
+
+        # Left border bar (selected only)
+        if is_sel:
+            bar_color = '#C75B5B' if is_uc else '#D17D34'
+            painter.fillRect(QRect(rect.left(), rect.top(), 5, rect.height()), QColor(bar_color))
+
+        # Text colours
+        if is_sel or is_hov:
+            name_color = '#f1e3c8'
+        elif is_uc:
+            name_color = '#C75B5B'
+        else:
+            name_color = '#aaa'
+
+        if is_uc:
+            sub_color = '#C75B5B'
+        elif is_sel:
+            sub_color = '#a07850'
+        else:
+            sub_color = '#666'
+
+        left_pad  = 14
+        right_pad = 10
+        text_x = rect.left() + left_pad
+        text_w = max(1, rect.width() - left_pad - right_pad)
+
+        name_y_off = 4 if is_all else 8
+        sub_y_off  = 18 if is_all else 26
+
+        # Name
+        name_font = QFont()
+        name_font.setPixelSize(11 if is_all else 12)
+        name_font.setBold(True)
+        painter.setFont(name_font)
+        painter.setPen(QColor(name_color))
+        painter.drawText(
+            QRect(text_x, rect.top() + name_y_off, text_w, 16),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            name,
+        )
+
+        # Subline
+        sub_font = QFont()
+        sub_font.setPixelSize(10)
+        sub_font.setBold(False)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(sub_color))
+        painter.drawText(
+            QRect(text_x, rect.top() + sub_y_off, text_w, 14),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            f'{artists:,} artists · {tracks:,} tracks',
+        )
+
+
+# ---------------------------------------------------------------------------
 # Library Browser view
 # ---------------------------------------------------------------------------
 
@@ -192,6 +299,15 @@ class LibraryBrowserView(QWidget):
         self._stack.setCurrentIndex(0)
 
     # ── Public ────────────────────────────────────────────────────────
+
+    def on_scan_finished(self, inventory, library_path: Path) -> None:
+        """Called by MainWindow after a background scan completes.
+        Refreshes the tree and genre sidebar without reloading the full session."""
+        self._library_path = library_path
+        self._inventory = list(inventory)
+        self._load_edits()
+        self._rebuild_tree()
+        self._populate_genre_sidebar()
 
     def load(self, inventory, library_path: Path) -> None:
         """
@@ -270,12 +386,13 @@ class LibraryBrowserView(QWidget):
         # Toolbar
         outer.addWidget(self._build_toolbar())
 
-        # Content row: genre sidebar (fixed 180px) + tree
-        content = QWidget()
-        content_layout = QHBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(0)
-        content_layout.addWidget(self._build_genre_sidebar())
+        # Content row: resizable genre sidebar + tree via splitter
+        self._sidebar_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._sidebar_splitter.setHandleWidth(4)
+        self._sidebar_splitter.setStyleSheet(
+            'QSplitter::handle { background-color: #2a2a2a; }'
+        )
+        self._sidebar_splitter.addWidget(self._build_genre_sidebar())
 
         # Tree — 15 columns; classify mode columns hidden until needed
         self._tree = QTreeWidget()
@@ -326,8 +443,17 @@ class LibraryBrowserView(QWidget):
         if saved:
             self._tree.header().restoreState(saved)
 
-        content_layout.addWidget(self._tree, stretch=1)
-        outer.addWidget(content, stretch=1)
+        self._sidebar_splitter.addWidget(self._tree)
+        self._sidebar_splitter.setStretchFactor(0, 0)
+        self._sidebar_splitter.setStretchFactor(1, 1)
+        _saved_w = self._settings.value('library/sidebar_width', 200, type=int)
+        self._sidebar_splitter.setSizes([_saved_w, 100000])
+        self._sidebar_splitter.splitterMoved.connect(
+            lambda: self._settings.setValue(
+                'library/sidebar_width', self._sidebar_splitter.sizes()[0]
+            )
+        )
+        outer.addWidget(self._sidebar_splitter, stretch=1)
 
         footer = QFrame()
         footer.setStyleSheet('QFrame { background: #2F2F2F; border-top: 1px solid #444; }')
@@ -423,10 +549,10 @@ class LibraryBrowserView(QWidget):
     def _build_genre_sidebar(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName('genre_sidebar')
-        frame.setFixedWidth(180)
+        frame.setMinimumWidth(160)
+        frame.setMaximumWidth(320)
         frame.setStyleSheet(
-            'QFrame#genre_sidebar { background-color: #1e1e1e; border: none; '
-            'border-right: 1px solid #2a2a2a; }'
+            'QFrame#genre_sidebar { background-color: #1e1e1e; border: none; }'
         )
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -434,23 +560,24 @@ class LibraryBrowserView(QWidget):
 
         header = QLabel('GENRES')
         header.setStyleSheet(
-            'color: #666; font-size: 9px; letter-spacing: 0.10em; '
-            'padding-left: 10px; padding-top: 12px; padding-bottom: 8px; '
-            'background: transparent; border: none;'
+            'color: #555; font-size: 9px; letter-spacing: 1px; '
+            'padding: 12px 14px 8px; background: transparent; border: none;'
         )
         layout.addWidget(header)
 
         self._genre_sidebar_list = QListWidget()
         self._genre_sidebar_list.setStyleSheet(
             'QListWidget { background: transparent; border: none; outline: none; }'
-            'QListWidget::item { padding: 5px 10px; border: none; '
-            'color: #aaa; font-size: 11px; }'
-            'QListWidget::item:selected { background: #252525; color: #f1e3c8; }'
-            'QListWidget::item:hover:!selected { background: #212121; }'
+            'QListWidget::item { padding: 0; border: none; }'
         )
         self._genre_sidebar_list.setSelectionMode(
             QListWidget.SelectionMode.SingleSelection
         )
+        self._genre_sidebar_list.setItemDelegate(
+            GenreSidebarDelegate(self._genre_sidebar_list)
+        )
+        self._genre_sidebar_list.setMouseTracking(True)
+        self._genre_sidebar_list.viewport().setMouseTracking(True)
         self._genre_sidebar_list.currentItemChanged.connect(
             self._on_sidebar_genre_changed
         )
@@ -483,26 +610,28 @@ class LibraryBrowserView(QWidget):
         total_artists = self._tree.topLevelItemCount()
         total_tracks = len(self._inventory)
 
-        all_item = QListWidgetItem(f'All  ({total_artists:,}a · {total_tracks:,}t)')
-        all_item.setData(Qt.ItemDataRole.UserRole, 'All')
-        all_item.setForeground(QBrush(QColor('#f1e3c8')))
-        self._genre_sidebar_list.addItem(all_item)
+        def _make_item(key: str, name: str, artist_c: int, track_c: int, itype: str) -> QListWidgetItem:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole,     key)
+            item.setData(Qt.ItemDataRole.UserRole + 1, name)
+            item.setData(Qt.ItemDataRole.UserRole + 2, artist_c)
+            item.setData(Qt.ItemDataRole.UserRole + 3, track_c)
+            item.setData(Qt.ItemDataRole.UserRole + 4, itype)
+            return item
+
+        self._genre_sidebar_list.addItem(
+            _make_item('All', 'All', total_artists, total_tracks, 'all')
+        )
 
         for genre in sorted(genre_artist_count.keys()):
-            ac = genre_artist_count[genre]
-            tc = genre_track_count[genre]
-            item = QListWidgetItem(f'● {genre}  {ac}a · {tc}t')
-            item.setData(Qt.ItemDataRole.UserRole, genre)
-            item.setForeground(QBrush(QColor('#aaa')))
-            self._genre_sidebar_list.addItem(item)
+            self._genre_sidebar_list.addItem(
+                _make_item(genre, genre, genre_artist_count[genre], genre_track_count[genre], 'genre')
+            )
 
         if unclassified_artists > 0:
-            unc_item = QListWidgetItem(
-                f'⚠ Unclassified  {unclassified_artists}a'
+            self._genre_sidebar_list.addItem(
+                _make_item('Unclassified', 'Unclassified', unclassified_artists, unclassified_tracks, 'unclassified')
             )
-            unc_item.setData(Qt.ItemDataRole.UserRole, 'Unclassified')
-            unc_item.setForeground(QBrush(QColor('#C75B5B')))
-            self._genre_sidebar_list.addItem(unc_item)
 
         # Restore current selection
         for i in range(self._genre_sidebar_list.count()):
@@ -567,7 +696,7 @@ class LibraryBrowserView(QWidget):
 
         # Column widths (only set on fresh load to respect QSettings restoreState)
         if not self._settings.value(_SETTINGS_KEY):
-            widths = [200, 60, 150, 130, 100, 70, 65, 55, 55, 80, 150, 220]
+            widths = [220, 60, 180, 120, 140, 80, 80, 70, 70, 80, 160, 200]
             for col, w in enumerate(widths):
                 self._tree.setColumnWidth(col, w)
 
@@ -1298,13 +1427,27 @@ class LibraryBrowserView(QWidget):
             entry.artist: (entry.display_genre, entry.confidence)
             for entry in session.entries
         }
-        # Show classify columns
+        # Snapshot header state so exit can restore it exactly
+        self._pre_classify_header_state = self._tree.header().saveState()
+
+        # Show classify columns with target widths
         self._tree.setColumnHidden(LC_CLS_PROPOSED, False)
         self._tree.setColumnHidden(LC_CLS_CONF,     False)
         self._tree.setColumnHidden(LC_CLS_STATUS,   False)
-        self._tree.setColumnWidth(LC_CLS_PROPOSED, 140)
-        self._tree.setColumnWidth(LC_CLS_CONF,      90)
-        self._tree.setColumnWidth(LC_CLS_STATUS,    90)
+        self._tree.setColumnWidth(LC_CLS_PROPOSED, 120)
+        self._tree.setColumnWidth(LC_CLS_CONF,      80)
+        self._tree.setColumnWidth(LC_CLS_STATUS,    80)
+
+        # Defer visual reorder until the tree has registered visibility changes
+        def _reorder_cls_cols():
+            hdr = self._tree.header()
+            genre_vis = hdr.visualIndex(LC_GENRE)
+            hdr.moveSection(hdr.visualIndex(LC_CLS_PROPOSED), genre_vis + 1)
+            hdr.moveSection(hdr.visualIndex(LC_CLS_CONF),     genre_vis + 2)
+            hdr.moveSection(hdr.visualIndex(LC_CLS_STATUS),   genre_vis + 3)
+
+        QTimer.singleShot(0, _reorder_cls_cols)
+
         # Teal-tinted column headers
         for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
             self._tree.headerItem().setForeground(col, QBrush(QColor('#428175')))
@@ -1364,7 +1507,10 @@ class LibraryBrowserView(QWidget):
             for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
                 item.setText(col, '')
                 item.setData(col, Qt.ItemDataRole.BackgroundRole, None)
-        # Restore header colors and hide columns
+        # Restore pre-classify header state (column order + widths), then hide columns
+        if getattr(self, '_pre_classify_header_state', None):
+            self._tree.header().restoreState(self._pre_classify_header_state)
+            self._pre_classify_header_state = None
         for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
             self._tree.headerItem().setForeground(col, QBrush(QColor('#a89b85')))
             self._tree.setColumnHidden(col, True)

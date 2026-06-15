@@ -124,7 +124,7 @@ class MainWindow(QMainWindow):
         self._dashboard.organize_requested.connect(self._on_organize_requested)
         self._dashboard.new_crate_requested.connect(self._on_new_crate_requested)
         self._dashboard.new_smart_crate_requested.connect(self._on_new_smart_crate_requested)
-        self._dashboard.scan_finished.connect(lambda: self._apply_nav_state(self._get_app_state()))
+        self._dashboard.scan_finished.connect(self._on_scan_finished)
         self._content.addWidget(self._dashboard)
 
         # Library Browser — index 1
@@ -595,6 +595,14 @@ class MainWindow(QMainWindow):
             f'Done.\n\n{result.crates_modified} crate(s) updated, '
             f'{result.paths_rewritten} track path(s) fixed.',
         )
+
+    def _on_scan_finished(self) -> None:
+        """Called when DashboardWidget finishes a library scan."""
+        self._apply_nav_state(self._get_app_state())
+        inv = self._dashboard._inventory
+        lib = self._dashboard._library_path
+        if inv and lib:
+            self._library_browser.on_scan_finished(inv, lib)
 
     def _on_reorg_completed(self) -> None:
         """Re-scan the library after a reorganization or rollback so the in-memory
