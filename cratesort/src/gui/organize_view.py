@@ -10,7 +10,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QProgressBar,
+    QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar,
     QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
@@ -19,6 +19,7 @@ from cratesort.src.core.classifier import ClassificationResult, Confidence
 from cratesort.src.core.file_organizer import (
     ExecutionResult, FileOrganizer, ReorganizationPlan,
 )
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm
 
 # ── Color constants (match CLAUDE-CS.md design language) ─────────────────────
 
@@ -334,15 +335,24 @@ class _OrganizeStatCard(QFrame):
 # _WarningsDetailDialog — expandable details for conflicts / path warnings / skipped
 # ---------------------------------------------------------------------------
 
-class _WarningsDetailDialog(QDialog):
+class _WarningsDetailDialog(_CrateSortDialog):
     def __init__(self, plan: ReorganizationPlan, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Warnings && Conflicts')
         self.setMinimumWidth(620)
         self.setMinimumHeight(440)
-        self.setStyleSheet(f'QDialog {{ background-color: {_PANEL}; }}')
 
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        container = QFrame()
+        container.setObjectName('warn_dlg_c')
+        container.setStyleSheet(
+            f'QFrame#warn_dlg_c {{ background-color: {_PANEL}; '
+            f'border: 1px solid #444444; border-radius: 12px; }}'
+        )
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(20, 20, 20, 16)
         layout.setSpacing(12)
 
@@ -441,6 +451,9 @@ class OrganizeView(QWidget):
         self._exec_worker: Optional[_ExecutionWorker] = None
         self._rb_worker:   Optional[_RollbackWorker]  = None
 
+        # Session plan cache — survives tab switches and cancel; cleared on execute/rollback
+        self._cached_plan: Optional[ReorganizationPlan] = None
+
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -458,11 +471,27 @@ class OrganizeView(QWidget):
     def load(self, inventory: list, library_path: Path, serato_dir: Path) -> None:
         """
         Called from MainWindow._on_nav() when the Organize tab is selected.
-        Always shows the gate screen with history. User clicks to start planning.
+        Restores the Preview screen if a plan was built this session and the
+        library hasn't changed; otherwise shows the gate screen with history.
         """
+        # Invalidate the cache if a different library is being loaded
+        if self._cached_plan is not None and self._cached_plan.library_root != library_path:
+            self._cached_plan = None
+
         self._inventory    = inventory
         self._library_path = library_path
         self._serato_dir   = serato_dir
+
+        if self._cached_plan is not None:
+            # Plan already built this session — restore Preview directly, no re-plan
+            self._plan = self._cached_plan
+            self._populate_preview(self._cached_plan)
+            self._stack.setCurrentIndex(_STATE_PREVIEW)
+            self.status_message.emit(
+                'Reorganization plan ready. Review before executing.', 'green'
+            )
+            return
+
         self._refresh_gate_screen()
         self._stack.setCurrentIndex(_STATE_GATE)
 
@@ -641,6 +670,7 @@ class OrganizeView(QWidget):
         try:
             from cratesort.src.gui.classifier_view import ClassificationSession
             session = ClassificationSession.load(session_path)
+            session.apply_library_edits()
             count = 0
             _UC = {'Unclassified', 'Untagged', ''}
             for entry in session.entries:
@@ -1062,7 +1092,7 @@ class OrganizeView(QWidget):
             try:
                 self._plan_worker.finished.disconnect()
                 self._plan_worker.errored.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
         self._plan_worker = _PlanWorker(
             self._library_path,
@@ -1075,18 +1105,23 @@ class OrganizeView(QWidget):
         self._plan_worker.start()
 
     def _on_plan_ready(self, plan: ReorganizationPlan) -> None:
-        self._plan = plan
-        self._populate_stats(plan.summary)
-        self._populate_ops_table(plan)
-        try:
-            self._card_warnings.clicked.disconnect()
-        except RuntimeError:
-            pass
-        self._card_warnings.clicked.connect(self._show_warnings_dialog)
+        self._plan        = plan
+        self._cached_plan = plan
+        self._populate_preview(plan)
         self._stack.setCurrentIndex(_STATE_PREVIEW)
         self.status_message.emit(
             'Reorganization plan ready. Review before executing.', 'green'
         )
+
+    def _populate_preview(self, plan: ReorganizationPlan) -> None:
+        """Populate Preview screen widgets from a plan. Called by _on_plan_ready and load()."""
+        self._populate_stats(plan.summary)
+        self._populate_ops_table(plan)
+        try:
+            self._card_warnings.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self._card_warnings.clicked.connect(self._show_warnings_dialog)
 
     def _show_warnings_dialog(self) -> None:
         if not self._plan:
@@ -1096,10 +1131,7 @@ class OrganizeView(QWidget):
 
     def _on_plan_error(self, message: str) -> None:
         self.status_message.emit('Plan build failed.', 'error')
-        QMessageBox.critical(
-            self, 'Plan Error',
-            f'Could not build reorganization plan:\n\n{message}',
-        )
+        _ov_alert(self, 'Plan Error', f'Could not build reorganization plan:\n\n{message[:400]}')
         self._stack.setCurrentIndex(_STATE_GATE)
 
     # ── Slots ─────────────────────────────────────────────────────────
@@ -1112,28 +1144,14 @@ class OrganizeView(QWidget):
                 return False
         except Exception:
             return False
-        box = QMessageBox(self)
-        box.setWindowTitle('Serato DJ Pro is Running')
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setText(
-            '<b>Serato DJ Pro is currently open.</b><br><br>'
+        _ov_alert(
+            self,
+            'Serato DJ Pro is Running',
+            'Serato DJ Pro is currently open.\n\n'
             'Close Serato before reorganizing your library. '
             'If Serato is open during reorganization, it will overwrite '
-            "CrateSort's changes when it closes."
+            "CrateSort's changes when it closes.",
         )
-        ok_btn = box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
-        ok_btn.setStyleSheet(
-            f'QPushButton {{ background-color: {_DANGER}; color: #ffffff; '
-            f'border: none; border-radius: 5px; padding: 7px 20px; '
-            f'font-size: 13px; font-weight: 600; }}'
-            f'QPushButton:hover {{ background-color: #b24c4c; }}'
-            f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
-        )
-        box.setStyleSheet(
-            f'QMessageBox {{ background-color: {_BG}; }} '
-            f'QLabel {{ color: {_CREAM}; font-size: 13px; }}'
-        )
-        box.exec()
         return True
 
     def _on_execute(self) -> None:
@@ -1143,14 +1161,13 @@ class OrganizeView(QWidget):
             return
         if sys.platform == 'win32' and self._plan.summary.path_warnings > 0:
             n = self._plan.summary.path_warnings
-            reply = QMessageBox.question(
-                self, 'Path Length Warning',
+            if not _ov_confirm(
+                self,
+                'Path Length Warning',
                 f'{n:,} operation(s) have destination paths that may exceed '
                 f"Windows' 260-character path limit and could fail.\n\nProceed anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+                confirm_text='Proceed',
+            ):
                 return
         self._stack.setCurrentIndex(_STATE_EXEC)
         self._exec_bar.setValue(0)
@@ -1172,7 +1189,8 @@ class OrganizeView(QWidget):
         )
 
     def _on_exec_finished(self, result: ExecutionResult) -> None:
-        self._exec_result       = result
+        self._cached_plan = None   # plan consumed — force re-plan on next visit
+        self._exec_result = result
         self._rollback_log_path = result.rollback_log_path
         moved   = len(result.completed)
         failed  = len(result.failed)
@@ -1183,7 +1201,10 @@ class OrganizeView(QWidget):
         if failed:
             detail += f'  {failed:,} file{"s" if failed != 1 else ""} failed.'
         if skipped:
-            detail += f'  {skipped:,} file{"s" if skipped != 1 else ""} skipped.'
+            detail += (
+                f'  {skipped:,} file{"s" if skipped != 1 else ""} could not be moved'
+                f' — destination already existed. Check the log for details.'
+            )
         if moved > 0:
             summary = result.crate_rewrite_summary
             if summary and summary.get('paths_rewritten', 0) > 0:
@@ -1200,11 +1221,9 @@ class OrganizeView(QWidget):
         )
 
     def _on_exec_error(self, message: str) -> None:
+        self._cached_plan = None   # execution failed — state is uncertain, require re-plan
         self.status_message.emit('Execution failed.', 'error')
-        QMessageBox.critical(
-            self, 'Execution Error',
-            f'Reorganization failed:\n\n{message}',
-        )
+        _ov_alert(self, 'Execution Error', f'Reorganization failed:\n\n{message[:400]}')
         self._stack.setCurrentIndex(_STATE_PREVIEW)
 
     def _on_cancel_preview(self) -> None:
@@ -1232,15 +1251,14 @@ class OrganizeView(QWidget):
         if self._warn_serato_running():
             return
 
-        reply = QMessageBox.question(
+        if not _ov_confirm(
             self,
             'Confirm Rollback',
             'This will undo the reorganization and restore all files to their '
             'original locations.\n\nAre you sure you want to continue?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+            confirm_text='Rollback',
+            confirm_danger=True,
+        ):
             return
 
         self._rollback_log_path = active_log
@@ -1261,6 +1279,7 @@ class OrganizeView(QWidget):
         self._rb_worker.start()
 
     def _on_rollback_finished(self, result: dict) -> None:
+        self._cached_plan = None   # library state changed — plan no longer valid
         restored = result.get('restored', 0)
         failed   = result.get('failed', 0)
         self._done_label.setText('Rollback complete.')
@@ -1277,8 +1296,5 @@ class OrganizeView(QWidget):
     def _on_rollback_error(self, message: str) -> None:
         self._rollback_btn.setEnabled(True)
         self._done_back_btn.setEnabled(True)
-        QMessageBox.critical(
-            self, 'Rollback Error',
-            f'Rollback failed:\n\n{message}',
-        )
+        _ov_alert(self, 'Rollback Error', f'Rollback failed:\n\n{message[:400]}')
         self.status_message.emit('Rollback failed.', 'error')

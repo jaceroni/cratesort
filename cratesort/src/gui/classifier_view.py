@@ -19,7 +19,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import QAbstractItemView, QCompleter
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QCheckBox, QComboBox, QDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QProgressBar,
     QPushButton, QSizePolicy, QSplitter, QStackedWidget,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from cratesort.src.core.classifier import PARENT_GENRES
+from cratesort.src.gui.overlays import _CrateSortDialog
 
 # Regex: detect collaboration patterns in artist fields (feat., ft., &, vs., comma-not-sort)
 _COLLAB_RE = re.compile(
@@ -68,16 +69,18 @@ _FEAT_STRIP_RE = re.compile(
 
 
 def _looks_like_sort_form(artist: str) -> bool:
-    """Return True if a comma in the artist name is a 'Last, First' sort separator, not a collab."""
-    if ',' not in artist:
-        return False
-    # "Gap Band, The" — classic sort form ending
-    if re.search(r',\s*(the|a|an)\s*$', artist, re.IGNORECASE):
-        return True
-    # If the text after the first comma contains no spaces it's a single token
-    # (possibly hyphenated like "Jean-Jacques") → treat as sort form, not collab
+    """
+    Returns True only if the artist name looks like a sort-form inversion
+    (e.g. 'Doors, The' or 'Gap Band, The').
+    Single-word collaboration suffixes like 'Outlaws' are NOT sort-forms.
+    """
     after_comma = artist.split(',', 1)[1].strip()
-    return ' ' not in after_comma
+    # Must have no spaces (sort-forms are single words like 'The', 'Jr', 'Sr')
+    if ' ' in after_comma:
+        return False
+    # Known article/particle allowlist — only these trigger sort-form treatment
+    _SORT_FORM_PARTICLES = {'the', 'a', 'an', 'jr', 'sr', 'jr.', 'sr.', 'ii', 'iii', 'iv'}
+    return after_comma.lower() in _SORT_FORM_PARTICLES
 
 
 def _extract_primary_artist(artist: str) -> tuple[str, bool]:
@@ -423,9 +426,10 @@ class _ClassifyWorker(QThread):
                         if r.genre == proposed_genre
                     ]
                     overall_conf = (
-                        'LOW'    if ('LOW' in conf_for_genre or 'NONE' in conf_for_genre) else
-                        'MEDIUM' if 'MEDIUM' in conf_for_genre else
-                        'HIGH'
+                        'LOW'     if ('LOW' in conf_for_genre or 'NONE' in conf_for_genre) else
+                        'MEDIUM'  if 'MEDIUM' in conf_for_genre else
+                        'HIGH'    if 'HIGH' in conf_for_genre else
+                        'MATCHED'
                     )
                     reasons = [r.reason for _, r in vote_results if r.genre == proposed_genre]
                     reason  = reasons[0] if reasons else ''
@@ -518,53 +522,68 @@ class _ClassifyWorker(QThread):
 # Change-genre dialog
 # ---------------------------------------------------------------------------
 
-class _ChangeGenreDialog(QDialog):
+class _ChangeGenreDialog(_CrateSortDialog):
     def __init__(self, artist: str, current_genre: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Change Genre')
-        self.setMinimumWidth(320)
-        self.setStyleSheet("""
-            QDialog { background-color: #2F2F2F; }
-            QLabel  { color: #f1e3c8; font-weight: 400; font-size: 13px; }
-            QLineEdit, QComboBox {
-                background-color: #1a1a1a; color: #f1e3c8;
-                font-weight: 400; font-size: 13px;
-                border: 1px solid #444444; border-radius: 4px; padding: 6px 8px;
-            }
-            QPushButton {
-                font-weight: 400; font-size: 13px;
-                padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
-                background-color: #428175; color: #ffffff;
-            }
-            QPushButton:hover { background-color: #38706a; }
-        """)
+        self.setMinimumWidth(340)
 
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        container = QFrame()
+        container.setObjectName('cgd_c')
+        container.setStyleSheet(
+            'QFrame#cgd_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
+        )
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(20, 20, 20, 16)
         layout.setSpacing(12)
 
-        layout.addWidget(QLabel(f'Select genre for <b>{artist}</b>:'))
+        headline = QLabel('Change Genre')
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+        )
+        layout.addWidget(headline)
+
+        sub = QLabel(f'Select genre for <b>{artist}</b>:')
+        sub.setStyleSheet('color: #a89b85; font-size: 13px; background: transparent; border: none;')
+        layout.addWidget(sub)
 
         self._combo = QComboBox()
+        self._combo.setStyleSheet(
+            'QComboBox { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
+            'border: 1px solid #444444; border-radius: 4px; padding: 6px 8px; }'
+        )
         for g in ALL_GENRES:
             self._combo.addItem(g)
         self._combo.setCurrentText(current_genre)
         layout.addWidget(self._combo)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        _c = buttons.button(QDialogButtonBox.StandardButton.Cancel)
-        if _c:
-            _c.setStyleSheet(
-                'QPushButton { background-color: #C75B5B; color: #ffffff; border-radius: 6px; border: none; padding: 8px 24px; min-width: 80px; }'
-                'QPushButton:hover { background-color: #b24c4c; }'
-                'QPushButton:pressed { background-color: #9c3b3b; }'
-            )
-        layout.addWidget(buttons)
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = QPushButton('Apply')
+        ok_btn.setFixedHeight(36)
+        ok_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
 
     @property
     def selected_genre(self) -> str:
@@ -579,36 +598,41 @@ class _ChangeGenreDialog(QDialog):
 # Reassign artist dialog — autocomplete + protection notice (items 9, 12)
 # ---------------------------------------------------------------------------
 
-class _ReassignArtistDialog(QDialog):
+class _ReassignArtistDialog(_CrateSortDialog):
     def __init__(self, existing_artists: list[str], parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Reassign Artist')
-        self.setMinimumWidth(380)
-        self.setStyleSheet("""
-            QDialog { background-color: #2F2F2F; }
-            QLabel  { color: #f1e3c8; font-weight: 400; font-size: 13px; }
-            QLineEdit, QComboBox {
-                background-color: #1a1a1a; color: #f1e3c8;
-                font-weight: 400; font-size: 13px;
-                border: 1px solid #444444; border-radius: 4px; padding: 6px 8px;
-            }
-            QPushButton {
-                font-weight: 400; font-size: 13px;
-                padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
-                background-color: #428175; color: #ffffff;
-            }
-            QPushButton:hover { background-color: #38706a; }
-        """)
-        layout = QVBoxLayout(self)
+        self.setMinimumWidth(400)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        container = QFrame()
+        container.setObjectName('rad_c')
+        container.setStyleSheet(
+            'QFrame#rad_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
+        )
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 16)
 
-        layout.addWidget(QLabel('Enter or select an artist name:'))
+        headline = QLabel('Reassign Artist')
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+        )
+        layout.addWidget(headline)
+
+        prompt_lbl = QLabel('Enter or select an artist name:')
+        prompt_lbl.setStyleSheet('color: #a89b85; font-size: 13px; background: transparent; border: none;')
+        layout.addWidget(prompt_lbl)
 
         self._edit = QLineEdit()
         self._edit.setPlaceholderText('Start typing…')
-
-        # Autocomplete from existing artists (item 9)
+        self._edit.setStyleSheet(
+            'QLineEdit { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
+            'border: 1px solid #444444; border-radius: 4px; padding: 6px 8px; }'
+        )
         completer = QCompleter(existing_artists, self._edit)
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
@@ -616,29 +640,37 @@ class _ReassignArtistDialog(QDialog):
         self._edit.setCompleter(completer)
         layout.addWidget(self._edit)
 
-        # Protection notice (item 12)
         note = QLabel(
             'Only the artist grouping will change. '
             'Your comments, cue points, and Serato data are never modified.'
         )
         note.setWordWrap(True)
-        note.setStyleSheet('color: #a89b85; font-size: 11px; font-style: italic;')
+        note.setStyleSheet('color: #a89b85; font-size: 11px; font-style: italic; background: transparent; border: none;')
         layout.addWidget(note)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        _c = buttons.button(QDialogButtonBox.StandardButton.Cancel)
-        if _c:
-            _c.setStyleSheet(
-                'QPushButton { background-color: #C75B5B; color: #ffffff; border-radius: 6px; border: none; padding: 8px 24px; min-width: 80px; }'
-                'QPushButton:hover { background-color: #b24c4c; }'
-                'QPushButton:pressed { background-color: #9c3b3b; }'
-            )
-        layout.addWidget(buttons)
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = QPushButton('Reassign')
+        ok_btn.setFixedHeight(36)
+        ok_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
 
     @property
     def artist_name(self) -> str:
@@ -649,55 +681,80 @@ class _ReassignArtistDialog(QDialog):
 # Edit tags dialog (item 13)
 # ---------------------------------------------------------------------------
 
-class _EditTagsDialog(QDialog):
+class _EditTagsDialog(_CrateSortDialog):
     def __init__(self, track: TrackInfo, parent=None):
         super().__init__(parent)
         self._track = track
-        self.setWindowTitle(f'Edit Style Tags — {track.filename}')
-        self.setMinimumWidth(400)
-        self.setStyleSheet("""
-            QDialog { background-color: #2F2F2F; }
-            QLabel  { color: #f1e3c8; font-weight: 400; font-size: 13px; }
-            QLineEdit, QComboBox {
-                background-color: #1a1a1a; color: #f1e3c8;
-                font-weight: 400; font-size: 13px;
-                border: 1px solid #444444; border-radius: 4px; padding: 6px 8px;
-            }
-            QPushButton {
-                font-weight: 400; font-size: 13px;
-                padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
-                background-color: #428175; color: #ffffff;
-            }
-            QPushButton:hover { background-color: #38706a; }
-        """)
-        layout = QVBoxLayout(self)
+        self.setMinimumWidth(420)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        container = QFrame()
+        container.setObjectName('etd_c')
+        container.setStyleSheet(
+            'QFrame#etd_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
+        )
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 16)
 
-        layout.addWidget(QLabel(f'<b>{track.title or track.filename}</b>'))
+        headline = QLabel('Edit Style Tags')
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+        )
+        layout.addWidget(headline)
+
+        track_lbl = QLabel(f'<b>{track.title or track.filename}</b>')
+        track_lbl.setStyleSheet('color: #f1e3c8; font-size: 13px; background: transparent; border: none;')
+        layout.addWidget(track_lbl)
 
         info = QLabel(f'Current genre tag: {track.genre_tag or "(none)"}')
-        info.setStyleSheet('color: #a89b85; font-size: 12px;')
+        info.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
         layout.addWidget(info)
 
-        layout.addWidget(QLabel('Style tags (comma-separated):'))
+        tags_lbl = QLabel('Style tags (comma-separated):')
+        tags_lbl.setStyleSheet('color: #a89b85; font-size: 13px; background: transparent; border: none;')
+        layout.addWidget(tags_lbl)
 
         self._tags_edit = QLineEdit(', '.join(track.tags))
         self._tags_edit.setPlaceholderText('e.g. Boom Bap, Jazzy Hip-Hop')
+        self._tags_edit.setStyleSheet(
+            'QLineEdit { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
+            'border: 1px solid #444444; border-radius: 4px; padding: 6px 8px; }'
+        )
         layout.addWidget(self._tags_edit)
 
         note = QLabel('Tags are stored as style metadata and never written to Serato frames.')
         note.setWordWrap(True)
-        note.setStyleSheet('color: #a89b85; font-size: 11px; font-style: italic;')
+        note.setStyleSheet('color: #a89b85; font-size: 11px; font-style: italic; background: transparent; border: none;')
         layout.addWidget(note)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
         )
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = QPushButton('Save Tags')
+        ok_btn.setFixedHeight(36)
+        ok_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        ok_btn.clicked.connect(self._on_accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
 
     def _on_accept(self) -> None:
         raw = self._tags_edit.text()

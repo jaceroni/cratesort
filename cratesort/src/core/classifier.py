@@ -700,10 +700,11 @@ _FOLDER_HINTS: dict[str, str] = {
 
 
 class Confidence(Enum):
-    HIGH = "HIGH"      # Direct parent genre or unambiguous style map match
-    MEDIUM = "MEDIUM"  # Style analysis or comment field
-    LOW = "LOW"        # Folder hint only
-    NONE = "NONE"      # Could not classify
+    MATCHED = "MATCHED"  # Existing ID3 tag matches taxonomy exactly
+    HIGH = "HIGH"        # Direct parent genre or unambiguous style map match
+    MEDIUM = "MEDIUM"    # Style analysis or comment field
+    LOW = "LOW"          # Folder hint only
+    NONE = "NONE"        # Could not classify
 
 
 @dataclass
@@ -748,11 +749,12 @@ class GenreClassifier:
         raw_genre = (record.genre or "").strip()
         genre_lower = raw_genre.lower()
 
-        # ── Tier 1: Already a valid parent genre ──────────────────────────
-        if raw_genre in PARENT_GENRES:
+        # ── Tier 1: Already a valid parent genre (case-insensitive) ─────────
+        canonical_parent = next((g for g in PARENT_GENRES if g.lower() == genre_lower), None)
+        if canonical_parent:
             return ClassificationResult(
-                genre=raw_genre,
-                confidence=Confidence.HIGH,
+                genre=canonical_parent,
+                confidence=Confidence.MATCHED,
                 reason="Genre tag is a valid parent genre",
                 original_genre_tag=raw_genre,
             )

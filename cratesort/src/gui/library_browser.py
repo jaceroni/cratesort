@@ -3,17 +3,25 @@ from __future__ import annotations
 import json
 import subprocess
 import sys as _sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QEvent, QRect, QSettings, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QPen
+from PyQt6.QtCore import Qt, QByteArray, QEvent, QRect, QSettings, QSize, QTimer, pyqtSignal
+
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert
+from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
+
+try:
+    from PyQt6.QtSvgWidgets import QSvgWidget as _QSvgWidget  # noqa: F401 (defensive import)
+except ImportError:
+    pass
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem,
-    QMenu, QPushButton, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate,
+    QMenu, QProgressBar, QPushButton, QSplitter, QStackedWidget,
+    QStyle, QStyledItemDelegate,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -45,6 +53,14 @@ HEADERS = [
 
 _MUTED   = '#a89b85'
 _DUMMY   = '__LAZY__'
+
+# Taxonomy-validated genres — only these 13 are accepted for ID3 fallback bucketing.
+# Keys are lowercase for case-insensitive matching; values are the canonical forms.
+_VALID_GENRES_LOWER: dict[str, str] = {g.lower(): g for g in {
+    'Blues', 'Country', 'Electronic', 'Funk/Soul', 'Hip-Hop/Rap',
+    'House', 'Jazz', 'R&B', 'Reggae', 'Rock', 'Seasonal',
+    'Specialty', 'Traditional',
+}}
 
 _SETTINGS_KEY = 'library_browser_header_state'
 
@@ -119,6 +135,29 @@ _EDITABLE = {
     LC_YEAR:    'year',
     LC_COMMENT: 'comment',
 }
+
+
+# SVG icon path for the classify-mode banner
+_BANNER_ICON_PATH = Path(__file__).resolve().parent.parent.parent / 'assets' / 'icons' / 'icon-banner.svg'
+
+
+def _tint_svg_icon(icon_path: Path, size: int, color: str) -> QPixmap:
+    """Load an SVG as a QPixmap, tint it to the given hex color, and return it."""
+    px = QPixmap(str(icon_path)).scaled(
+        size, size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    if px.isNull():
+        return px
+    tinted = QPixmap(px.size())
+    tinted.fill(Qt.GlobalColor.transparent)
+    p = QPainter(tinted)
+    p.drawPixmap(0, 0, px)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    p.fillRect(tinted.rect(), QColor(color))
+    p.end()
+    return tinted
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +290,254 @@ class GenreSidebarDelegate(QStyledItemDelegate):
 
 
 # ---------------------------------------------------------------------------
+# Unsaved classify-mode changes dialog
+# ---------------------------------------------------------------------------
+
+class _UnsavedChangesDialog(_CrateSortDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(440)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        container = QFrame()
+        container.setObjectName('unsaved_container')
+        container.setStyleSheet(
+            'QFrame#unsaved_container { background-color: #2F2F2F; '
+            'border: 1px solid #444444; border-radius: 12px; }'
+        )
+        root.addWidget(container)
+
+        inner = QVBoxLayout(container)
+        inner.setContentsMargins(24, 20, 24, 16)
+        inner.setSpacing(10)
+
+        headline = QLabel('Unsaved Classification Changes')
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 15px; font-weight: 600; '
+            'background: transparent; border: none;'
+        )
+        inner.addWidget(headline)
+
+        body = QLabel(
+            'You have unsaved changes in Classify mode. '
+            'If you leave now, your corrections will be lost.'
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet(
+            'color: #a89b85; font-size: 13px; background: transparent; border: none;'
+        )
+        inner.addWidget(body)
+        inner.addSpacing(4)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(10)
+
+        leave_btn = QPushButton('Leave Anyway')
+        leave_btn.setFixedHeight(36)
+        leave_btn.setStyleSheet(
+            'QPushButton { background: #C75B5B; color: #f1e3c8; border: none; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background: #b24c4c; }'
+            'QPushButton:pressed { background: #9c3b3b; }'
+        )
+        leave_btn.clicked.connect(self.accept)
+
+        stay_btn = QPushButton('Stay and Finish')
+        stay_btn.setFixedHeight(36)
+        stay_btn.setStyleSheet(
+            'QPushButton { background: #428175; color: #f1e3c8; border: none; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background: #38706a; }'
+            'QPushButton:pressed { background: #2d6358; }'
+        )
+        stay_btn.clicked.connect(self.reject)
+
+        btns.addWidget(leave_btn)
+        btns.addStretch()
+        btns.addWidget(stay_btn)
+        inner.addLayout(btns)
+
+# ---------------------------------------------------------------------------
+# _AnimatedStatCardWidget — count-up stat card for the Analyze Library modal
+# ---------------------------------------------------------------------------
+
+class _AnimatedStatCardWidget(QFrame):
+    """Smoothly animates a numeric value towards a moving target at 60 fps."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._current_value = 0
+        self._target_value  = 0
+
+        self.setStyleSheet(
+            'QFrame { background-color: #1a1a1a; border: 1px solid #444444; '
+            'border-radius: 8px; }'
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._value_label = QLabel('0')
+        self._value_label.setProperty('role', 'stat')
+        self._value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._value_label.setStyleSheet(
+            'font-size: 22px; font-weight: 600; color: #f1e3c8; '
+            'background: transparent; border: none;'
+        )
+        layout.addWidget(self._value_label)
+
+        self._title_label = QLabel(title)
+        self._title_label.setProperty('role', 'stat_label')
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setStyleSheet(
+            'font-size: 10px; color: #a89b85; letter-spacing: 0.06em; '
+            'background: transparent; border: none;'
+        )
+        layout.addWidget(self._title_label)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def update_target(self, target: int) -> None:
+        self._target_value = target
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _tick(self) -> None:
+        diff = self._target_value - self._current_value
+        if diff == 0:
+            self._timer.stop()
+            return
+        if diff > 0:
+            step = max(1, int(diff * 0.15))
+            self._current_value = min(self._target_value, self._current_value + step)
+        else:
+            step = min(-1, int(diff * 0.15))
+            self._current_value = max(self._target_value, self._current_value + step)
+        self._value_label.setText(f'{self._current_value:,}')
+
+
+# ---------------------------------------------------------------------------
+# _AnalyzeLibraryModal — frameless modal shown during first-run classification
+# ---------------------------------------------------------------------------
+
+class _AnalyzeLibraryModal(_CrateSortDialog):
+    """Frameless 520×280 card displayed over the overlay during auto-classify."""
+
+    review_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(520, 280)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        container = QFrame()
+        container.setObjectName('modal_container')
+        container.setStyleSheet(
+            'QFrame#modal_container { background-color: #2F2F2F; '
+            'border: 1px solid #444444; border-radius: 12px; }'
+        )
+        root.addWidget(container)
+
+        inner = QVBoxLayout(container)
+        inner.setContentsMargins(28, 24, 28, 20)
+        inner.setSpacing(14)
+
+        headline = QLabel('Analyzing Library')
+        headline.setProperty('role', 'heading')
+        headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 16px; font-weight: 600; '
+            'background: transparent; border: none;'
+        )
+        inner.addWidget(headline)
+
+        subtitle = QLabel('Analyzing your DJ library and media files – validating artists and genres...')
+        subtitle.setProperty('role', 'muted')
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setStyleSheet(
+            'color: #a89b85; font-size: 12px; background: transparent; border: none;'
+        )
+        inner.addWidget(subtitle)
+
+        # Stat cards row
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(10)
+        self._card_tracks  = _AnimatedStatCardWidget('Tracks Analyzed',   self)
+        self._card_artists = _AnimatedStatCardWidget('Artists Classified', self)
+        self._card_fixes   = _AnimatedStatCardWidget('Corrections Made',   self)
+        cards_row.addWidget(self._card_tracks)
+        cards_row.addWidget(self._card_artists)
+        cards_row.addWidget(self._card_fixes)
+        inner.addLayout(cards_row)
+
+        # Action stack — fixed height keeps modal dimensions stable on transition
+        self._action_stack = QStackedWidget()
+        self._action_stack.setFixedHeight(45)
+        self._action_stack.setStyleSheet('background: transparent;')
+
+        # Page 0: progress bar
+        pb_wrapper = QWidget()
+        pb_layout  = QVBoxLayout(pb_wrapper)
+        pb_layout.setContentsMargins(0, 16, 0, 0)
+        pb_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFixedHeight(4)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setStyleSheet(
+            'QProgressBar { background-color: #383838; border: none; border-radius: 2px; }'
+            'QProgressBar::chunk { background-color: #428175; border-radius: 2px; }'
+        )
+        pb_layout.addWidget(self._progress_bar)
+        self._action_stack.addWidget(pb_wrapper)   # index 0
+
+        # Page 1: Review Results button
+        btn_wrapper = QWidget()
+        btn_layout  = QHBoxLayout(btn_wrapper)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._review_btn = QPushButton('Review Results')
+        self._review_btn.setProperty('secondary', True)
+        self._review_btn.setFixedSize(180, 36)
+        self._review_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #f1e3c8; '
+            'border: none; border-radius: 5px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        self._review_btn.clicked.connect(self.review_requested.emit)
+        btn_layout.addWidget(self._review_btn)
+        self._action_stack.addWidget(btn_wrapper)  # index 1
+
+        inner.addWidget(self._action_stack)
+
+    def update_stats(self, tracks_count: int, artists_count: int) -> None:
+        self._card_tracks.update_target(tracks_count)
+        self._card_artists.update_target(artists_count)
+        # TODO: Corrections Made — real-time comparison signal not yet available
+
+    def update_percent(self, percent: int) -> None:
+        self._progress_bar.setValue(percent)
+
+    def on_classification_complete(self) -> None:
+        self._action_stack.setCurrentIndex(1)
+
+
+def _show_dark_alert(parent_window: QWidget, title: str, body: str) -> None:
+    """Thin wrapper — delegates to the canonical _ov_alert from overlays."""
+    _ov_alert(parent_window, title, body)
+
+
+# ---------------------------------------------------------------------------
 # Library Browser view
 # ---------------------------------------------------------------------------
 
@@ -269,6 +556,7 @@ class LibraryBrowserView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._session_genre: dict[str, tuple[str, str]] = {}  # artist → (genre, conf)
+        self._session_artists: dict[str, str] = {}            # track_path → artist
         self._track_overrides: dict[str, str] = {}            # file_path → overridden genre
         self._has_classification = False
         self._library_path: Optional[Path] = None
@@ -283,6 +571,18 @@ class LibraryBrowserView(QWidget):
         self._classify_session = None
         self._classify_results: dict[str, tuple[str, str]] = {}  # artist → (genre, conf)
         self._classify_worker = None
+        # Tracks the last genre edit for post-sidebar-rebuild navigation
+        self._last_edited_artist:  Optional[str] = None
+        self._last_assigned_genre: Optional[str] = None
+
+        # Auto-classify modal state
+        self._analyze_modal:          Optional[_AnalyzeLibraryModal] = None
+        self._auto_classify_session                                   = None
+        self._processed_artists:      set                            = set()
+        self._processed_tracks_count: int                            = 0
+        self._auto_artist_tracks_map: dict                           = {}
+        self._auto_dj_tools_count:    int                            = 0
+
         # Inline editor state — at most one open at a time
         self._edit_item:     Optional[QTreeWidgetItem] = None
         self._edit_col:      int = -1
@@ -302,12 +602,8 @@ class LibraryBrowserView(QWidget):
 
     def on_scan_finished(self, inventory, library_path: Path) -> None:
         """Called by MainWindow after a background scan completes.
-        Refreshes the tree and genre sidebar without reloading the full session."""
-        self._library_path = library_path
-        self._inventory = list(inventory)
-        self._load_edits()
-        self._rebuild_tree()
-        self._populate_genre_sidebar()
+        Routes through load() so session variables are always fully initialized."""
+        self.load(inventory, library_path)
 
     def load(self, inventory, library_path: Path) -> None:
         """
@@ -353,6 +649,10 @@ class LibraryBrowserView(QWidget):
         self._rebuild_tree()
         self._populate_genre_sidebar()
         self._stack.setCurrentIndex(1)
+
+        # Auto-classify if the user has not yet confirmed any genre assignments
+        if not self._is_classification_complete() and self.isVisible():
+            self._on_classify_clicked(auto_classify=True)
 
     # ── Empty state ───────────────────────────────────────────────────
 
@@ -443,7 +743,13 @@ class LibraryBrowserView(QWidget):
         if saved:
             self._tree.header().restoreState(saved)
 
-        self._sidebar_splitter.addWidget(self._tree)
+        # Wrap tree in a stack so we can show an empty state over it
+        self._track_stack = QStackedWidget()
+        self._track_stack.addWidget(self._build_library_empty_state())  # index 0
+        self._track_stack.addWidget(self._tree)                          # index 1
+        self._track_stack.setCurrentIndex(1)
+
+        self._sidebar_splitter.addWidget(self._track_stack)
         self._sidebar_splitter.setStretchFactor(0, 0)
         self._sidebar_splitter.setStretchFactor(1, 1)
         _saved_w = self._settings.value('library/sidebar_width', 200, type=int)
@@ -472,17 +778,24 @@ class LibraryBrowserView(QWidget):
         frame = QFrame()
         frame.setVisible(False)
         frame.setStyleSheet(
-            'QFrame { background: #1e2e2b; border-bottom: 1px solid #2d4a44; }'
+            'QFrame { background: #1a3530; border-left: 3px solid #428175; border-bottom: 1px solid #2d4a44; }'
         )
         row = QHBoxLayout(frame)
-        row.setContentsMargins(14, 7, 14, 7)
+        row.setContentsMargins(14, 12, 14, 12)
         row.setSpacing(12)
 
-        msg = QLabel(
-            'Classify mode — review proposed genres and correct where needed, then accept.'
-        )
+        icon_px = _tint_svg_icon(_BANNER_ICON_PATH, 16, '#f1e3c8')
+        if not icon_px.isNull():
+            icon_lbl = QLabel()
+            icon_lbl.setPixmap(icon_px)
+            icon_lbl.setFixedSize(16, 16)
+            icon_lbl.setStyleSheet('background: transparent; border: none;')
+            row.addWidget(icon_lbl)
+
+        msg = QLabel("This is your library how we see it — review the artists and their nested files. Right-click/double-click an artist or their tracks to correct anything that looks off. Not sure about something? Change its genre to 'Unclassified' and move on. Your files are not touched until you reorganize.")
+        msg.setWordWrap(True)
         msg.setStyleSheet(
-            'color: #7bbdad; font-size: 11px; background: transparent; border: none;'
+            'color: #7bbdad; font-size: 12px; background: transparent; border: none;'
         )
         row.addWidget(msg, stretch=1)
 
@@ -545,6 +858,83 @@ class LibraryBrowserView(QWidget):
         row.addWidget(self._classify_btn)
 
         return tb
+
+    def _build_library_empty_state(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(12)
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        icon_lbl = QLabel('♪')
+        icon_lbl.setStyleSheet('font-size: 48px; color: #333; background: transparent;')
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(icon_lbl)
+
+        heading = QLabel("Your library hasn't been classified yet.")
+        heading.setStyleSheet(
+            'font-size: 14px; font-weight: 500; color: #f1e3c8; background: transparent;'
+        )
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+
+        subline = QLabel(
+            'Hit Classify Library to assign genres, clean up filenames, '
+            'and get your library organized.'
+        )
+        subline.setStyleSheet('font-size: 12px; color: #666; background: transparent;')
+        subline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subline.setWordWrap(True)
+        subline.setMaximumWidth(380)
+        layout.addWidget(subline, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        classify_btn = QPushButton('Classify Library')
+        classify_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #f1e3c8; '
+            'font-size: 11px; font-weight: 500; border: none; border-radius: 4px; '
+            'padding: 8px 20px; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        classify_btn.clicked.connect(self._on_classify_clicked)
+        layout.addWidget(classify_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        return w
+
+    def _update_empty_state(self) -> None:
+        """Show the empty state when no genres are classified, tree otherwise."""
+        if not hasattr(self, '_track_stack'):
+            return
+        if self._classify_mode:
+            self._track_stack.setCurrentIndex(1)
+            return
+        _UC = {'', '—', 'Unclassified', 'Untagged'}
+        has_genres = any(
+            (self._tree.topLevelItem(i).data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or '')
+            not in _UC
+            for i in range(self._tree.topLevelItemCount())
+        )
+        self._track_stack.setCurrentIndex(1 if has_genres else 0)
+
+    def _count_unclassified_artists(self) -> int:
+        _UC = {'', '—', 'Unclassified', 'Untagged'}
+        count = 0
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+            if genre in _UC:
+                count += 1
+        return count
+
+    def has_unsaved_classify_changes(self) -> bool:
+        return self._classify_mode
+
+    def _is_classification_complete(self) -> bool:
+        if not self._library_path:
+            return False
+        flag_path = self._library_path / '_CrateSort' / 'classification_accepted.flag'
+        return flag_path.exists()
 
     def _build_genre_sidebar(self) -> QFrame:
         frame = QFrame()
@@ -644,6 +1034,44 @@ class LibraryBrowserView(QWidget):
 
         self._genre_sidebar_list.blockSignals(False)
 
+        # Post-edit navigation: follow the artist to its new genre bucket if applicable.
+        dest_genre  = self._last_assigned_genre
+        dest_artist = self._last_edited_artist
+        if dest_genre is not None and dest_artist is not None:
+            self._last_edited_artist  = None
+            self._last_assigned_genre = None
+
+            # Navigate when the user is viewing a specific bucket that is no longer
+            # the destination (skip navigation when viewing "All").
+            navigate = (
+                self._sidebar_genre != 'All'
+                and self._sidebar_genre != dest_genre
+            )
+
+            if navigate:
+                self._sidebar_genre = dest_genre
+                self._genre_sidebar_list.blockSignals(True)
+                for i in range(self._genre_sidebar_list.count()):
+                    it = self._genre_sidebar_list.item(i)
+                    if it.data(Qt.ItemDataRole.UserRole) == dest_genre:
+                        self._genre_sidebar_list.setCurrentItem(it)
+                        break
+                self._genre_sidebar_list.blockSignals(False)
+
+            # Always re-apply filter so row visibilities and status counts are current.
+            self._apply_filter()
+
+            if navigate:
+                for i in range(self._tree.topLevelItemCount()):
+                    top = self._tree.topLevelItem(i)
+                    top_data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+                    if top_data.get('artist', '') == dest_artist:
+                        self._tree.clearSelection()
+                        top.setSelected(True)
+                        self._tree.setCurrentItem(top)
+                        self._tree.scrollToItem(top)
+                        break
+
     def _on_sidebar_genre_changed(
         self, current: QListWidgetItem, _previous: QListWidgetItem
     ) -> None:
@@ -682,10 +1110,26 @@ class LibraryBrowserView(QWidget):
         formats: set[str] = set()
 
         for artist, tracks in sorted(artist_tracks.items()):
-            genre, _ = self._classify_lookup(artist)
             artist_edits = self._edits.get(f'__artist__{artist}', {})
             if 'genre' in artist_edits:
                 genre = artist_edits['genre']
+            else:
+                genre, _ = self._classify_lookup(artist)
+                if not genre:
+                    # Step 3: taxonomy-validated ID3 majority vote (exact case-insensitive match only)
+                    _tag_counts: Counter = Counter()
+                    for rec in tracks:
+                        t_edits = self._edits.get(str(rec.path), {})
+                        raw_tag = (
+                            t_edits.get('genre')
+                            or self._track_overrides.get(str(rec.path))
+                            or rec.genre
+                            or ''
+                        )
+                        canonical = _VALID_GENRES_LOWER.get(raw_tag.strip().lower())
+                        if canonical:
+                            _tag_counts[canonical] += 1
+                    genre = _tag_counts.most_common(1)[0][0] if _tag_counts else ''
             item = self._make_artist_item(artist, tracks, genre)
             self._tree.addTopLevelItem(item)
             if genre:
@@ -706,12 +1150,20 @@ class LibraryBrowserView(QWidget):
         if not self._settings.value(_SETTINGS_KEY):
             self._tree.sortByColumn(LC_ARTIST, Qt.SortOrder.AscendingOrder)
 
-        # Fix 3: enforce min col widths AFTER layout pass (100ms delay)
-        QTimer.singleShot(100, self._enforce_min_col_widths)
+        # Resize columns to content on first load; user-adjusted widths persist via QSettings
+        if not self._settings.value(_SETTINGS_KEY):
+            def _resize_to_content():
+                self._tree.header().resizeSections(QHeaderView.ResizeMode.ResizeToContents)
+                _min = 60
+                for i in range(self._tree.columnCount()):
+                    if self._tree.columnWidth(i) < _min:
+                        self._tree.setColumnWidth(i, _min)
+            QTimer.singleShot(100, _resize_to_content)
 
         n = self._tree.topLevelItemCount()
         t = len(self._inventory)
         self._count_label.setText(f'{n:,} artists · {t:,} tracks')
+        self._update_empty_state()
 
     def _make_artist_item(self, artist: str, tracks: list, genre: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem()
@@ -728,21 +1180,23 @@ class LibraryBrowserView(QWidget):
         # Artist-level tags only — track tags are independent and stored separately
         tags = self._edits.get(f'__artist__{artist}', {}).get('tags', '')
 
+        _UC_ARTIST = {'', '—', 'Unclassified', 'Untagged'}
+
         item.setIcon(LC_ARTIST, _get_artist_icon())
         item.setText(LC_ARTIST, artist)
         item.setText(LC_TRACKS, str(len(tracks)))
-        item.setText(LC_GENRE,  genre or '—')
+        item.setText(LC_GENRE,  'Unclassified' if genre in _UC_ARTIST else genre)
         item.setText(LC_TAGS,   tags)
         item.setText(LC_PATH,   common)
 
         muted = QBrush(QColor(_MUTED))
         item.setForeground(LC_TRACKS, muted)
 
-        if not genre:
-            item.setForeground(LC_GENRE, muted)
-            f = item.font(LC_GENRE)
-            f.setItalic(True)
-            item.setFont(LC_GENRE, f)
+        if genre in _UC_ARTIST:
+            _red = QBrush(QColor('#C75B5B'))
+            item.setForeground(LC_ARTIST, _red)
+            item.setForeground(LC_GENRE, _red)
+            item.setToolTip(LC_ARTIST, 'Classify this artist to move all tracks out of Unclassified.')
 
         # Lazy-load placeholder
         dummy = QTreeWidgetItem(item)
@@ -782,9 +1236,28 @@ class LibraryBrowserView(QWidget):
         if comment:
             child.setToolTip(LC_COMMENT, comment)
 
-        muted = QBrush(QColor(_MUTED))
-        for col in range(len(HEADERS)):
-            child.setForeground(col, muted)
+        _UC_T = {'', '—', 'Unclassified', 'Untagged'}
+        parent_genre = parent.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+        if parent_genre in _UC_T:
+            track_genre_raw = genre.strip() if genre else ''
+            if track_genre_raw and track_genre_raw not in _UC_T:
+                # Case B: track has a genre tag but artist is unclassified → amber
+                _amber = QBrush(QColor('#c9a87a'))
+                for col in range(len(HEADERS)):
+                    child.setForeground(col, _amber)
+                child.setText(LC_GENRE, f'{track_genre_raw} ⚠ Artist unclassified')
+                child.setForeground(LC_GENRE, _amber)
+                child.setToolTip(LC_ARTIST, 'This track has a genre tag but will remain in Unclassified until its artist is classified.')
+            else:
+                # Case A: track has no genre → red (same as artist)
+                _red = QBrush(QColor('#C75B5B'))
+                for col in range(len(HEADERS)):
+                    child.setForeground(col, _red)
+                child.setForeground(LC_GENRE, _red)
+        else:
+            muted = QBrush(QColor(_MUTED))
+            for col in range(len(HEADERS)):
+                child.setForeground(col, muted)
         return child
 
     def _classify_lookup(self, artist: str) -> tuple[str, str]:
@@ -884,11 +1357,42 @@ class LibraryBrowserView(QWidget):
         item.setText(col, display)
 
         rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
-        if rec and col in _EDITABLE:
-            field = _EDITABLE[col]
+        field = _EDITABLE.get(col)
+        if rec and field:
             self._edits.setdefault(str(rec.path), {})[field] = new_val
             self.track_field_changed.emit(str(rec.path), field, new_val)
         self._save_edits()
+
+        # Write field to disk immediately (free-tier metadata write-through).
+        # 'tags' is virtual-only — skip disk write. _save_edits() staging always stands.
+        disk_ok = True
+        if rec and field and field != 'tags':
+            from cratesort.src.core.file_organizer import write_file_metadata
+            disk_ok = write_file_metadata(rec.path, field, new_val)
+            if disk_ok:
+                if field == 'title':
+                    rec.title = new_val
+                elif field == 'album':
+                    rec.album = new_val
+                elif field == 'bpm':
+                    try:
+                        rec.bpm = float(new_val)
+                    except (ValueError, TypeError):
+                        pass
+                elif field == 'year':
+                    rec.year = new_val
+                elif field == 'comment':
+                    rec.comment = new_val
+
+        if not disk_ok:
+            item.setText(col, f'  {original}' if col == LC_ARTIST else original)
+            saved_label = self._count_label.text()
+            self._count_label.setText(
+                '⚠ Could not write to file — check that the drive is connected '
+                'and the file is not locked.'
+            )
+            QTimer.singleShot(5000, lambda t=saved_label: self._count_label.setText(t))
+            return
 
         # Deselect the row before flashing: selected state applies dark text on
         # orange background, hiding the teal text flash entirely.
@@ -1095,16 +1599,62 @@ class LibraryBrowserView(QWidget):
         new_genre = dlg.selected_genre
         artist_changes: dict[str, str] = {}
         track_changes:  dict[str, str] = {}
+        _UC_GENRES = {'', '—', 'Unclassified', 'Untagged'}
         for item in selected:
             if item.parent() is None:
                 data   = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
                 artist = data.get('artist', '')
-                item.setText(LC_GENRE, new_genre)
+                display_genre = 'Unclassified' if new_genre in _UC_GENRES else new_genre
+                item.setText(LC_GENRE, display_genre)
                 item.setData(LC_GENRE, Qt.ItemDataRole.UserRole + 1, new_genre)
-                item.setForeground(LC_GENRE, QBrush(QColor('#f1e3c8')))
                 f = item.font(LC_GENRE)
                 f.setItalic(False)
                 item.setFont(LC_GENRE, f)
+                if new_genre in _UC_GENRES:
+                    _red = QBrush(QColor('#C75B5B'))
+                    item.setForeground(LC_ARTIST, _red)
+                    item.setForeground(LC_GENRE, _red)
+                    item.setToolTip(LC_ARTIST, 'Classify this artist to move all tracks out of Unclassified.')
+                else:
+                    _cream = QBrush(QColor('#f1e3c8'))
+                    item.setForeground(LC_ARTIST, _cream)
+                    item.setForeground(LC_GENRE, _cream)
+                    item.setToolTip(LC_ARTIST, '')
+                # Propagate color to any already-expanded child track items
+                for ci in range(item.childCount()):
+                    ch = item.child(ci)
+                    if ch.text(0) == _DUMMY:
+                        continue
+                    rec = ch.data(LC_PATH, Qt.ItemDataRole.UserRole)
+                    if not rec:
+                        continue
+                    t_edits = self._edits.get(str(rec.path), {})
+                    t_genre = (
+                        t_edits.get('genre')
+                        or self._track_overrides.get(str(rec.path))
+                        or rec.genre
+                        or ''
+                    )
+                    if new_genre in _UC_GENRES:
+                        if t_genre and t_genre not in _UC_GENRES:
+                            _amber = QBrush(QColor('#c9a87a'))
+                            for col in range(self._tree.columnCount()):
+                                ch.setForeground(col, _amber)
+                            ch.setText(LC_GENRE, f'{t_genre} ⚠ Artist unclassified')
+                            ch.setForeground(LC_GENRE, _amber)
+                            ch.setToolTip(LC_ARTIST, 'This track has a genre tag but will remain in Unclassified until its artist is classified.')
+                        else:
+                            _red = QBrush(QColor('#C75B5B'))
+                            for col in range(self._tree.columnCount()):
+                                ch.setForeground(col, _red)
+                            ch.setForeground(LC_GENRE, _red)
+                            ch.setToolTip(LC_ARTIST, '')
+                    else:
+                        _muted = QBrush(QColor(_MUTED))
+                        for col in range(self._tree.columnCount()):
+                            ch.setForeground(col, _muted)
+                        ch.setText(LC_GENRE, t_genre or '—')
+                        ch.setToolTip(LC_ARTIST, '')
                 self._edits.setdefault(f'__artist__{artist}', {})['genre'] = new_genre
                 artist_changes[artist] = new_genre
                 item.setSelected(False)
@@ -1117,6 +1667,11 @@ class LibraryBrowserView(QWidget):
                     track_changes[str(rec.path)] = new_genre
         self._save_edits()
         self._sync_genres_to_session(artist_changes, track_changes)
+        if artist_changes:
+            self._last_edited_artist  = next(reversed(artist_changes))
+            self._last_assigned_genre = new_genre
+        self._populate_genre_sidebar()
+        self._update_empty_state()
 
     def _artist_menu(self, item: QTreeWidgetItem, pos) -> None:
         data  = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
@@ -1287,6 +1842,26 @@ class LibraryBrowserView(QWidget):
         dest_item.setSelected(False)
         self._flash_row_text(dest_item)
         self._save_edits()
+        self._populate_genre_sidebar()
+        self._update_empty_state()
+
+        # Write artist tag to disk for each reassigned track (free-tier write-through)
+        from cratesort.src.core.file_organizer import write_file_metadata
+        disk_failures = 0
+        for _, track_rec, _ in tracks_to_move:
+            if write_file_metadata(track_rec.path, 'artist', new_artist):
+                track_rec.artist = new_artist
+            else:
+                disk_failures += 1
+        if disk_failures:
+            n = self._tree.topLevelItemCount()
+            t = len(self._inventory)
+            norm = f'{n:,} artists · {t:,} tracks'
+            self._count_label.setText(
+                f'⚠ {disk_failures} track(s) could not be updated on disk — '
+                f'check that the drive is connected and files are not locked.'
+            )
+            QTimer.singleShot(6000, lambda s=norm: self._count_label.setText(s))
 
     def _change_artist_genre(self, item: QTreeWidgetItem, artist: str) -> None:
         from cratesort.src.gui.classifier_view import _ChangeGenreDialog
@@ -1304,6 +1879,25 @@ class LibraryBrowserView(QWidget):
             self._save_edits()
             item.setSelected(False)
             self._flash_row_text(item)
+
+            # Write genre to all tracks for this artist (free-tier write-through)
+            from cratesort.src.core.file_organizer import write_file_metadata
+            artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            disk_failures = 0
+            for rec in artist_data.get('tracks', []):
+                if write_file_metadata(rec.path, 'genre', new_genre):
+                    rec.genre = new_genre
+                else:
+                    disk_failures += 1
+            if disk_failures:
+                n = self._tree.topLevelItemCount()
+                t = len(self._inventory)
+                norm = f'{n:,} artists · {t:,} tracks'
+                self._count_label.setText(
+                    f'⚠ {disk_failures} track(s) could not be updated on disk — '
+                    f'check that the drive is connected and files are not locked.'
+                )
+                QTimer.singleShot(6000, lambda s=norm: self._count_label.setText(s))
 
     def _edit_artist_tags(self, item: QTreeWidgetItem, artist: str) -> None:
         from cratesort.src.gui.classifier_view import _EditTagsDialog
@@ -1383,29 +1977,89 @@ class LibraryBrowserView(QWidget):
 
     # ── Classify mode ─────────────────────────────────────────────────
 
-    def _on_classify_clicked(self) -> None:
+    def _on_classify_clicked(self, checked: bool = False, auto_classify: bool = False) -> None:
         if not self._inventory or not self._library_path:
             return
         from cratesort.src.gui.classifier_view import ClassificationSession, _ClassifyWorker
 
-        # If a session already exists, load it directly
         session_file = self._library_path / '_CrateSort' / 'classification_session.json'
-        if session_file.exists():
-            try:
-                session = ClassificationSession.load(session_file)
-                session.apply_library_edits()
-                self._enter_classify_mode(session)
-                return
-            except Exception:
-                pass
 
-        # Run the classifier in the background
-        self._classify_btn.setEnabled(False)
-        self._classify_btn.setText('Classifying…')
-        self._classify_worker = _ClassifyWorker(self._inventory, self._library_path)
-        self._classify_worker.finished.connect(self._on_classify_finished)
-        self._classify_worker.errored.connect(self._on_classify_error)
-        self._classify_worker.start()
+        if auto_classify:
+            # Session already on disk — load and enter classify mode immediately
+            if session_file.exists():
+                try:
+                    session = ClassificationSession.load(session_file)
+                    session.apply_library_edits()
+                    self._enter_classify_mode(session)
+                    return
+                except Exception:
+                    pass
+
+            # No session yet — show the Analyze Library modal and run the worker
+            from cratesort.src.gui.classifier_view import (
+                _extract_primary_artist, _canonical_artist,
+                DJ_TOOLS_LABEL, _DJ_TOOLS_FOLDER_PATTERNS,
+            )
+            _VIDEO_PURPOSE = frozenset({
+                'movie clips', '_movie clips', 'commercials', '_commercials',
+                'clips', 'films', 'visuals', '_visuals',
+            })
+
+            # Pre-compile artist → track_count map (mirrors _ClassifyWorker grouping)
+            artist_tracks_map: dict[str, int] = {}
+            dj_tools_count = 0
+            for rec in self._inventory:
+                raw_artist = rec.artist or ''
+                no_artist  = (
+                    not raw_artist
+                    or raw_artist.lower() in ('unknown artist', 'various', 'fx')
+                )
+                if rec.is_video:
+                    if any(p in str(rec.path).lower() for p in _VIDEO_PURPOSE):
+                        dj_tools_count += 1
+                        continue
+                if no_artist and rec.duration and rec.duration < 60:
+                    if any(p in str(rec.path).lower() for p in _DJ_TOOLS_FOLDER_PATTERNS):
+                        dj_tools_count += 1
+                        continue
+                primary, _ = _extract_primary_artist(raw_artist or 'Unknown Artist')
+                canonical  = _canonical_artist(primary)
+                artist_tracks_map[canonical] = artist_tracks_map.get(canonical, 0) + 1
+
+            self._auto_artist_tracks_map = artist_tracks_map
+            self._auto_dj_tools_count    = dj_tools_count
+            self._processed_artists      = set()
+            self._processed_tracks_count = 0
+
+            main_window = self.window()
+            self._analyze_modal = _AnalyzeLibraryModal(main_window)
+            self._analyze_modal.review_requested.connect(self._on_review_results_clicked)
+            self._analyze_modal.show()
+            self._analyze_modal.raise_()
+
+            self._classify_worker = _ClassifyWorker(self._inventory, self._library_path)
+            self._classify_worker.progress.connect(self._on_auto_classify_progress)
+            self._classify_worker.finished.connect(self._on_auto_classify_finished)
+            self._classify_worker.errored.connect(self._on_auto_classify_error)
+            self._classify_worker.start()
+
+        else:
+            # Manual toolbar trigger — existing behaviour
+            if session_file.exists():
+                try:
+                    session = ClassificationSession.load(session_file)
+                    session.apply_library_edits()
+                    self._enter_classify_mode(session)
+                    return
+                except Exception:
+                    pass
+
+            self._classify_btn.setEnabled(False)
+            self._classify_btn.setText('Classifying…')
+            self._classify_worker = _ClassifyWorker(self._inventory, self._library_path)
+            self._classify_worker.finished.connect(self._on_classify_finished)
+            self._classify_worker.errored.connect(self._on_classify_error)
+            self._classify_worker.start()
 
     def _on_classify_finished(self, session) -> None:
         session.save()
@@ -1417,8 +2071,54 @@ class LibraryBrowserView(QWidget):
     def _on_classify_error(self, message: str) -> None:
         self._classify_btn.setEnabled(True)
         self._classify_btn.setText('Classify Library')
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.critical(self, 'Classification Failed', message[:500])
+        _show_dark_alert(self.window(), 'Classification Failed', message[:500])
+
+    # ── Auto-classify modal slots ──────────────────────────────────────
+
+    def _on_auto_classify_progress(self, done: int, total: int, artist_name: str) -> None:
+        from cratesort.src.gui.classifier_view import DJ_TOOLS_LABEL
+        if self._analyze_modal is None:
+            return
+        if artist_name not in self._processed_artists:
+            self._processed_artists.add(artist_name)
+            if artist_name == DJ_TOOLS_LABEL:
+                self._processed_tracks_count += self._auto_dj_tools_count
+            else:
+                self._processed_tracks_count += self._auto_artist_tracks_map.get(artist_name, 0)
+        self._analyze_modal.update_stats(
+            self._processed_tracks_count, len(self._processed_artists)
+        )
+        if total > 0:
+            self._analyze_modal.update_percent(int((done / total) * 100))
+
+    def _on_auto_classify_finished(self, session) -> None:
+        session.save()
+        session.apply_library_edits()
+        self._auto_classify_session = session
+        if self._analyze_modal is not None:
+            self._analyze_modal.on_classification_complete()
+
+    def _on_auto_classify_error(self, message: str) -> None:
+        self._cleanup_auto_classify_ui()
+        _show_dark_alert(self.window(), 'Classification Failed', message[:500])
+
+    def _on_review_results_clicked(self) -> None:
+        session = self._auto_classify_session
+        self._cleanup_auto_classify_ui()
+        if session is not None:
+            self._enter_classify_mode(session)
+
+    def _cleanup_auto_classify_ui(self) -> None:
+        if self._analyze_modal is not None:
+            modal = self._analyze_modal
+            self._analyze_modal = None
+            modal.close()       # emits finished → _CrateSortDialog._cleanup_overlay handles scrim
+            modal.deleteLater()
+        self._auto_classify_session  = None
+        self._processed_artists      = set()
+        self._processed_tracks_count = 0
+        self._auto_artist_tracks_map = {}
+        self._auto_dj_tools_count    = 0
 
     def _enter_classify_mode(self, session) -> None:
         self._classify_mode = True
@@ -1445,6 +2145,10 @@ class LibraryBrowserView(QWidget):
             hdr.moveSection(hdr.visualIndex(LC_CLS_PROPOSED), genre_vis + 1)
             hdr.moveSection(hdr.visualIndex(LC_CLS_CONF),     genre_vis + 2)
             hdr.moveSection(hdr.visualIndex(LC_CLS_STATUS),   genre_vis + 3)
+            for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
+                self._tree.resizeColumnToContents(col)
+                if self._tree.columnWidth(col) < 60:
+                    self._tree.setColumnWidth(col, 60)
 
         QTimer.singleShot(0, _reorder_cls_cols)
 
@@ -1452,6 +2156,7 @@ class LibraryBrowserView(QWidget):
         for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
             self._tree.headerItem().setForeground(col, QBrush(QColor('#428175')))
         self._populate_classify_columns()
+        self._update_empty_state()
         self._classify_banner_frame.setVisible(True)
         self._classify_btn.setVisible(False)
 
@@ -1476,6 +2181,8 @@ class LibraryBrowserView(QWidget):
             item.setBackground(LC_CLS_PROPOSED, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
             if is_uc:
                 item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#C75B5B')))
+            elif confidence == 'MATCHED':
+                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#f1e3c8')))
             elif changed:
                 item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#D17D34')))
             else:
@@ -1485,13 +2192,16 @@ class LibraryBrowserView(QWidget):
             item.setText(LC_CLS_CONF, confidence)
             item.setBackground(LC_CLS_CONF, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
             conf_color = {
-                'HIGH': '#428175', 'MEDIUM': '#D4A04A',
-                'LOW': '#D17D34',  'NONE':   '#C75B5B',
+                'MATCHED': '#f1e3c8',
+                'HIGH':    '#428175',
+                'MEDIUM':  '#9fa4c7',
+                'LOW':     '#D17D34',
+                'NONE':    '#C75B5B',
             }.get(confidence, '#aaa')
             item.setForeground(LC_CLS_CONF, QBrush(QColor(conf_color)))
 
             # Status
-            status = 'Modified' if changed else ''
+            status = '' if confidence == 'MATCHED' else ('Modified' if changed else '')
             item.setText(LC_CLS_STATUS, status)
             item.setBackground(LC_CLS_STATUS, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
             if status:
@@ -1514,6 +2224,7 @@ class LibraryBrowserView(QWidget):
         for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
             self._tree.headerItem().setForeground(col, QBrush(QColor('#a89b85')))
             self._tree.setColumnHidden(col, True)
+        self._update_empty_state()
         self._classify_banner_frame.setVisible(False)
         self._classify_btn.setVisible(True)
 
@@ -1531,30 +2242,76 @@ class LibraryBrowserView(QWidget):
                 pass
 
         _UC = {'Unclassified', 'Untagged', ''}
+        _last_accept_artist: Optional[str] = None
+        _last_accept_genre:  Optional[str] = None
+        _accepted_tracks: list = []   # (rec, proposed_genre) collected for disk writes
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
             artist = data.get('artist', '')
             current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
             proposed = item.text(LC_CLS_PROPOSED)
+            artist_key = f'__artist__{artist}'
+            if artist_key in edits and 'genre' in edits[artist_key]:
+                continue  # user-set override — don't overwrite with classifier's proposal
+            confidence = item.text(LC_CLS_CONF)
+            if confidence == 'MATCHED' and proposed == current_genre:
+                continue  # ID3 tag already matches taxonomy — no override needed
             if proposed and proposed not in _UC and proposed != current_genre:
-                edits.setdefault(f'__artist__{artist}', {})['genre'] = proposed
+                edits.setdefault(artist_key, {})['genre'] = proposed
                 item.setText(LC_GENRE, proposed)
                 item.setData(LC_GENRE, Qt.ItemDataRole.UserRole + 1, proposed)
                 item.setForeground(LC_GENRE, QBrush(QColor('#f1e3c8')))
                 f = item.font(LC_GENRE)
                 f.setItalic(False)
                 item.setFont(LC_GENRE, f)
+                _last_accept_artist = artist
+                _last_accept_genre  = proposed
+                for rec in data.get('tracks', []):
+                    _accepted_tracks.append((rec, proposed))
 
         edits_path.parent.mkdir(parents=True, exist_ok=True)
+        save_success = False
         try:
             with open(edits_path, 'w', encoding='utf-8') as f:
                 json.dump(edits, f, indent=2)
+            save_success = True
         except Exception as exc:
             print(f'[LibraryBrowser] Failed to save accepted classifications: {exc}')
 
+        if save_success:
+            try:
+                flag_path = self._library_path / '_CrateSort' / 'classification_accepted.flag'
+                flag_path.parent.mkdir(parents=True, exist_ok=True)
+                flag_path.touch()
+            except Exception as exc:
+                print(f'[LibraryBrowser] Warning: Failed to write classification accepted flag: {exc}')
+
+        # Write accepted genre proposals to track files on disk (free-tier write-through).
+        # library_edits.json staging already stands as an Organize fallback for any failures.
+        from cratesort.src.core.file_organizer import write_file_metadata
+        disk_failures = 0
+        for rec, genre in _accepted_tracks:
+            if write_file_metadata(rec.path, 'genre', genre):
+                rec.genre = genre
+            else:
+                disk_failures += 1
+
+        if _last_accept_artist:
+            self._last_edited_artist  = _last_accept_artist
+            self._last_assigned_genre = _last_accept_genre
         self._exit_classify_mode_cancel()
         self._populate_genre_sidebar()
+
+        if disk_failures:
+            n = self._tree.topLevelItemCount()
+            t = len(self._inventory)
+            norm = f'{n:,} artists · {t:,} tracks'
+            self._count_label.setText(
+                f'⚠ Classification accepted. {disk_failures} file(s) could not be '
+                f'updated on disk — check that the drive is connected and files are not locked.'
+            )
+            QTimer.singleShot(7000, lambda s=norm: self._count_label.setText(s))
 
     # ── Persistence ───────────────────────────────────────────────────
 

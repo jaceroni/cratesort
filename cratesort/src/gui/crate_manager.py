@@ -10,10 +10,10 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QDrag, QFontMetrics, QIcon, QPen, QPixmap, QPainter
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QDialogButtonBox,
+    QAbstractItemView, QApplication, QDialog,
     QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QMessageBox, QPushButton, QSizePolicy, QSplitter,
+    QMenu, QPushButton, QSplitter,
     QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -28,6 +28,7 @@ from cratesort.src.utils.undo_manager import (
     CreateCrateCommand, DeleteCrateCommand, RenameCrateCommand,
     ReorderCratesCommand, ReparentCrateCommand, EditTrackMetadataCommand,
 )
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm
 
 # ---------------------------------------------------------------------------
 # Column indices
@@ -75,38 +76,6 @@ _BORDER = '#444444'
 _SETTINGS_KEY   = 'crate_manager_header_state'
 _ALL_TRACKS_KEY = '__ALL_TRACKS__'
 
-_RED_BTN = (
-    'QPushButton { background-color: #C75B5B; color: #ffffff; font-weight: 400; '
-    'border-radius: 6px; border: none; padding: 8px 24px; min-width: 80px; }'
-    'QPushButton:hover { background-color: #b24c4c; }'
-    'QPushButton:pressed { background-color: #9c3b3b; }'
-)
-
-
-def _style_cancel_btns(box: 'QMessageBox') -> None:
-    """Apply red styling to all Reject/Destructive/No role buttons in a QMessageBox."""
-    for btn in box.buttons():
-        role = box.buttonRole(btn)
-        if role in (
-            QMessageBox.ButtonRole.RejectRole,
-            QMessageBox.ButtonRole.DestructiveRole,
-            QMessageBox.ButtonRole.NoRole,
-        ):
-            btn.setStyleSheet(_RED_BTN)
-
-_MSGBOX_STYLE = """
-    QMessageBox { background-color: #2F2F2F; }
-    QMessageBox QLabel {
-        color: #f1e3c8; font-weight: 400; font-size: 13px; padding: 12px 16px;
-    }
-    QMessageBox QPushButton {
-        background-color: #428175; color: #ffffff; font-weight: 400; font-size: 13px;
-        padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
-    }
-    QMessageBox QPushButton:hover  { background-color: #38706a; }
-    QMessageBox QPushButton:pressed { background-color: #36675d; }
-    QDialogButtonBox { qproperty-centerButtons: true; }
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -461,29 +430,33 @@ def _show_in_finder(file_path: str) -> None:
 # Add Tracks dialog
 # ---------------------------------------------------------------------------
 
-class _AddTracksDialog(QDialog):
+class _AddTracksDialog(_CrateSortDialog):
     def __init__(self, inventory, current_tracks: set[str], parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Add Tracks to Crate')
         self.setMinimumSize(560, 440)
-        self.setStyleSheet("""
-            QDialog { background-color: #2F2F2F; }
-            QLabel  { color: #f1e3c8; font-weight: 400; font-size: 13px; }
-            QLineEdit {
-                background-color: #1a1a1a; color: #f1e3c8;
-                font-weight: 400; font-size: 13px;
-                border: 1px solid #444444; border-radius: 4px; padding: 6px 8px;
-            }
-            QListWidget { background-color: #1a1a1a; color: #f1e3c8; font-weight: 400; }
-            QPushButton {
-                font-weight: 400; font-size: 13px;
-                padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
-            }
-        """)
 
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        container = QFrame()
+        container.setObjectName('atd_c')
+        container.setStyleSheet(
+            'QFrame#atd_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
+            'QLabel { color: #f1e3c8; font-size: 13px; background: transparent; }'
+            'QLineEdit { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
+            'border: 1px solid #444444; border-radius: 4px; padding: 6px 8px; }'
+            'QListWidget { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; }'
+        )
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 16)
+
+        headline = QLabel('Add Tracks to Crate')
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+        )
+        layout.addWidget(headline)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText('Search tracks…')
@@ -517,22 +490,29 @@ class _AddTracksDialog(QDialog):
 
             self._list.addItem(item)
 
-        buttons = QDialogButtonBox()
-        self._add_btn    = buttons.addButton('Add Selected', QDialogButtonBox.ButtonRole.AcceptRole)
-        self._cancel_btn = buttons.addButton('Cancel', QDialogButtonBox.ButtonRole.RejectRole)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self._cancel_btn = QPushButton('Cancel')
+        self._cancel_btn.setFixedHeight(36)
+        self._cancel_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
+        )
+        self._cancel_btn.clicked.connect(self.reject)
+        self._add_btn = QPushButton('Add Selected')
+        self._add_btn.setFixedHeight(36)
         self._add_btn.setStyleSheet(
-            'QPushButton { background-color: #428175; color: #ffffff; font-weight: 400; border-radius: 6px; border: none; }'
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
-        self._cancel_btn.setStyleSheet(
-            'QPushButton { background-color: #C75B5B; color: #ffffff; font-weight: 400; border-radius: 6px; border: none; }'
-            'QPushButton:hover { background-color: #b24c4c; }'
-            'QPushButton:pressed { background-color: #9c3b3b; }'
-        )
-        layout.addWidget(buttons)
+        self._add_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._cancel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self._add_btn)
+        layout.addLayout(btn_row)
 
     def accept(self) -> None:
         """Show immediate loading feedback before the dialog closes."""
@@ -562,60 +542,69 @@ class _AddTracksDialog(QDialog):
 # Styled text-input dialog (replaces QInputDialog.getText)
 # ---------------------------------------------------------------------------
 
-class _NameInputDialog(QDialog):
+class _NameInputDialog(_CrateSortDialog):
     """Styled text-input dialog replacing QInputDialog.getText()."""
 
     def __init__(self, parent, title: str, prompt: str, prefill: str = ''):
         super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setMinimumWidth(340)
-        self.setStyleSheet("""
-            QDialog { background-color: #2F2F2F; }
-            QLabel  { color: #f1e3c8; font-weight: 400; font-size: 13px; }
-            QLineEdit {
-                background-color: #1a1a1a; color: #f1e3c8;
-                font-weight: 400; font-size: 13px;
-                border: 1px solid #444444; border-radius: 4px; padding: 6px 8px;
-            }
-            QPushButton {
-                font-weight: 400; font-size: 13px;
-                padding: 8px 24px; border-radius: 6px; border: none; min-width: 80px;
-            }
-        """)
+        self.setMinimumWidth(360)
 
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        container = QFrame()
+        container.setObjectName('nid_c')
+        container.setStyleSheet(
+            'QFrame#nid_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
+        )
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        layout.addWidget(QLabel(prompt))
+        headline = QLabel(title)
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+        )
+        layout.addWidget(headline)
+
+        prompt_lbl = QLabel(prompt)
+        prompt_lbl.setStyleSheet(
+            'color: #a89b85; font-size: 13px; background: transparent; border: none;'
+        )
+        layout.addWidget(prompt_lbl)
 
         self._edit = QLineEdit(prefill)
         self._edit.selectAll()
+        self._edit.setStyleSheet(
+            'QLineEdit { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
+            'border: 1px solid #444444; border-radius: 4px; padding: 6px 8px; }'
+        )
         layout.addWidget(self._edit)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
+        btn_row.setSpacing(10)
         cancel = QPushButton('Cancel')
-        cancel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        cancel.setFixedHeight(36)
         cancel.setStyleSheet(
-            'QPushButton { background-color: #C75B5B; color: #ffffff; border-radius: 6px; border: none; }'
-            'QPushButton:hover { background-color: #b24c4c; }'
-            'QPushButton:pressed { background-color: #9c3b3b; }'
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
         )
         cancel.clicked.connect(self.reject)
-        btn_row.addWidget(cancel)
-
         ok = QPushButton('OK')
         ok.setDefault(True)
-        ok.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        ok.setFixedHeight(36)
         ok.setStyleSheet(
-            'QPushButton { background-color: #428175; color: #ffffff; }'
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
         )
         ok.clicked.connect(self.accept)
+        btn_row.addWidget(cancel)
+        btn_row.addStretch()
         btn_row.addWidget(ok)
-
         layout.addLayout(btn_row)
 
     def get_name(self) -> Optional[str]:
@@ -773,18 +762,12 @@ class CrateManagerView(QWidget):
         self._crate_new(parent_path=None)
 
     def _on_new_smart_crate(self) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle('Smart Crates')
-        box.setText(
+        _ov_alert(
+            self, 'Smart Crates',
             'Smart Crates is a Pro feature.\n\n'
             'Create rule-based dynamic crates that automatically update '
-            'based on metadata filters (e.g. genre, BPM, year).'
+            'based on metadata filters (e.g. genre, BPM, year).',
         )
-        box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
-        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
-        if box.layout():
-            box.layout().setContentsMargins(20, 20, 20, 20)
-        box.exec()
 
     # ── Empty state ───────────────────────────────────────────────────
 
@@ -1960,7 +1943,7 @@ class CrateManagerView(QWidget):
                 return
             result = writer.rename_crate(drag_path, crate_name)
             if not result.success:
-                QMessageBox.warning(self, 'Promote Crate', f'Failed: {result.error}')
+                _ov_alert(self, 'Promote Crate', f'Failed: {result.error}')
                 return
             # Update _crate_order to remove from old parent
             old_parent = '/'.join(drag_path.split('/')[:-1])
@@ -2040,7 +2023,7 @@ class CrateManagerView(QWidget):
             target_display = new_parent_path.split('/')[-1]
             self._set_status(f'Moved "{crate_name}" into "{target_display}"', teal=True)
         else:
-            QMessageBox.warning(self, 'Move Crate', f'Failed: {result.error}')
+            _ov_alert(self, 'Move Crate', f'Failed: {result.error}')
 
     def _on_crate_hover_expand(self) -> None:
         """Called when hover timer fires — expand the hovered crate."""
@@ -2126,7 +2109,7 @@ class CrateManagerView(QWidget):
         else:
             result = writer.create_crate(crate_path)
             if not result.success:
-                QMessageBox.warning(self, 'Create Crate', f'Failed: {result.error}')
+                _ov_alert(self, 'Create Crate', f'Failed: {result.error}')
                 self._set_status('')
                 return
             self._refresh(select=crate_path)
@@ -2148,7 +2131,7 @@ class CrateManagerView(QWidget):
         else:
             result = writer.create_subcrate(parent_path, name)
             if not result.success:
-                QMessageBox.warning(self, 'New Subcrate', f'Failed: {result.error}')
+                _ov_alert(self, 'New Subcrate', f'Failed: {result.error}')
                 self._set_status('')
                 return
             self._refresh(select=child_path)
@@ -2175,7 +2158,7 @@ class CrateManagerView(QWidget):
         else:
             result = writer.rename_crate(crate_path, new_path)
             if not result.success:
-                QMessageBox.warning(self, 'Rename Crate', f'Failed: {result.error}')
+                _ov_alert(self, 'Rename Crate', f'Failed: {result.error}')
                 self._set_status('')
                 return
             # Update _crate_order: replace old path with new across all keys
@@ -2204,7 +2187,7 @@ class CrateManagerView(QWidget):
         self._set_status('Duplicating crate…')
         result = writer.duplicate_crate(crate_path, dst_path)
         if not result.success:
-            QMessageBox.warning(self, 'Duplicate Crate', f'Failed: {result.error}')
+            _ov_alert(self, 'Duplicate Crate', f'Failed: {result.error}')
             self._set_status('')
             return
         self._refresh(select=dst_path)
@@ -2218,16 +2201,7 @@ class CrateManagerView(QWidget):
             msg = f'Delete "{crate.name}"? It contains {crate.track_count} tracks. This cannot be undone.'
         else:
             msg = f'Delete "{crate.name}"? This cannot be undone.'
-        box = QMessageBox(self)
-        box.setWindowTitle('Delete Crate')
-        box.setText(msg)
-        del_btn = box.addButton('Delete', QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
-        if box.layout():
-            box.layout().setContentsMargins(20, 20, 20, 20)
-        box.exec()
-        if box.clickedButton() is not del_btn:
+        if not _ov_confirm(self, 'Delete Crate', msg, confirm_text='Delete', confirm_danger=True):
             return
         writer = self._writer()
         if not writer:
@@ -2245,7 +2219,7 @@ class CrateManagerView(QWidget):
                 self._set_status('Delete failed — crate file may be locked or missing', teal=True)
                 return
             if not result.success:
-                QMessageBox.warning(self, 'Delete Crate', f'Failed: {result.error}')
+                _ov_alert(self, 'Delete Crate', f'Failed: {result.error}')
                 self._set_status('')
                 return
             # Remove from all order keys
@@ -2288,7 +2262,7 @@ class CrateManagerView(QWidget):
         else:
             result = writer.add_tracks(crate_path, paths)
             if not result.success:
-                QMessageBox.warning(self, 'Add Tracks', f'Failed: {result.error}')
+                _ov_alert(self, 'Add Tracks', f'Failed: {result.error}')
                 self._set_status('')
                 return
             self._reload_current_crate()
@@ -2475,7 +2449,7 @@ class CrateManagerView(QWidget):
         else:
             result = writer.remove_tracks(self._current_crate_path, paths_to_remove)
             if not result.success:
-                QMessageBox.warning(self, 'Remove Tracks', f'Failed: {result.error}')
+                _ov_alert(self, 'Remove Tracks', f'Failed: {result.error}')
                 self._set_status('')
                 return
             self._refresh(select=self._current_crate_path)
@@ -2491,16 +2465,7 @@ class CrateManagerView(QWidget):
         else:
             msg = f'Remove {len(rows)} tracks from {self._current_crate_path!r}?'
 
-        box = QMessageBox(self)
-        box.setWindowTitle('Remove Tracks')
-        box.setText(msg)
-        remove_btn = box.addButton('Remove', QMessageBox.ButtonRole.AcceptRole)
-        box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
-        if box.layout():
-            box.layout().setContentsMargins(20, 20, 20, 20)
-        box.exec()
-        if box.clickedButton() is remove_btn:
+        if _ov_confirm(self, 'Remove Tracks', msg, confirm_text='Remove', confirm_danger=True):
             self._remove_from_crate(rows)
 
     def _confirm_delete_crate(self, crate_path: str) -> None:
@@ -2514,16 +2479,7 @@ class CrateManagerView(QWidget):
         else:
             msg = f'Delete "{name}"? This cannot be undone.'
 
-        box = QMessageBox(self)
-        box.setWindowTitle('Delete Crate')
-        box.setText(msg)
-        del_btn = box.addButton('Delete', QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setStyleSheet(_MSGBOX_STYLE); _style_cancel_btns(box)
-        if box.layout():
-            box.layout().setContentsMargins(20, 20, 20, 20)
-        box.exec()
-        if box.clickedButton() is del_btn:
+        if _ov_confirm(self, 'Delete Crate', msg, confirm_text='Delete', confirm_danger=True):
             writer = self._writer()
             if not writer:
                 return
@@ -2541,7 +2497,7 @@ class CrateManagerView(QWidget):
                 self._set_status('Delete failed — crate file may be locked or missing', teal=True)
                 return
             if not result.success:
-                QMessageBox.warning(self, 'Delete Crate', f'Failed: {result.error}')
+                _ov_alert(self, 'Delete Crate', f'Failed: {result.error}')
                 self._set_status('')
                 return
             self._crate_order = {
@@ -2572,7 +2528,7 @@ class CrateManagerView(QWidget):
             return
         result = writer.reorder_tracks(self._current_crate_path, new_order)
         if not result.success:
-            QMessageBox.warning(self, 'Reorder Tracks', f'Failed: {result.error}')
+            _ov_alert(self, 'Reorder Tracks', f'Failed: {result.error}')
             return
         # Reload from disk — this is the single source of truth
         self._refresh(select=self._current_crate_path)
@@ -2600,7 +2556,7 @@ class CrateManagerView(QWidget):
             return
         result = writer.add_tracks(crate_path, new_paths)
         if not result.success:
-            QMessageBox.warning(self, 'Add Tracks', f'Failed: {result.error}')
+            _ov_alert(self, 'Add Tracks', f'Failed: {result.error}')
             return
         self._refresh(select=self._current_crate_path)
         if skip_count:

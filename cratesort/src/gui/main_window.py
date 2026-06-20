@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt, QMimeData, QSettings, QSize, QTimer
 from PyQt6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QPalette, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup,
-    QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
+    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu,
     QPushButton, QSizePolicy, QStackedWidget, QStatusBar,
     QVBoxLayout, QWidget,
 )
@@ -20,6 +20,7 @@ except ImportError:
     _SVG_AVAILABLE = False
 
 from cratesort.src.gui.theme import apply_theme, C
+from cratesort.src.gui.overlays import _ov_alert
 from cratesort.src.gui.dashboard import DashboardWidget
 from cratesort.src.gui.library_browser import LibraryBrowserView
 from cratesort.src.gui.crate_manager import CrateManagerView
@@ -116,7 +117,9 @@ class MainWindow(QMainWindow):
         self._content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # Dashboard — index 0
-        self._dashboard = DashboardWidget()
+        _saved_lib  = self._settings.value('library_path', None)
+        _saved_path = Path(_saved_lib).resolve() if _saved_lib and Path(_saved_lib).exists() else None
+        self._dashboard = DashboardWidget(saved_path=_saved_path)
         self._dashboard.library_path_changed.connect(self._on_library_changed)
         self._dashboard.status_message.connect(self._update_status)
         self._dashboard.classify_requested.connect(self._on_library_requested)
@@ -338,10 +341,11 @@ class MainWindow(QMainWindow):
     # ── Slots ─────────────────────────────────────────────────────────
 
     def _show_sync_warning(self) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle('Sync Required')
-        box.setText('Please review and sync the detected Serato changes on the Dashboard first.')
-        box.exec()
+        _ov_alert(
+            self,
+            'Sync Required',
+            'Please review and sync the detected Serato changes on the Dashboard first.',
+        )
 
     def _on_nav(self, index: int) -> None:
         # Silent no-op for nav items disabled by current app state
@@ -355,7 +359,20 @@ class MainWindow(QMainWindow):
             self._content.setCurrentIndex(0)
             return
 
+        # Warn if leaving Library while classify mode has unsaved changes
+        if self._content.currentIndex() == 1 and index != 1:
+            if hasattr(self, '_library_browser') and self._library_browser.has_unsaved_classify_changes():
+                from cratesort.src.gui.library_browser import _UnsavedChangesDialog
+                dlg = _UnsavedChangesDialog(self)
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    self._nav_btns['library'].setChecked(True)
+                    return
+                else:
+                    self._library_browser._exit_classify_mode_cancel()
+
         self._content.setCurrentIndex(index)
+        if index == 0:
+            self._dashboard.refresh()
         inv = self._dashboard._inventory
         lib = self._dashboard._library_path
         if index == 1:   # Library Browser
@@ -505,13 +522,13 @@ class MainWindow(QMainWindow):
         self._art_panel.set_track(file_path)
 
     def _show_about(self) -> None:
-        QMessageBox.about(
+        _ov_alert(
             self,
             'About CrateSort',
-            f'<b>CrateSort</b> v{VERSION}<br><br>'
-            f'Get your shit together.<br><br>'
-            f'A DJ library organizer and Serato crate manager.<br>'
-            f'&copy; JWBC',
+            f'CrateSort v{VERSION}\n\n'
+            f'Get your shit together.\n\n'
+            f'A DJ library organizer and Serato crate manager.\n'
+            f'© JWBC',
         )
 
     def _on_library_requested(self) -> None:
@@ -534,7 +551,7 @@ class MainWindow(QMainWindow):
 
     def _on_library_changed_from_settings(self, path: Path) -> None:
         self._on_library_changed(path)
-        self._dashboard.start_scan(path)
+        self._dashboard.set_library_path(path)
         self._on_nav_by_id('dashboard')
 
     def _on_repair_crate_paths(self) -> None:
@@ -584,13 +601,11 @@ class MainWindow(QMainWindow):
             changes.append(PathChange(old_path=orig, new_path=curr))
 
         if not changes:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.information(self, 'Repair Crate Paths', 'No stale paths found — crates are up to date.')
+            _ov_alert(self, 'Repair Crate Paths', 'No stale paths found — crates are up to date.')
             return
 
         result = PathRewriter(serato_dir).rewrite(changes, dry_run=False)
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(
+        _ov_alert(
             self, 'Repair Crate Paths',
             f'Done.\n\n{result.crates_modified} crate(s) updated, '
             f'{result.paths_rewritten} track path(s) fixed.',
@@ -881,7 +896,7 @@ class _ArtPanel(QLabel):
             self.set_track(self._current_path, self._current_title)
             self._flash_success()
         else:
-            QMessageBox.warning(self, 'Error', 'Could not write album art to file.')
+            _ov_alert(self, 'Error', 'Could not write album art to file.')
 
     def _remove_art(self) -> None:
         """Remove art immediately — no confirmation dialog, teal flash on success."""
@@ -889,7 +904,7 @@ class _ArtPanel(QLabel):
             self._show_pixmap(None)
             self._flash_success()
         else:
-            QMessageBox.warning(self, 'Error', 'Could not remove album art from file.')
+            _ov_alert(self, 'Error', 'Could not remove album art from file.')
 
     def _flash_success(self) -> None:
         """Flash the panel border teal for 800ms to confirm an art write."""

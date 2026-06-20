@@ -99,24 +99,27 @@ All track listing tables across the entire app must use:
 
 ## Nav structure (locked)
 
-6 items in order. Content stack index matches nav index exactly.
+**Nav is now 5 items. Classification tab has been eliminated.**
 
 | Nav index | ID | Label | Icon | Content widget |
 |---|---|---|---|---|
-| 0 | `dashboard` | Dashboard | `⌂` (+ SVG) | `DashboardWidget` |
-| 1 | `classification` | Classification | `🔍` (+ SVG) | `ClassifierView` |
-| 2 | `library` | Library | `📚` (+ SVG) | `LibraryBrowserView` |
-| 3 | `crates` | Crates | `📦` (+ SVG) | `CrateManagerView` |
-| 4 | `organize` | Organize | `📁` (+ SVG) | `OrganizeView` |
-| 5 | `settings` | Settings | `⚙` (+ SVG) | `SettingsView` |
+| 0 | `dashboard` | Dashboard | dashboard SVG | `DashboardWidget` |
+| 1 | `library` | Library | library SVG | `LibraryBrowserView` |
+| 2 | `crates` | Crates | crates SVG | `CrateManagerView` |
+| 3 | `organize` | Organize | organize SVG | `OrganizeView` |
+| 4 | `settings` | Settings | settings SVG | `SettingsView` |
+
+`classifier_view.py` has been renamed to `_ClassifierViewLegacy` and is retired as a GUI destination. The backend `_ClassifyWorker` and `ClassificationSession` models inside it remain active and are used by `library_browser.py`.
+
+Nav order is locked. Content stack index matches nav index exactly.
 
 SVG icons live in `cratesort/assets/icons/` as `icon-{nav_id}.svg`. All are filled orange (`#D17D34`).
 
-Nav buttons load SVGs via `QIcon(str(icon_path))` at `16×16`. The `_on_nav(index)` handler calls `.load()` on the appropriate view. `_on_nav()` guards against disabled nav items in States 1 and 2 (no library or Serato missing) — clicks on Classification, Library, Crates, and Organize are silent no-ops. When no-library is detected mid-session, redirects to Settings (index 5) as the recovery path.
+Nav buttons load SVGs via `QIcon(str(icon_path))` at `16×16`. The `_on_nav(index)` handler calls `.load()` on the appropriate view. `_on_nav()` guards against disabled nav items in "No library loaded" state — clicks on Library, Crates, and Organize are silent no-ops. When no-library is detected mid-session, redirects to Settings (index 4) as the recovery path.
 
 After reorg or rollback completes, `OrganizeView.reorg_completed` fires → `MainWindow._on_reorg_completed()` → `_dashboard.start_scan(lib)` to rebuild inventory with new file paths.
 
-**Nav order is locked.** Organize stays at the end — it is a destination, not a routine step. The Dashboard action cards (01/02/03) provide the guided journey nudge without forcing order on the user.
+**Nav order is locked.** Organize stays at the end — it is a destination, not a routine step.
 
 ---
 
@@ -139,27 +142,211 @@ The launch screen is a context-aware single screen — no popup dialog. It lives
 - No popup modal on launch under any circumstances
 - `always_load_last` preference stored in QSettings key `always_load_last` (bool)
 
-### Three app states (nav availability)
+### Nav state rules
 
-Evaluated on every launch and whenever library path changes via `_get_app_state()` → `_apply_nav_state()` in `main_window.py`. Classification completion evaluated via `_is_library_classified()` — returns `True` only when every track has an approved valid genre with no pending, flagged, or unclassified entries remaining.
+**Two states only:**
 
-| Nav Item | No Library | Library+Serato, Unclassified | Fully Classified |
-|---|---|---|---|
-| Dashboard | Active | Active | Active |
-| Classification | Disabled | Active | Active |
-| Library | Disabled | **Disabled** | Active |
-| Crates | Disabled | Active | Active |
-| Organize | Disabled | **Disabled** | Active |
-| Settings | Active | Active | Active |
+**No library loaded:**
+- Dashboard: Active
+- Library: Disabled (visible, reduced opacity, tooltip: "Load a library to get started.")
+- Crates: Disabled (same tooltip)
+- Organize: Disabled (same tooltip)
+- Settings: Active
 
-**Key rules:**
-- Library and Organize are gated on classification completion — not just library/Serato presence
-- Crates is accessible without classification — crate management is independent
-- Disabled items are always **visible** — reduced opacity, no hover, tooltip explaining why. Never hidden.
-- Tooltip for disabled Library: `"Complete classification before browsing your library."`
-- Tooltip for disabled Organize: `"Complete classification before organizing your library."`
-- `_apply_nav_state()` called on launch, library path change, and classification session save
-- Stale library path (saved in QSettings but no longer exists on disk): path and `always_load_last` both cleared from QSettings immediately; welcome screen shown in first-launch state (commit 739c97e)
+**Library loaded:**
+- All nav items: Active
+- No classification gate on any nav item
+- Organize shows warning dialog if unclassified tracks exist — does NOT hard block
+
+Stale library path (saved in QSettings but no longer exists on disk): path and `always_load_last` both cleared from QSettings immediately; welcome screen shown in first-launch state (commit 739c97e).
+
+---
+
+## Classification Architecture
+
+**Classification is a mode inside the Library tab, not a separate screen.**
+
+The Library tab is the single unified environment for all track and artist editing. Classification is triggered by a "Classify Library" button in the Library toolbar.
+
+### Classify mode behavior
+
+- "Classify Library" button (teal, `#428175`) lives in the Library toolbar
+- Clicking it runs `_ClassifyWorker` in the background and enters classify mode
+- Classify mode inserts three columns into the track table: Proposed Genre (LC_CLS_PROPOSED, logical index 12), Confidence (LC_CLS_CONFIDENCE, logical index 13), Status (LC_CLS_STATUS, logical index 14)
+- These columns are visually repositioned adjacent to the Genre column via `moveSection` after insertion
+- A classify mode banner appears below the toolbar: teal background `#1a3530`, left border `3px solid #428175`, padding 12px, ⚡ icon, 12px text
+- "Accept Reclassifications" button (teal) saves all proposals to `library_edits.json` and exits classify mode
+- "Cancel" button exits classify mode without saving
+
+### Auto-classify on first load
+
+When `load()` runs and `_is_classification_complete()` returns `False` **and `self.isVisible()` is `True`**, `_on_classify_clicked(auto_classify=True)` is called automatically. The `isVisible()` guard prevents the modal from firing during background scans while the user is on the Dashboard — it only triggers when the user has explicitly navigated to Library.
+
+`_on_classify_clicked` takes `checked: bool = False, auto_classify: bool = False`. The manual toolbar button passes `checked` (Qt signal arg); `auto_classify` is always passed as a keyword.
+
+**Auto-classify path (two sub-cases):**
+
+1. **Session already exists** (`classification_session.json` found): loads it, calls `apply_library_edits()`, enters classify mode directly — no modal shown.
+
+2. **No session** (first-run): shows the `_AnalyzeLibraryModal` takeover and runs `_ClassifyWorker` in the background.
+
+**Manual toolbar path** (`auto_classify=False`): same existing behavior — if session exists, enter classify mode directly; otherwise disable the button, run the worker, reconnect to `_on_classify_finished` / `_on_classify_error`.
+
+### Classify mode navigate-away guard dialog
+
+When the user tries to navigate away from Library while in classify mode, `_UnsavedClassifyDialog` appears with:
+- **Headline**: "Classifications not saved"
+- **Body**: "You haven't accepted your classifications yet — your genre corrections won't be written to your files until you do."
+- **Primary button (teal)**: "Stay and Finish" — closes dialog, keeps user in classify mode
+- **Secondary button (red)**: "Leave Anyway" — exits classify mode, allows navigation
+
+This dialog is the only navigate-away guard for classify mode. Do not add additional dialogs or change these labels without explicit approval.
+
+### Classify mode banner copy (locked)
+
+The classify mode banner reads:
+> "This is your library how we see it — review the artists and their nested files. Right-click/double-click an artist or their tracks to correct anything that looks off. Not sure about something? Change its genre to 'Unclassified' and move on. Your files are not touched until you reorganize."
+
+Do not change this copy without explicit approval.
+
+### _AnalyzeLibraryModal (first-run classify UI)
+
+Three classes live in `library_browser.py`, inserted before `LibraryBrowserView`:
+
+**`_AnimatedStatCardWidget(QFrame)`** — stat card with a 16ms QTimer that eases a numeric counter toward `_target_value` using `step = max(1, int(diff * 0.15))` (positive diff) / `min(-1, int(diff * 0.15))` (negative diff). Cards: `#1a1a1a` background, `1px solid #444444` border, 8px radius.
+
+**`_ModalOverlay`** — now lives in `src/gui/overlays.py`. See **Dialog & Overlay Architecture** section below.
+
+**`_AnalyzeLibraryModal(_CrateSortDialog)`** — inherits `_CrateSortDialog` from `overlays.py` (overlay scrim + bounce animation handled by base class). Fixed `520×280`. Inner `QFrame#modal_container` (`#2F2F2F`, 1px `#444444` border, 12px radius) provides the visual surface. Contains:
+- Headline + subtitle labels
+- Row of 3 `_AnimatedStatCardWidget` cards: Tracks Analyzed, Artists Classified, Corrections Made (last one stays at 0 — `# TODO: real-time comparison signal not yet available`)
+- `QStackedWidget` (fixed 45px height, no layout jump):
+  - Page 0: 4px `QProgressBar` (`#383838` bg, `#428175` chunk), determinate from first progress tick
+  - Page 1: "Review Results" button (180×36px, teal)
+- `review_requested = pyqtSignal()` — emitted by the button
+
+**API:** `update_stats(tracks_count, artists_count)`, `update_percent(percent)`, `on_classification_complete()` (switches stack to page 1).
+
+**Pre-compile step** (before starting worker): iterates `self._inventory` using the same DJ-tools/video grouping logic as `_ClassifyWorker.run()` to build `_auto_artist_tracks_map: dict[str, int]` and `_auto_dj_tools_count: int`. Progress slot uses these to increment `_processed_tracks_count` as each artist name arrives.
+
+**Cleanup:** `_cleanup_auto_classify_ui()` — calls `modal.close()` which emits `finished` → `_CrateSortDialog._cleanup_overlay` tears down the scrim automatically. Resets all `_auto_*` state fields. Called by `_on_review_results_clicked` (then enters classify mode with `_auto_classify_session`) and `_on_auto_classify_error`.
+
+### Modal subtitle copy (locked)
+
+> "Analyzing your DJ library and media files – validating artists and genres..."
+
+### Overlay rendering requirement
+
+`_ModalOverlay` must have `self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)` set in `__init__` to render its stylesheet background color. Without it the scrim is invisible. This is a known PyQt6 behavior for custom `QWidget` subclasses.
+
+### Classification complete definition
+
+Classification is complete when `_CrateSort/classification_accepted.flag` exists on disk. This flag is written ONLY when the user clicks Accept Reclassifications. Individual right-click genre edits do NOT set this flag.
+
+`_is_classification_complete()` checks for this flag file. It does NOT check `library_edits.json` entry counts or `classification_session.json` existence.
+
+### Five-state confidence system
+
+| State | Meaning | Color |
+|---|---|---|
+| MATCHED | Existing ID3 tag matches taxonomy exactly — no change needed | `#f1e3c8` (cream) |
+| HIGH | Classifier confident in proposal | `#428175` (teal) |
+| MEDIUM | Classifier moderate confidence | `#9fa4c7` (lavender) |
+| LOW | Limited signal, user should review | `#D17D34` (orange) |
+| NONE | No usable data, user must decide | `#C75B5B` (red) |
+
+MATCHED entries are not written to `library_edits.json` on Accept — their existing tag is their classification.
+
+### Artist genre fallback chain (in _rebuild_tree)
+
+1. Artist override in `library_edits.json` — key format `f'__artist__{artist}'`
+2. Classification session `final_genre` or `proposed_genre` from `_classify_lookup(artist)`
+3. Taxonomy-validated ID3 majority vote — only accepts exact matches against the 13 valid parent genres (case-insensitive). Invalid tags ("Pop", "Alternative Rock", "Hip Hop") are rejected.
+4. Default to `''` — Unclassified
+
+Raw ID3 tags are only trusted at Step 3 if they match one of the 13 valid parent genres exactly. No other fallback.
+
+### Genre sidebar in Library
+
+The Library tab has a permanent 180px genre sidebar (resizable via QSplitter, persists via QSettings `library/sidebar_width`). It shows:
+- "All Artists" at top — total library counts
+- One item per populated genre, alphabetical, with artist and track count subline
+- Unclassified bucket at bottom in red — only visible when count > 0
+
+Sidebar bucketing is driven by artist genre only. Track genre tags are metadata — they never determine which sidebar bucket an artist appears in.
+
+After any genre change, `_populate_genre_sidebar()` and `_apply_filter()` are called immediately — no nav round-trip required.
+
+### Navigate-away guard in classify mode
+
+When the user clicks a nav item while classify mode is active, `_UnsavedClassifyDialog` appears:
+- "Leave Anyway" (red) — exits classify mode without saving, allows navigation
+- "Stay and Finish" (teal) — dismisses dialog, keeps user in Library
+
+### Unclassified genre
+
+Unclassified is a valid, selectable genre in the right-click Change Genre menu. It is a deliberate "flag for later" choice. During Organize, unclassified tracks go to `Media/Unclassified/Artist/Track` — same hierarchy as other genres. Organize shows a warning dialog (not a block) when unclassified tracks exist.
+
+---
+
+## Dialog & Overlay Architecture
+
+All custom dialogs in CrateSort are built on the canonical classes in `src/gui/overlays.py`. **Never recreate these patterns inline.**
+
+### `_ModalOverlay(QWidget)` — `overlays.py`
+Full-window child of the main window. Style: `rgba(26, 26, 26, 217)` + `WA_StyledBackground`. Installs an event filter on the parent window; on `Resize`, updates geometry and re-centers the dialog. `mousePressEvent` accepts to block click-through. `removeFromParent()` removes the event filter before deletion. `set_modal(widget)` registers the dialog for centering.
+
+### `_CrateSortDialog(QDialog)` — `overlays.py`
+Base class for every CrateSort dialog. In `__init__`:
+- Sets `FramelessWindowHint | Dialog` and `WA_TranslucentBackground`
+- Creates `_ModalOverlay` over `parent.window()`, calls `set_modal(self)`, shows overlay
+- Connects `self.finished` → `_cleanup_overlay` (removes event filter, hides, `deleteLater`)
+
+In `showEvent`: calls `overlay.center_modal()` then `run_bounce_animation()` (200ms cubic ease-out, shrinks from 90% to full geometry via `QPropertyAnimation`).
+
+**Usage:** subclass `_CrateSortDialog`, add a `QFrame` container with dark-panel styling, lay out content inside it. The overlay and animation are handled automatically.
+
+### `_ov_alert(parent, title, body)` — `overlays.py`
+One-button alert built on `_CrateSortDialog`. Always teal OK button, right-aligned.
+
+### `_ov_confirm(parent, title, body, confirm_text, cancel_text, confirm_danger)` — `overlays.py`
+Two-button confirmation. Cancel (muted outline, left) + Confirm (teal or red if `confirm_danger=True`, right). Returns `bool`.
+
+### Dialog container styling standard
+Every dialog built on `_CrateSortDialog` wraps all content in a `QFrame` with:
+```
+background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px;
+```
+The dialog itself is transparent (`WA_TranslucentBackground`) — the frame provides all visual weight. Always use an `objectName` for the QSS selector to avoid cascading.
+
+### Files that import from overlays.py
+`library_browser.py`, `organize_view.py`, `classifier_view.py`, `crate_manager.py`, `settings_view.py`, `dashboard.py`, `main_window.py`. `theme.py` still contains `QMessageBox` style rules for any future system dialogs — leave those alone.
+
+---
+
+## Free Tier Metadata Write-Through
+
+Under the monetization model, free tier edits write directly to audio files on disk at the point of edit. This is implemented in `library_browser.py` and backed by a public wrapper in `file_organizer.py`.
+
+### `write_file_metadata(file_path, field, value) → bool` — `file_organizer.py`
+Thin public wrapper around the internal mutagen tag helpers. Loads the file with `mutagen.File(path, easy=False)`, calls `_write_metadata_tag(audio, ext, field, value)`, saves. Returns `True` on success, `False` on any failure. **Never raises** — catches all exceptions and logs.
+
+**Supported fields:** `genre`, `artist`, `title`, `album`, `bpm`, `year`, `comment`.
+**Supported formats:** MP3/WAV/AIFF, MP4/M4A, FLAC.
+**Not supported:** `tags` (style tags — virtual-only, deferred).
+
+### Write-through call sites in `library_browser.py`
+
+| Method | Field written | Failure behavior |
+|---|---|---|
+| `_commit_active_editor` | `title/album/bpm/year/comment` | Reverts cell display; 5s warning in `_count_label`; staging in `library_edits.json` always preserved |
+| `_reassign_track` | `artist` | Single warning after all tracks; partial success accepted |
+| `_change_artist_genre` | `genre` (all tracks for artist) | Same |
+| `_exit_classify_mode_accept` | `genre` (all accepted tracks) | Same; flag file still written |
+
+**In-memory sync rule:** after every successful `write_file_metadata()`, update the corresponding `TrackRecord` field directly (`rec.title = new_val`, `rec.genre = new_val`, etc.). Never trigger a full re-scan.
+
+**`library_edits.json` is not replaced.** Both the disk write and the JSON staging write happen. They are not mutually exclusive. The JSON staging acts as the Organize fallback for any disk-write failures.
 
 ---
 
@@ -172,12 +359,18 @@ Evaluated on every launch and whenever library path changes via `_get_app_state(
 1. **Stat Cards** (`_build_stat_cards_section()`) — four cards: Total Tracks, Total Crates, Unique Artists, Hours of Music. Count-up animation on load. No icon labels — numbers and labels only. `_AnimatedStatCard(target, suffix, label)` — note: no icon parameter.
 
 2. **Action Cards** (`_build_action_cards_section()`) — two groups:
-   - **Go To** (3 cards, not 4): `01 Classify Library`, `02 Manage Crates`, `03 Organize Media`. "Change Library" card was removed — that lives in Settings now.
-     - Step numbers always orange (visible at rest, not just on hover).
-     - On hover: border turns orange, background warms slightly.
-     - Large SVG icon (100px, `AlignTop`) on the right side of each card: icon-classification.svg, icon-crates.svg, icon-organize.svg. Dimmed (`#2a2a2a`) at rest, full orange on hover.
-     - Card height: `setMinimumHeight(230)`.
+   - **Go To** (3 cards):
+     - `Manage Library` — navigates to Library (index 1). Primary label in orange `#D17D34`, 16px, weight 500. No step number.
+     - `Manage Crates` — navigates to Crates (index 2). Same label treatment.
+     - `Organize Media` — navigates to Organize (index 3). Same label treatment.
+     - **First-load highlight**: When `_is_classification_complete()` returns False, the Manage Library card renders with:
+       - Border: `2px solid #428175`
+       - Background: `#1a2e2b`
+       - Icon at full teal opacity
+       - Returns to standard appearance once classification is complete.
    - **Create** (2 cards): `＋ New Crate` (orange), `✦ New Smart Crate` (orange). Both use the same orange warm-tinted base/hover style (`#2a2218` base, orange border on hover).
+
+Dashboard has a `refresh()` method called when navigating to index 0 — re-runs sync check and repopulates dashboard state.
 
 3. **Recent Activity** (`_build_activity_section()`) — combined feed: crate changes, recently added tracks, and reorganization events (teal dot = reorg/addition, orange dot = rollback/removal). Last 30 days, capped at 10 items.
 
@@ -200,37 +393,7 @@ When changes are detected on launch, an amber banner appears with a "Review && S
 
 ---
 
-## Classification View — Current Architecture
 
-`src/gui/classifier_view.py`
-
-### Classification flow (locked)
-
-Classification must be completed before Library or Organize are accessible. The correct linear flow is:
-
-**Classification → Library → Crates → Organize**
-
-Classification is the proposal step — CrateSort tells the DJ what it thinks about genre, style, and naming. Library is the editing surface where the DJ confirms or overrides. Organize executes only after both are complete.
-
-### "Accept and Go to Library" behavior (commit e7391b3)
-
-When clicked, marks **every entry in the classification session as `approved`** regardless of selection state. Entries never touched by the user are approved as-is (proposal stands). Entries marked `modified` or `edited` are approved with their current values. Session is saved to disk before navigating to Library. This button means "I accept the current state of everything" — no select-all required.
-
-### Multi-select reassign (commit 056883e)
-
-`_reassign_track()` accepts `new_artist: Optional[str] = None`. When provided, the dialog is skipped. `_track_context_menu()` detects multi-select via `_context_selection`, shows the dialog once, snapshots all `(item, track, parent_item, parent_entry)` tuples before any tree modification (indices stay valid as items are removed), then calls `_reassign_track(..., new_artist=new_artist)` for each. Drag-and-drop reassignment is not implemented in `ClassifierView`.
-
-### Proposed genre display (commit 056883e)
-
-Two fixes applied:
-- When `state='edited'` but `final_genre=''`, the `display_genre` property now returns `final_genre or proposed_genre` — falls back to the classifier's proposal instead of blank.
-- After `original_genres` is computed, if `proposed_genre='Unclassified'` but all files carry a single valid `PARENT_GENRES` genre tag, that tag is adopted as the proposal at HIGH confidence. Only fires when CrateSort has no conflicting opinion.
-
-Blank proposed genre must only occur when the current genre is not a valid taxonomy genre AND CrateSort cannot determine the correct genre. `'Pop'`, `'Unclassified'`, `'Untagged'`, and empty string are never valid proposed genres.
-
-### Library rename → Classification sync (commit e7391b3)
-
-When a track title is committed via inline edit in Library, `ClassifierView` receives the signal and updates the affected row's displayed title in place. Does not trigger re-classification — only updates display text. Genre assignments, style tags, and classification state are unaffected.
 
 ---
 
@@ -299,11 +462,23 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 
 `src/gui/organize_view.py` — `QStackedWidget` across 5 states:
 
-- **State 0: Gate / Landing Screen** — always shown on tab visit. Shows classification status (toggles `_gate_needs_class_widget` / `_gate_ready_widget`) and a history list of up to 3 recent reorganizations (`_history_layout`). Each history row shows date, file count, and either "Rolled back on [date]" or a red **Rollback** button. `_refresh_gate_screen()` is called on every `load()` and every `_on_back_to_dashboard()`. `load()` never auto-transitions to planning — user clicks "Plan Reorganization…".
+- **State 0: Landing Screen** — always shown on tab visit. Shows a history list of up to 3 recent reorganizations (`_history_layout`). Each history row shows date, file count, and either "Rolled back on [date]" or a red **Rollback** button. `_refresh_gate_screen()` is called on every `load()` and every `_on_back_to_dashboard()`. `load()` never auto-transitions to planning — user clicks "Plan Reorganization…".
 - **State 1: Planning Screen** — `_PlanWorker` thread builds the plan.
 - **State 2: Preview Screen** — animated stat cards + operations table.
 - **State 3: Executing Screen** — copy-verify-delete progress.
 - **State 4: Done Screen** — success or rollback-in-progress state. Has `self._done_back_btn` (re-enabled after rollback finishes) and `self._rollback_btn`. The detail line now shows crate path update status: "N crate(s) updated" on success, or "Crate paths not updated — use Repair Crate Paths in Settings" if `paths_rewritten == 0`.
+
+### Organize gate / warning behavior
+
+Organize shows a warning dialog when unclassified tracks are detected during plan building:
+- Title: "Unclassified Tracks Detected"
+- Body: "X tracks have no genre assignment and will be moved to an Unclassified folder in your Media directory."
+- "Go Back to Library" (red) — navigates to Library
+- "Proceed" (teal) — continues reorganization
+
+Unclassified tracks go to `Media/Unclassified/` during reorganization. This is a valid destination, not an error state.
+
+`_count_unclassified_tracks()` applies `library_edits.json` overrides via `session.apply_library_edits()` before counting — manual edits are factored in.
 
 ### Operations table action labels:
 
@@ -315,6 +490,22 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 | Metadata only + folder same | Tag Update | `#9fa4c7` lavender |
 | Neither | Move Only | `#e89ebb` pink |
 
+### Organize plan cache (`_cached_plan`)
+
+`OrganizeView` caches the last-built plan as `self._cached_plan`. When `load()` is called on nav to the Organize tab, if `_cached_plan` is not `None` and its `library_root` matches the current library, the Preview screen is restored directly — no re-plan required. The cache is **cleared** on: execute complete (success or failure), rollback complete, different library loaded. The cache is **preserved** on: Cancel & Go Back to Dashboard, any tab switch. This allows the user to plan once and return to review without waiting.
+
+### Destination filename collision resolution
+
+`build_plan()` runs a post-pass collision resolution step after all operations are constructed: it iterates over `operations` in order, and for any `op.destination_path` that has already been seen, appends a ` (N)` suffix (space + parens + integer starting at 2) to the filename stem before the extension. The loop increments `N` until the path is unique. After renaming, `destination_map` is rebuilt from the updated operations so the conflict detection below it reflects final paths.
+
+**Suffix format**: `{stem} ({N}){ext}` — e.g. `St. Ides Commercial (2).mp4`. Space before paren, integer starting at 2. This matches the Export Crate to Folder spec.
+
+If a collision somehow reaches `execute()` (e.g. a pre-existing file on disk), `execute()` no longer silently skips — it logs the operation to the rollback log with `status='skipped'` and `reason='destination_exists_hash_mismatch'`, saves the log, then continues. The Done screen surfaces any skipped files: *"X file(s) could not be moved — destination already existed. Check the log for details."*
+
+### Signal disconnect safety
+
+In `_start_plan_worker` and `_on_plan_ready`, all `.disconnect()` calls on PyQt6 signals are wrapped in `except (RuntimeError, TypeError): pass`. PyQt6 raises `TypeError` (not just `RuntimeError`) when `.disconnect()` is called on a signal with no active connections. Catching only `RuntimeError` allows `TypeError` to escape silently into the slot chain, blocking the `setCurrentIndex(_STATE_PREVIEW)` call and locking the GUI on the spinner. Both exception types must be caught on every `.disconnect()` call.
+
 ### Rollback from history
 
 `_on_rollback_requested(log_path=None)` — accepts an optional `Path`. If a Path is passed (from history row), sets `_rollback_log_path = log_path`, transitions to State 4 in in-progress mode (labels set, rollback btn hidden, back btn disabled). Guard: `isinstance(log_path, Path)` distinguishes real Path from QPushButton's `checked=False` signal arg.
@@ -322,6 +513,10 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 ### reorg_completed signal
 
 `OrganizeView.reorg_completed` pyqtSignal — emitted from `_on_back_to_dashboard()` only (not from cancel). Connected in MainWindow to `_on_reorg_completed()` which calls `_dashboard.start_scan(lib)`. This re-scans the library after a reorg so the Crates tab immediately reflects new file paths without requiring a restart.
+
+### Plan persistence (_cached_plan)
+
+`OrganizeView` stores the completed plan as `self._cached_plan` (initialized to `None` in `__init__`). On `load()`, if `_cached_plan is not None` and `cached_plan.library_root == current_library_path`, the Preview screen is restored directly from the cached plan — no re-planning required. Cache is cleared on: execute complete, execute error, rollback complete, library change. Cache is NOT cleared on: cancel, tab switch, or any other navigation.
 
 ---
 
@@ -345,7 +540,7 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 
 ### build_plan() scope (commit a1891e6)
 
-`build_plan()` considers **every file in the library** as a plan candidate — not just files with session edits. Source of truth is a full library scan compared against the target Genre/Artist/Track structure. State filter was removed — all entries where `final_genre or proposed_genre` is a real genre (not empty/`'Unclassified'`/`'Untagged'`) are included. Files already in the correct structure are excluded as no-ops. Unclassified files are gated out at the Organize gate screen before `build_plan()` runs.
+`build_plan()` considers **every file in the library** as a plan candidate — not just files with session edits. Source of truth is a full library scan compared against the target Genre/Artist/Track structure. State filter was removed — all entries where `final_genre or proposed_genre` is a real genre (not empty/`'Unclassified'`/`'Untagged'`) are included. Files already in the correct structure are excluded as no-ops. Unclassified tracks are allowed to proceed and are mapped to the Media/Unclassified/ folder destination.
 
 `_update_crate_paths()` in `FileOrganizer.execute()` supplies both relative-to-library-root and absolute path variants for every moved file. If `paths_rewritten == 0` after a non-zero move count, the crate files were not updated — the Done screen now surfaces this with a prompt to use Repair Crate Paths in Settings.
 
@@ -380,6 +575,25 @@ For typical POSIX paths these are equivalent. Mismatch can occur if the raw stri
 - Stems are **never displayed** anywhere in CrateSort — Library, Crates, Classification, Organize operations table. Invisible to the user. Wrong file extension means the audio scanner never picks them up.
 - The recursive search logic in `_find_stems_files()` is correct — only the destination calculation was changed
 
+### Artist sort-form heuristic (`_looks_like_sort_form` in `classifier_view.py`)
+
+`_looks_like_sort_form(artist)` determines whether a comma in an artist name is a "Last, First" sort separator (keep as-is) or a collaboration separator (split to primary artist).
+
+**Current allowlist logic:**
+1. If the part after the comma contains a space → `False` (collaboration, e.g. "2Pac, Thug Life")
+2. If the part after the comma is in `_SORT_FORM_PARTICLES = {'the', 'a', 'an', 'jr', 'sr', 'jr.', 'sr.', 'ii', 'iii', 'iv'}` → `True` (sort-form, e.g. "Doors, The")
+3. Otherwise → `False` (single-word collaboration suffix, e.g. "2Pac, Outlaws")
+
+**This is a tight allowlist**, not a heuristic. Any single-word suffix not in the list is treated as a collaboration. Extend `_SORT_FORM_PARTICLES` only when a specific sort-form pattern is confirmed to exist in the library.
+
+### Artist folder placement for consolidation variants
+
+In `_build_destination()`, when an artist consolidation merge proposal has `use_subfolders=True` and `artist != winner`:
+- **Correct**: variant is placed as a **sibling** under the genre folder — `Media/<genre>/<variant_folder>/`
+- **Wrong (old bug, now fixed)**: variant was nested inside the winner's folder — `Media/<genre>/<winner_folder>/<variant_folder>/`
+
+The winner folder is NOT part of the path for variants. Both winner and variant land directly under the genre folder as siblings.
+
 ### Title tag sync
 
 When `build_plan()` generates an operation, it also adds a `MetadataChange(field='title')` to sync the ID3 title tag with the clean destination filename stem. This prevents `FilenameCleaner` from re-proposing the same rename on every subsequent run.
@@ -398,6 +612,14 @@ Called after every execute and rollback. Updates `classification_session.json` a
 ### Protected prefixes
 
 `DEFAULT_PROTECTED_PREFIXES = ()` — no folders are protected. The docstring claiming `_`-prefixed folders are skipped is outdated and wrong.
+
+### Destination collision handling (build_plan)
+
+`build_plan()` runs a collision detection pass after all operations are built. Any two operations sharing the same destination path are resolved by appending ` (2)`, ` (3)` etc. to the filename stem of the later operation. The pass iterates until all destination paths in the plan are unique. This pass runs inside `build_plan()` before the plan is returned — never during execute.
+
+### Silent skip prohibition
+
+`execute()` must never silently skip a file. If `op.destination_path.exists()` is True and SHA-256 hashes differ, the operation is logged to the rollback log with `reason='destination_exists_hash_mismatch'` and a skipped counter is incremented. The Done screen surfaces the skipped count as a non-blocking warning if greater than zero.
 
 ---
 
@@ -552,15 +774,64 @@ Covers inline track metadata edits (title, album, tags, BPM, year, comment) made
 - **`addStretch()` in `_dashboard_layout`** — do not add `setAlignment(AlignTop)` to this layout; it conflicts with addStretch at large window sizes
 - **`setDragDropMode(NoDragDrop)` before `setAcceptDrops(True)`** — NoDragDrop overrides acceptDrops; order is mandatory
 - **Every Claude Code prompt delivered as a .md file** — never inline code blocks, no exceptions
+- **Classification tab is retired** — `ClassifierView` renamed to `_ClassifierViewLegacy`. Do not restore it as a nav destination. Do not import it in `main_window.py`.
+- **`classification_accepted.flag`** — written only by Accept Reclassifications. Never written by individual genre edits. Never deleted by CrateSort automatically.
+- **`isVisible()` guard on auto-classify** — `load()` only calls `_on_classify_clicked(auto_classify=True)` when `self.isVisible()` is True. This prevents the `_AnalyzeLibraryModal` from firing during background scans while the user is on the Dashboard.
+- **`_AnalyzeLibraryModal` first-run path** — only shown when `classification_session.json` does NOT yet exist. When the session file exists, auto-classify enters classify mode directly with no modal. Never show the modal for a returning session.
+- **`_ModalOverlay` event filter** — `removeFromParent()` must be called before `deleteLater()`. Skipping this leaves a dangling event filter on the main window. In `_CrateSortDialog`, this is handled automatically by `_cleanup_overlay` which is connected to `finished` — never bypass this by calling `hide()`/`deleteLater()` directly on a `_CrateSortDialog` without also calling `close()` first to emit `finished`.
+- **Organize `.disconnect()` exception handling** — `_start_plan_worker` and `_on_plan_ready` must catch `(RuntimeError, TypeError)` on every signal `.disconnect()` call. `TypeError` alone is enough to silently kill the rest of the slot and freeze the GUI on the planning spinner.
+- **Artist genre drives sidebar bucketing** — track genre tags never determine which sidebar bucket an artist appears in.
+- **Five confidence states** — MATCHED, HIGH, MEDIUM, LOW, NONE. Never reduce back to three states.
+- **Classify mode columns** — logical indices 12, 13, 14. Only visible during classify mode. Restored/hidden correctly on enter/exit.
+- **`resizeColumnsToContents()`** — called after `_rebuild_tree()` and after classify columns are inserted. 60px minimum floor enforced.
+- **`WA_StyledBackground` on `_ModalOverlay`** — `_ModalOverlay.__init__` must set `self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)`. Without it, the stylesheet `background-color` rule is silently ignored and the scrim renders transparent. Custom `QWidget` subclasses require this attribute to honor stylesheet backgrounds.
+- **`overlays.py` is the single source of truth for all dialog patterns** — never recreate `_ModalOverlay`, `_CrateSortDialog`, `_ov_alert`, or `_ov_confirm` inline in any GUI file. Import from `cratesort.src.gui.overlays`.
+- **`write_file_metadata()` never raises** — any call site in `library_browser.py` that does not check the return value is a bug. Always check the bool and handle failure by reverting the UI or showing a count-label warning.
+- **`library_edits.json` staging is not replaced by disk writes** — both happen. The JSON staging is the Organize fallback; the disk write delivers immediate free-tier value. They are never mutually exclusive.
+- **`_looks_like_sort_form()` uses an explicit allowlist** — it does NOT use a heuristic. Only `{'the', 'a', 'an', 'jr', 'sr', 'jr.', 'sr.', 'ii', 'iii', 'iv'}` trigger sort-form treatment. Any new suffix must be added to the allowlist explicitly.
+- **Organize plan cache** — `_cached_plan` survives Cancel and tab switches. It is cleared only on execute, rollback, or library change. Do not clear it in `_on_cancel_preview`.
+- **Collision suffix format** — destination filename collisions in `build_plan()` are resolved with ` (N)` suffix (space before paren, integer ≥ 2). Do not use underscores, hyphens, or other separators.
+- **`_looks_like_sort_form()` allowlist** — the sort-form heuristic in `classifier_view.py` uses `_SORT_FORM_PARTICLES = {'the', 'a', 'an', 'jr', 'sr', 'jr.', 'sr.', 'ii', 'iii', 'iv'}`. Only particles in this allowlist trigger sort-form treatment. Single-word collaboration names (e.g. "Outlaws") must never be treated as sort-forms. Do not remove or loosen this allowlist without explicit approval.
+- **`_build_destination()` sibling rule** — when `use_subfolders=True` and `artist != winner`, the variant folder must be placed as a sibling under `genre_folder`, never nested inside the winner folder. The winner folder segment must not appear in the variant's destination path.
+- **Destination collision handling** — `build_plan()` must detect destination filename conflicts and resolve them with sequential number suffixes (` (2)`, ` (3)`) before returning the plan. Every operation in the returned plan must have a unique destination path. `execute()` must never silently skip a file — any skip must be logged to the rollback log with `reason='destination_exists_hash_mismatch'`.
+- **`_cached_plan` in `OrganizeView`** — the plan built by `_PlanWorker` is stored as `self._cached_plan` and restored on `load()` if the library root matches. It must be cleared on execute complete, execute error, rollback, and library change. It must NOT be cleared on cancel or tab switch. Never remove this persistence without replacing it — forcing users to re-plan on every visit breaks the testing and real-world workflow.
+- **`write_file_metadata()` is the free tier write path** — this public function in `file_organizer.py` is the single entry point for immediate metadata writes to disk. It must never raise — always catch, log, return bool. Failed writes must never appear as successful edits in the UI. `library_edits.json` writes still happen alongside disk writes — they are not mutually exclusive. Style tags remain virtual/deferred and must not be written to disk by this function.
 
 ---
 
-## Monetization model (future, not built in v1)
+## Monetization model (locked June 15 2026)
 
-- **Free tier**: Dashboard, Classification, Library metadata editing (reassign artists, fix years, add style tags, clean filenames). Genuinely useful on its own — not a crippled demo.
-- **Paid tier** (~$5–10/month or ~$100/year): Crate creation and management, Organize (physical file reorganization), Export Crate to Folder, duplicate detection, smart crate builder, CrateView bridge.
-- The free tier must feel complete. Paid features are additive power, not the removal of basic dignity.
-- Architecture supports feature gating without rewrites.
+**The line: Free tier fixes the file. Paid tier moves the file.**
+
+### Free tier — Library & Metadata
+- Load library, view all media, run classification
+- Correct artist assignments, fix track titles, fix filenames, fix genres, add artwork
+- **All edits write directly to the file on disk immediately at the point of edit**
+- The file does not move — only its contents and properties change
+- This is real, complete value — not a demo or a crippled experience
+
+### Paid Tier 1 — Crate Management
+- Full crate manager: create, rename, delete, reorder, drag tracks between crates
+- Smart crate builder
+- Export Crate to Folder
+
+### Paid Tier 2 — Organize
+- Physical file relocation into Genre/Artist/Track folder hierarchy
+- Filename normalization at OS level (file moves to its new name and location)
+- Serato crate path rewriting after all moves
+- Full restructure with rollback
+
+### Architectural rule — metadata writes (critical)
+Free tier edits (metadata, filename, genre, artwork) write directly to the file on disk immediately at the point of edit. The file does not move. Organize is a paid feature — its sole job is physical relocation: moving files into the Genre/Artist/Track folder hierarchy and updating all Serato crate paths accordingly.
+
+`library_edits.json` must not gate metadata writes for free tier users. Its role going forward is Organize planning only — it records what physical moves need to happen, not what metadata changes are pending. Any code that defers a metadata write to library_edits.json instead of writing through to the file immediately is incorrect behavior for free tier edits.
+
+### Implication for classify flow
+When a free user clicks Accept Reclassifications, genre tags write to files on disk immediately. Real value is delivered without requiring Organize. The navigate-away guard dialog in classify mode should communicate: "You haven't accepted your classifications yet — your genre corrections won't be written to your files until you do."
+
+### License check
+Periodic, offline-tolerant. Lapsed subscription drops to free tier — never locks users out of their library or their metadata. The free tier must always function fully regardless of subscription state.
+
 
 ---
 

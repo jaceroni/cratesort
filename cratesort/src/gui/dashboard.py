@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
+from PyQt6.QtGui import QBrush, QColor, QFontMetrics, QPainter, QPen
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem,
@@ -31,9 +31,12 @@ sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
 
 from cratesort.src.utils.checkpoint import save_checkpoint, load_checkpoint, detect_changes
 from cratesort.src.serato.database_reader import read_track_add_dates
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert
 
-_ASSETS    = Path(__file__).parent.parent.parent / 'assets'
-_LOGO_SVG  = _ASSETS / 'logo' / 'cs-logo-mascot-stacked.svg'
+_ASSETS         = Path(__file__).parent.parent.parent / 'assets'
+_LOGO_SVG       = _ASSETS / 'logo' / 'cs-logo-mascot-stacked.svg'
+_ICON_CHECKED   = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
+_ICON_UNCHECKED = str(_ASSETS / 'icons' / 'checkbox-unchecked.svg')
 _ORG, _APP = 'JWBC', 'CrateSort'
 
 # Minimum time the scanning UI stays visible (ms)
@@ -234,16 +237,23 @@ class _WorkflowCard(QFrame):
     _ICON_DIM    = '#2a2a2a'
     _ICON_ACTIVE = '#D17D34'
 
-    def __init__(self, step: str, title: str, desc: str, callback, icon_path=None, parent=None):
+    def __init__(self, _step: str, title: str, desc: str, callback, icon_path=None, highlighted: bool = False, parent=None):
         super().__init__(parent)
         self._callback  = callback
         self._icon_path = icon_path
         self._icon_svg: QSvgWidget | None = None
         self._svg_bytes: bytes | None = None
 
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        if highlighted:
+            self.style_rest = 'QFrame { background-color: #1a2e2b; border: 2px solid #428175; border-radius: 10px; }'
+            self.icon_dim   = '#428175'
+        else:
+            self.style_rest = self._STYLE_REST
+            self.icon_dim   = self._ICON_DIM
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMinimumHeight(230)
-        self.setStyleSheet(self._STYLE_REST)
+        self.setStyleSheet(self.style_rest)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # Outer row: text on left, icon on right
@@ -254,23 +264,16 @@ class _WorkflowCard(QFrame):
         col = QVBoxLayout()
         col.setSpacing(4)
 
-        self._step_label = QLabel(step)
-        self._step_label.setStyleSheet(
-            'font-size: 32px; font-weight: 600; color: #D17D34; '
-            'letter-spacing: -1px; background: transparent; border: none;'
-        )
-        col.addWidget(self._step_label)
-
         title_lbl = QLabel(title)
         title_lbl.setStyleSheet(
-            'font-size: 14px; font-weight: 500; color: #f1e3c8; '
+            'font-size: 16px; font-weight: 500; color: #D17D34; '
             'background: transparent; border: none;'
         )
         col.addWidget(title_lbl)
 
         desc_lbl = QLabel(desc)
         desc_lbl.setStyleSheet(
-            'font-size: 11px; color: #7a6a55; background: transparent; border: none;'
+            'font-size: 11px; color: #666; background: transparent; border: none;'
         )
         desc_lbl.setWordWrap(True)
         col.addWidget(desc_lbl)
@@ -287,7 +290,7 @@ class _WorkflowCard(QFrame):
                 self._icon_svg.setFixedSize(100, 100)
                 self._icon_svg.setStyleSheet('background: transparent;')
                 self._icon_svg.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-                self._load_icon_color(self._ICON_DIM)
+                self._load_icon_color(self.icon_dim)
                 row.addWidget(self._icon_svg, alignment=Qt.AlignmentFlag.AlignTop)
             except Exception:
                 pass
@@ -306,8 +309,8 @@ class _WorkflowCard(QFrame):
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.setStyleSheet(self._STYLE_REST)
-        self._load_icon_color(self._ICON_DIM)
+        self.setStyleSheet(self.style_rest)
+        self._load_icon_color(self.icon_dim)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
@@ -319,7 +322,7 @@ class _WorkflowCard(QFrame):
 # Change Review Dialog
 # ---------------------------------------------------------------------------
 
-class _ChangeReviewDialog(QDialog):
+class _ChangeReviewDialog(_CrateSortDialog):
     """
     Review Serato library changes detected since the last session.
 
@@ -343,7 +346,6 @@ class _ChangeReviewDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle('Review Serato Changes')
         self.setMinimumSize(540, 400)
 
         self._serato_dir         = serato_dir
@@ -351,7 +353,18 @@ class _ChangeReviewDialog(QDialog):
         self._pending_reverts:   set[int] = set()   # indices into self._changes
         self._changes            = list(changes)
 
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        container = QFrame()
+        container.setObjectName('crd_c')
+        container.setStyleSheet(
+            'QFrame#crd_c { background-color: #2F2F2F; '
+            'border: 1px solid #444444; border-radius: 12px; }'
+        )
+        root.addWidget(container)
+
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 16)
 
@@ -539,8 +552,7 @@ class _ChangeReviewDialog(QDialog):
                 failed.append(f'• {change.get("description", "unknown")} — {exc}')
 
         if failed:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(
+            _ov_alert(
                 self,
                 'Revert Failed',
                 'The following changes could not be reverted:\n\n'
@@ -639,7 +651,7 @@ class DashboardWidget(QWidget):
     new_smart_crate_requested = pyqtSignal()
     status_message            = pyqtSignal(str, str)  # (message, state)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, saved_path: Optional[Path] = None):
         super().__init__(parent)
         self._settings      = QSettings(_ORG, _APP)
         self._library_path: Path | None = None
@@ -657,7 +669,9 @@ class DashboardWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.addWidget(self._stack)
 
-        saved_path = Path(self._settings.value('library_path')) if self._settings.value('library_path') else None
+        if saved_path is None:
+            _raw = self._settings.value('library_path')
+            saved_path = Path(_raw) if _raw else None
         self._stack.addWidget(self._build_welcome(saved_path))  # 0
         self._stack.addWidget(self._build_scanning())           # 1
         self._stack.addWidget(self._build_dashboard())          # 2
@@ -668,6 +682,17 @@ class DashboardWidget(QWidget):
 
     def is_sync_pending(self) -> bool:
         return self._sync_pending
+
+    def _is_classification_complete(self) -> bool:
+        if not self._library_path:
+            return False
+        flag_path = self._library_path / '_CrateSort' / 'classification_accepted.flag'
+        return flag_path.exists()
+
+    def refresh(self) -> None:
+        if self._library_path and self._summary is not None:
+            self._check_serato_sync()
+            self._populate_dashboard()
 
     def set_library_path(self, path: Path) -> None:
         self._library_path = path
@@ -730,34 +755,54 @@ class DashboardWidget(QWidget):
 
         elif not saved_path.exists():
             # Returning user whose library path was deleted or moved.
+            content_container = QWidget()
+            content_container.setFixedWidth(440)
+            cc_layout = QVBoxLayout(content_container)
+            cc_layout.setContentsMargins(0, 0, 0, 0)
+            cc_layout.setSpacing(10)
+            layout.addWidget(content_container, alignment=Qt.AlignmentFlag.AlignCenter)
+
             not_found = QLabel('Your previous library could not be found.')
             not_found.setStyleSheet('font-size: 14px; color: #f1e3c8;')
             not_found.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(not_found)
+            cc_layout.addWidget(not_found)
 
-            path_text = QLabel(str(saved_path))
-            path_text.setWordWrap(True)
+            path_text = QLabel()
             path_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
             path_text.setStyleSheet('font-size: 12px; color: #7a6a55;')
-            layout.addWidget(path_text)
+            fm = QFontMetrics(path_text.font())
+            elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 400)
+            path_text.setText(elided_path)
+            path_text.setToolTip(str(saved_path))
+            cc_layout.addWidget(path_text)
 
             btn = QPushButton('Select Music Library…')
             btn.setFixedWidth(220)
             btn.setMinimumHeight(42)
             btn.clicked.connect(self._on_select_library)
-            layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+            cc_layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         else:
+            content_container = QWidget()
+            content_container.setFixedWidth(440)
+            cc_layout = QVBoxLayout(content_container)
+            cc_layout.setContentsMargins(0, 0, 0, 0)
+            cc_layout.setSpacing(10)
+            layout.addWidget(content_container, alignment=Qt.AlignmentFlag.AlignCenter)
+
             last_lbl = QLabel('Last library:')
             last_lbl.setProperty('role', 'muted')
             last_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(last_lbl)
+            cc_layout.addWidget(last_lbl)
 
-            path_text = QLabel(str(saved_path))
-            path_text.setWordWrap(True)
+            path_text = QLabel()
             path_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
             path_text.setStyleSheet('font-size: 12px; color: #f1e3c8;')
-            layout.addWidget(path_text)
+            fm = QFontMetrics(path_text.font())
+            elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 400)
+            path_text.setText(elided_path)
+            path_text.setToolTip(str(saved_path))
+            cc_layout.addWidget(path_text)
 
             load_btn = QPushButton('Manage Last Library')
             load_btn.setMinimumHeight(42)
@@ -772,11 +817,16 @@ class DashboardWidget(QWidget):
             btns_layout.setSpacing(8)
             btns_layout.addWidget(load_btn)
             btns_layout.addWidget(choose_btn)
-            layout.addWidget(btns)
+            cc_layout.addWidget(btns)
 
             always_cb = QCheckBox('Always load without asking')
-            always_cb.setStyleSheet('font-size: 12px;')
-            layout.addWidget(always_cb, alignment=Qt.AlignmentFlag.AlignCenter)
+            always_cb.setStyleSheet(
+                f'QCheckBox {{ color: #f1e3c8; font-size: 12px; background: transparent; spacing: 8px; }}'
+                f'QCheckBox::indicator {{ width: 16px; height: 16px; }}'
+                f'QCheckBox::indicator:unchecked {{ image: url("{_ICON_UNCHECKED}"); }}'
+                f'QCheckBox::indicator:checked   {{ image: url("{_ICON_CHECKED}");   }}'
+            )
+            cc_layout.addWidget(always_cb, alignment=Qt.AlignmentFlag.AlignCenter)
 
             def _on_load():
                 self._settings.setValue('always_load_last', always_cb.isChecked())
@@ -952,8 +1002,12 @@ class DashboardWidget(QWidget):
         goto_grid.setContentsMargins(0, 0, 0, 0)
         goto_grid.setSpacing(10)
 
+        highlight_manage_library = not self._is_classification_complete()
         for col_idx, (step, title, desc, action, icon_path) in enumerate(goto_cards):
-            card = _WorkflowCard(step, title, desc, action, icon_path=icon_path)
+            card = _WorkflowCard(
+                step, title, desc, action, icon_path=icon_path,
+                highlighted=(highlight_manage_library and title == 'Manage Library'),
+            )
             goto_grid.addWidget(card, 0, col_idx)
 
         vbox.addWidget(goto_widget)

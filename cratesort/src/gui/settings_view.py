@@ -8,8 +8,9 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QSettings, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
+from cratesort.src.gui.overlays import _ov_alert, _ov_confirm
 
 logger = logging.getLogger(__name__)
 
@@ -359,43 +360,10 @@ class SettingsView(QWidget):
         return row
 
     def _confirm(self, title: str, message: str) -> bool:
-        box = QMessageBox(self)
-        box.setWindowTitle(title)
-        box.setText(message)
-        yes = box.addButton('Continue', QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(yes)
-        box.setStyleSheet(
-            'QMessageBox { background: #2F2F2F; }'
-            'QMessageBox QLabel { color: #f1e3c8; font-size: 13px; padding: 12px 16px; }'
-        )
-        for btn in box.buttons():
-            role = box.buttonRole(btn)
-            if role == QMessageBox.ButtonRole.DestructiveRole:
-                btn.setStyleSheet(
-                    f'QPushButton {{ background: {_DANGER}; color: #fff; border-radius: 6px; '
-                    f'border: none; padding: 8px 20px; }}'
-                    f'QPushButton:hover {{ background: #b24c4c; }}'
-                )
-            elif role == QMessageBox.ButtonRole.RejectRole:
-                btn.setStyleSheet(
-                    f'QPushButton {{ background: {_DANGER}; color: #fff; border-radius: 6px; '
-                    f'border: none; padding: 8px 20px; }}'
-                    f'QPushButton:hover {{ background: #b24c4c; }}'
-                )
-        box.exec()
-        return box.clickedButton() == yes
+        return _ov_confirm(self, title, message, confirm_text='Continue', confirm_danger=True)
 
     def _warn(self, message: str) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle('Settings')
-        box.setText(message)
-        box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
-        box.exec()
+        _ov_alert(self, 'Settings', message)
 
     def _info(self, message: str) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle('Settings')
-        box.setText(message)
-        box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
-        box.exec()
+        _ov_alert(self, 'Settings', message)

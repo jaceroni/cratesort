@@ -142,6 +142,7 @@ class RollbackLog:
         op: FileMoveOp,
         duplicate: bool = False,
         stems: Optional[list[dict]] = None,
+        reason: Optional[str] = None,
     ) -> None:
         entry: dict = {
             'source': str(op.source_path),
@@ -154,6 +155,8 @@ class RollbackLog:
             entry['duplicate'] = True
         if stems:
             entry['stems'] = stems
+        if reason:
+            entry['reason'] = reason
         self._data['moves'].append(entry)
 
     def log_metadata(
@@ -577,6 +580,30 @@ class FileOrganizer:
                 path_too_long=path_too_long,
             ))
 
+        # Collision resolution: rename duplicate destination paths with a (N) suffix.
+        # Iterates operations in order — first occurrence keeps its path, subsequent
+        # occurrences get ' (2)', ' (3)', etc. inserted between stem and extension.
+        # After this pass every operation has a unique destination_path.
+        _dest_seen: set[Path] = set()
+        for op in operations:
+            if op.destination_path in _dest_seen:
+                stem    = op.destination_path.stem
+                ext     = op.destination_path.suffix
+                parent  = op.destination_path.parent
+                counter = 2
+                candidate = parent / f"{stem} ({counter}){ext}"
+                while candidate in _dest_seen:
+                    counter += 1
+                    candidate = parent / f"{stem} ({counter}){ext}"
+                op.destination_path = candidate
+            _dest_seen.add(op.destination_path)
+
+        # Rebuild destination_map from the (possibly renamed) operations so the
+        # conflict detection below reflects the final, unique destination paths.
+        destination_map.clear()
+        for op in operations:
+            destination_map[op.destination_path].append(op.source_path)
+
         # Detect conflicts (two sources → same destination)
         conflicts = [
             ConflictReport(destination_path=dest, sources=srcs)
@@ -699,9 +726,15 @@ class FileOrganizer:
                     logger.warning("Duplicate check failed: %s", exc)
 
                 op.status = 'skipped'
-                op.error = f'Destination already exists: {op.destination_path.name}'
+                op.error = 'destination_exists_hash_mismatch'
+                op.executed_at = datetime.now().isoformat()
+                rlog.log_move(op, reason='destination_exists_hash_mismatch')
+                rlog.save()
                 skipped.append(op)
-                logger.warning("Skipped (conflict): %s", op.source_path.name)
+                logger.warning(
+                    "Skipped (destination exists, hash mismatch): %s → %s",
+                    op.source_path.name, op.destination_path.name,
+                )
                 continue
 
             try:
@@ -1022,7 +1055,6 @@ class FileOrganizer:
                     self._library_root
                     / "Media"
                     / genre_folder
-                    / sanitize_path_component(winner_folder)
                     / sanitize_path_component(variant_folder)
                 )
             else:
@@ -1434,3 +1466,29 @@ def _write_comment(audio, ext: str, value: Optional[str]) -> None:
             audio.pop('comment', None)
         else:
             audio['comment'] = [value]
+
+
+def write_file_metadata(file_path: Path, field: str, value: Optional[str]) -> bool:
+    """Write a single metadata field to disk via mutagen.
+
+    Public wrapper around the internal tag helpers for free-tier write-through.
+    Returns True on success, False on any failure. Never raises.
+    Supported fields: genre, artist, title, album, bpm, year, comment.
+    Supported formats: MP3/WAV/AIFF, MP4/M4A, FLAC.
+    Style tags (``tags`` field) are not written to disk — that is deferred.
+    """
+    try:
+        ext = file_path.suffix.lower()
+        audio = mutagen.File(file_path, easy=False)
+        if audio is None:
+            logger.warning('write_file_metadata: mutagen could not open %s', file_path.name)
+            return False
+        _write_metadata_tag(audio, ext, field, value)
+        audio.save()
+        return True
+    except Exception as exc:
+        logger.warning(
+            'write_file_metadata: failed writing field "%s" on %s: %s',
+            field, file_path.name, exc,
+        )
+        return False
