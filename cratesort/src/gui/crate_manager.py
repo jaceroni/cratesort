@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys as _sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QDrag, QFontMetrics, QIcon, QPen, QPixmap, QPainter
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog,
     QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QPushButton, QSplitter,
+    QFileDialog, QMenu, QProgressBar, QPushButton, QSplitter,
     QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -28,7 +29,7 @@ from cratesort.src.utils.undo_manager import (
     CreateCrateCommand, DeleteCrateCommand, RenameCrateCommand,
     ReorderCratesCommand, ReparentCrateCommand, EditTrackMetadataCommand,
 )
-from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm, _create_dialog_layout
 
 # ---------------------------------------------------------------------------
 # Column indices
@@ -433,28 +434,23 @@ def _show_in_finder(file_path: str) -> None:
 class _AddTracksDialog(_CrateSortDialog):
     def __init__(self, inventory, current_tracks: set[str], parent=None):
         super().__init__(parent)
-        self.setMinimumSize(560, 440)
+        self.setMinimumSize(560, 480)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        container = QFrame()
-        container.setObjectName('atd_c')
-        container.setStyleSheet(
-            'QFrame#atd_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
+        # Use standard Teal accent layout (safe action/selection)
+        layout = _create_dialog_layout(self, '#428175')
+
+        # Since QListWidget and QLineEdit styling is on the dialog or layout, we can set it on parent/self
+        self.setStyleSheet(
             'QLabel { color: #f1e3c8; font-size: 13px; background: transparent; }'
             'QLineEdit { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
             'border: 1px solid #444444; border-radius: 4px; padding: 6px 8px; }'
             'QListWidget { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; }'
         )
-        root.addWidget(container)
-
-        layout = QVBoxLayout(container)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 16)
 
         headline = QLabel('Add Tracks to Crate')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
         layout.addWidget(headline)
 
@@ -491,20 +487,21 @@ class _AddTracksDialog(_CrateSortDialog):
             self._list.addItem(item)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        btn_row.setSpacing(12)
         self._cancel_btn = QPushButton('Cancel')
         self._cancel_btn.setFixedHeight(36)
         self._cancel_btn.setStyleSheet(
-            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
-            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         self._cancel_btn.clicked.connect(self.reject)
         self._add_btn = QPushButton('Add Selected')
         self._add_btn.setFixedHeight(36)
         self._add_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
@@ -547,32 +544,27 @@ class _NameInputDialog(_CrateSortDialog):
 
     def __init__(self, parent, title: str, prompt: str, prefill: str = ''):
         super().__init__(parent)
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(480)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        container = QFrame()
-        container.setObjectName('nid_c')
-        container.setStyleSheet(
-            'QFrame#nid_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
-        )
-        root.addWidget(container)
-
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        # Use standard Teal accent layout (safe action/input)
+        layout = _create_dialog_layout(self, '#428175')
 
         headline = QLabel(title)
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
         layout.addWidget(headline)
+        layout.addSpacing(6)
 
-        prompt_lbl = QLabel(prompt)
+        prompt_lbl = QLabel()
+        prompt_lbl.setTextFormat(Qt.TextFormat.RichText)
+        prompt_lbl.setText(f'<div style="line-height: 145%;">{prompt}</div>')
         prompt_lbl.setStyleSheet(
-            'color: #a89b85; font-size: 13px; background: transparent; border: none;'
+            'color: #d5c7ad; font-size: 14px; background: transparent; border: none;'
         )
         layout.addWidget(prompt_lbl)
+        layout.addSpacing(4)
 
         self._edit = QLineEdit(prefill)
         self._edit.selectAll()
@@ -583,13 +575,14 @@ class _NameInputDialog(_CrateSortDialog):
         layout.addWidget(self._edit)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        btn_row.setSpacing(12)
         cancel = QPushButton('Cancel')
         cancel.setFixedHeight(36)
         cancel.setStyleSheet(
-            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
-            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel.clicked.connect(self.reject)
         ok = QPushButton('OK')
@@ -597,7 +590,7 @@ class _NameInputDialog(_CrateSortDialog):
         ok.setFixedHeight(36)
         ok.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
@@ -611,6 +604,330 @@ class _NameInputDialog(_CrateSortDialog):
         if self.exec() == QDialog.DialogCode.Accepted:
             return self._edit.text().strip() or None
         return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _validate_crate_name(name: str) -> Optional[str]:
+    """Return an error message if name is invalid, else None."""
+    if not name or not name.strip():
+        return 'Crate name cannot be empty.'
+    if '/' in name or '\\' in name:
+        return 'Crate name cannot contain slashes.'
+    if '%' in name:
+        return "Crate name cannot contain '%' — it conflicts with Serato's internal path encoding."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Worker: async track table loading
+# ---------------------------------------------------------------------------
+
+class _CrateLoadWorker(QThread):
+    progress = pyqtSignal(int, int, str)   # (done, total, label)
+    finished = pyqtSignal(object)          # payload dict
+    errored  = pyqtSignal(str)
+
+    def __init__(
+        self,
+        track_paths: list,
+        inventory_by_path: dict,
+        inventory_by_name: dict,
+        edits: dict,
+        session_genre: dict,
+        track_genre_overrides: dict,
+        add_dates: dict,
+        library_path,
+        label: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._track_paths           = track_paths
+        self._inventory_by_path     = inventory_by_path
+        self._inventory_by_name     = inventory_by_name
+        self._edits                 = edits
+        self._session_genre         = session_genre
+        self._track_genre_overrides = track_genre_overrides
+        self._add_dates             = add_dates
+        self._library_path          = library_path
+        self._label                 = label
+        self._cancelled             = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _resolve(self, track_path: str):
+        if track_path in self._inventory_by_path:
+            return self._inventory_by_path[track_path]
+        if self._library_path:
+            key = str(self._library_path / track_path)
+            if key in self._inventory_by_path:
+                return self._inventory_by_path[key]
+        return self._inventory_by_name.get(Path(track_path).name)
+
+    def run(self) -> None:
+        try:
+            total          = len(self._track_paths)
+            rows: list     = []
+            resolved_count = 0
+            total_dur_secs = 0.0
+
+            for i, tp in enumerate(self._track_paths):
+                if self._cancelled:
+                    return
+                rec = self._resolve(tp)
+                if rec is not None:
+                    row = self._build_resolved(tp, rec)
+                    resolved_count += 1
+                    total_dur_secs += row['duration_secs']
+                else:
+                    row = {'resolved': False, 'track_path': tp,
+                           'filename': Path(tp).name}
+                rows.append(row)
+                self.progress.emit(i + 1, total, self._label)
+
+            if self._cancelled:
+                return
+
+            self.finished.emit({
+                'rows':           rows,
+                'track_paths':    self._track_paths,
+                'label':          self._label,
+                'total':          total,
+                'resolved_count': resolved_count,
+                'total_dur_secs': total_dur_secs,
+            })
+        except Exception as exc:
+            import traceback
+            self.errored.emit(f'{exc}\n{traceback.format_exc()}')
+
+    def _build_resolved(self, tp: str, rec) -> dict:
+        edits      = self._edits.get(str(rec.path), {})
+        path_str   = str(rec.path)
+        artist_key = f'__artist__{rec.artist}' if rec.artist else ''
+
+        genre = (
+            edits.get('genre')
+            or (self._edits.get(artist_key, {}).get('genre') if artist_key else None)
+            or self._track_genre_overrides.get(path_str)
+            or self._session_genre.get(rec.artist or '')
+            or rec.genre
+            or '—'
+        )
+
+        date_str = '—'
+        date_ts  = 0
+        if self._add_dates and self._library_path:
+            try:
+                rel_key = Path(path_str).relative_to(self._library_path).as_posix()
+                add_dt  = self._add_dates.get(rel_key)
+                if add_dt is None:
+                    add_dt = self._add_dates.get(rel_key.replace(' : ', ''))
+                if add_dt:
+                    date_str = add_dt.strftime('%Y-%m-%d')
+                    date_ts  = int(add_dt.timestamp())
+            except ValueError:
+                pass
+
+        return {
+            'resolved':      True,
+            'track_path':    tp,
+            'path_str':      path_str,
+            'title':         edits.get('title',            rec.title   or ''),
+            'artist':        edits.get('reassign_artist',  rec.artist  or ''),
+            'album':         edits.get('album',            rec.album   or ''),
+            'genre':         genre,
+            'tags':          edits.get('tags',             ''),
+            'bpm':           edits.get('bpm', str(round(rec.bpm)) if rec.bpm else '—'),
+            'year':          edits.get('year',             rec.year    or '—'),
+            'comment':       edits.get('comment',          rec.comment or ''),
+            'dur':           _fmt_dur(rec.duration),
+            'fmt':           rec.extension.lstrip('.').upper() if rec.extension else '—',
+            'bitrate':       f'{rec.bitrate} kbps' if rec.bitrate else '—',
+            'path':          path_str,
+            'date_str':      date_str,
+            'date_ts':       date_ts,
+            'duration_secs': rec.duration or 0.0,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Export Crate to Folder — worker + progress dialog
+# ---------------------------------------------------------------------------
+
+class _ExportCrateWorker(QThread):
+    progress = pyqtSignal(int, int, str)   # (done, total, filename)
+    finished = pyqtSignal(object)          # {'copied': int, 'failed': int, 'dest': Path}
+    errored  = pyqtSignal(str)
+
+    def __init__(
+        self,
+        crate_library,
+        root_crate_path: str,
+        inventory_by_path: dict,
+        inventory_by_name: dict,
+        edits: dict,
+        library_path,
+        total: int,
+        dest_folder: Path,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._crate_library     = crate_library
+        self._root_crate_path   = root_crate_path
+        self._inventory_by_path = inventory_by_path
+        self._inventory_by_name = inventory_by_name
+        self._edits             = edits
+        self._library_path      = library_path
+        self._total             = total
+        self._dest              = dest_folder
+        self._cancelled         = False
+        self._done              = 0
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            crate_name  = self._root_crate_path.split('/')[-1]
+            export_root = self._dest / crate_name
+            export_root.mkdir(parents=True, exist_ok=True)
+            copied, failed = self._export_crate(self._root_crate_path, export_root)
+            if not self._cancelled:
+                self.finished.emit({'copied': copied, 'failed': failed, 'dest': export_root})
+        except Exception as exc:
+            import traceback
+            self.errored.emit(f'{exc}\n{traceback.format_exc()}')
+
+    def _export_crate(self, crate_path: str, dest_folder: Path) -> tuple:
+        if self._cancelled or crate_path not in self._crate_library.crates:
+            return 0, 0
+        crate  = self._crate_library.crates[crate_path]
+        copied = 0
+        failed = 0
+
+        # Direct tracks → dest_folder / Artist /
+        for tp in crate.tracks:
+            if self._cancelled:
+                break
+            rec = self._resolve(tp)
+            if rec is None:
+                failed += 1
+                self._done += 1
+                self.progress.emit(self._done, self._total, '')
+                continue
+            track_edits = self._edits.get(str(rec.path), {})
+            artist      = track_edits.get('reassign_artist', rec.artist or 'Unknown Artist')
+            artist_dir  = dest_folder / artist
+            artist_dir.mkdir(exist_ok=True)
+            src  = Path(str(rec.path))
+            dest = self._unique_dest(artist_dir / src.name)
+            try:
+                shutil.copy2(src, dest)
+                copied += 1
+            except Exception:
+                failed += 1
+            self._done += 1
+            self.progress.emit(self._done, self._total, src.name)
+
+        # Subcrates → dest_folder / _SubcrateName / (underscore prefix sorts to top)
+        for child_path in crate.children:
+            if self._cancelled:
+                break
+            child_name = '_' + child_path.split('/')[-1]
+            child_dest = dest_folder / child_name
+            child_dest.mkdir(exist_ok=True)
+            c, f = self._export_crate(child_path, child_dest)
+            copied += c
+            failed += f
+
+        return copied, failed
+
+    def _resolve(self, track_path: str):
+        if track_path in self._inventory_by_path:
+            return self._inventory_by_path[track_path]
+        if self._library_path:
+            key = str(self._library_path / track_path)
+            if key in self._inventory_by_path:
+                return self._inventory_by_path[key]
+        return self._inventory_by_name.get(Path(track_path).name)
+
+    @staticmethod
+    def _unique_dest(path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem, suffix, parent = path.stem, path.suffix, path.parent
+        n = 2
+        while True:
+            candidate = parent / f'{stem}_{n}{suffix}'
+            if not candidate.exists():
+                return candidate
+            n += 1
+
+
+class _ExportProgressDialog(_CrateSortDialog):
+    cancelled = pyqtSignal()
+
+    def __init__(self, crate_name: str, total: int, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(480)
+
+        # Use standard Teal accent layout (safe action/progress)
+        layout = _create_dialog_layout(self, '#428175')
+
+        title = QLabel('Exporting Crate')
+        title.setStyleSheet(
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+        )
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        layout.addSpacing(6)
+
+        name_lbl = QLabel()
+        name_lbl.setTextFormat(Qt.TextFormat.RichText)
+        name_lbl.setText(f'<div style="line-height: 145%; text-align: center;">{crate_name}</div>')
+        name_lbl.setStyleSheet('color: #d5c7ad; font-size: 14px; background: transparent; border: none;')
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(name_lbl)
+        layout.addSpacing(8)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, total)
+        self._bar.setValue(0)
+        self._bar.setFixedHeight(8)
+        self._bar.setTextVisible(False)
+        self._bar.setStyleSheet(
+            'QProgressBar { background: #383838; border: none; border-radius: 4px; }'
+            f'QProgressBar::chunk {{ background: {_TEAL}; border-radius: 4px; }}'
+        )
+        layout.addWidget(self._bar)
+
+        self._count_lbl = QLabel(f'0 of {total:,}')
+        self._count_lbl.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
+        self._count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._count_lbl)
+
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
+        )
+        cancel_btn.clicked.connect(self._on_cancel)
+        layout.addWidget(cancel_btn)
+
+    def update_progress(self, done: int, total: int) -> None:
+        self._bar.setValue(done)
+        self._count_lbl.setText(f'{done:,} of {total:,}')
+
+    def _on_cancel(self) -> None:
+        self.cancelled.emit()
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +992,9 @@ class CrateManagerView(QWidget):
         # Pre-initialize so eventFilter never raises AttributeError
         # if events fire during _build_crate_panel() before _build_track_panel() runs
         self._track_table: Optional[_ReorderableTable] = None  # type: ignore[assignment]
+        self._load_worker:   Optional[_CrateLoadWorker]       = None
+        self._export_worker: Optional[_ExportCrateWorker]     = None
+        self._export_dialog: Optional[_ExportProgressDialog]  = None
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -931,15 +1251,15 @@ class CrateManagerView(QWidget):
         image: url(none);
     }
     QTreeWidget::branch:has-siblings:!adjoins-item {
-        border-left: 1px solid #4a4a4a;
+        border-left: 1px solid #444444;
         background: #2F2F2F;
     }
     QTreeWidget::branch:has-siblings:adjoins-item {
-        border-left: 1px solid #4a4a4a;
+        border-left: 1px solid #444444;
         background: #2F2F2F;
     }
     QTreeWidget::branch:!has-siblings:adjoins-item {
-        border-left: 1px solid #4a4a4a;
+        border-left: 1px solid #444444;
         background: #2F2F2F;
     }
 """)
@@ -1044,7 +1364,46 @@ class CrateManagerView(QWidget):
             )
         )
 
-        layout.addWidget(self._track_table, stretch=1)
+        # Loading overlay (shown while _CrateLoadWorker runs)
+        load_overlay = QWidget()
+        load_overlay.setStyleSheet('background: #242424;')
+        ol = QVBoxLayout(load_overlay)
+        ol.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ol.setSpacing(12)
+
+        self._load_label = QLabel('Loading…')
+        self._load_label.setStyleSheet(
+            f'color: {_CREAM}; font-size: 14px; background: transparent;'
+        )
+        self._load_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ol.addWidget(self._load_label)
+
+        self._load_progress = QProgressBar()
+        self._load_progress.setRange(0, 100)
+        self._load_progress.setValue(0)
+        self._load_progress.setFixedWidth(360)
+        self._load_progress.setFixedHeight(8)
+        self._load_progress.setTextVisible(False)
+        self._load_progress.setStyleSheet(
+            'QProgressBar { background: #383838; border: none; border-radius: 4px; }'
+            f'QProgressBar::chunk {{ background: {_TEAL}; border-radius: 4px; }}'
+        )
+        ol.addWidget(self._load_progress, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self._load_count = QLabel()
+        self._load_count.setStyleSheet(
+            f'color: {_MUTED}; font-size: 12px; background: transparent;'
+        )
+        self._load_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ol.addWidget(self._load_count)
+
+        # Stack: 0 = table, 1 = loading overlay
+        self._track_content_stack = QStackedWidget()
+        self._track_content_stack.addWidget(self._track_table)
+        self._track_content_stack.addWidget(load_overlay)
+        self._track_content_stack.setCurrentIndex(0)
+
+        layout.addWidget(self._track_content_stack, stretch=1)
 
         # Fix 5: set minimum width on TC_PATH column and minimum section size
         self._track_table.setColumnWidth(TC_PATH, 300)
@@ -1318,14 +1677,7 @@ class CrateManagerView(QWidget):
                 if tp not in seen:
                     seen.add(tp)
                     track_paths.append(tp)
-        self._populate_track_table(track_paths)
-        total_dur = self._total_duration(track_paths)
-        resolved  = sum(1 for p in track_paths if self._resolve_track(p) is not None)
-        unresolved = len(track_paths) - resolved
-        self._status_label.setText(
-            f'All Tracks  ·  {len(track_paths):,} tracks  ·  {total_dur}'
-            f'  ·  {resolved:,} resolved, {unresolved:,} unresolved'
-        )
+        self._start_load_worker(track_paths, 'All Tracks')
 
     def _collect_tracks_recursive(self, crate_path: str) -> list[str]:
         """Return deduplicated track paths from crate + all sub-crates at any depth."""
@@ -1351,11 +1703,7 @@ class CrateManagerView(QWidget):
         crate  = self._crate_library.crates[crate_path]
         # Show combined tracks for parent crates (own tracks + all descendants)
         tracks = self._collect_tracks_recursive(crate_path) if crate.children else list(crate.tracks)
-        self._populate_track_table(tracks)
-        total_dur = self._total_duration(tracks)
-        self._status_label.setText(
-            f'{crate.name}  ·  {len(tracks):,} tracks  ·  {total_dur}'
-        )
+        self._start_load_worker(tracks, crate.name)
 
     def _total_duration(self, track_paths: list[str]) -> str:
         total_secs = 0.0
@@ -1372,7 +1720,137 @@ class CrateManagerView(QWidget):
             return f'{hours}h {minutes}m {seconds}s'
         return f'{minutes}m {seconds}s'
 
+    # ── Worker: launch / progress / finish ────────────────────────────
+
+    def _start_load_worker(self, track_paths: list, label: str) -> None:
+        if self._load_worker and self._load_worker.isRunning():
+            self._load_worker.progress.disconnect()
+            self._load_worker.finished.disconnect()
+            self._load_worker.errored.disconnect()
+            self._load_worker.cancel()
+            self._load_worker = None
+
+        if not track_paths:
+            self._populate_track_table([])
+            self._status_label.setText('')
+            return
+
+        self._load_label.setText(label)
+        self._load_progress.setValue(0)
+        self._load_count.setText(f'0 of {len(track_paths):,}')
+        self._track_content_stack.setCurrentIndex(1)
+        self._track_search.setEnabled(False)
+
+        self._load_worker = _CrateLoadWorker(
+            track_paths=list(track_paths),
+            inventory_by_path=dict(self._inventory_by_path),
+            inventory_by_name=dict(self._inventory_by_name),
+            edits=dict(self._edits),
+            session_genre=dict(self._session_genre),
+            track_genre_overrides=dict(self._track_genre_overrides),
+            add_dates=self._add_dates,
+            library_path=self._library_path,
+            label=label,
+            parent=self,
+        )
+        self._load_worker.progress.connect(self._on_load_progress)
+        self._load_worker.finished.connect(self._on_load_finished)
+        self._load_worker.errored.connect(self._on_load_errored)
+        self._load_worker.start()
+
+    def _on_load_progress(self, done: int, total: int, _label: str) -> None:
+        pct = int(done / total * 100) if total else 0
+        self._load_progress.setValue(pct)
+        self._load_count.setText(f'{done:,} of {total:,}')
+
+    def _on_load_finished(self, payload: dict) -> None:
+        rows           = payload['rows']
+        track_paths    = payload['track_paths']
+        label          = payload['label']
+        total          = payload['total']
+        resolved_count = payload['resolved_count']
+        dur_secs       = payload['total_dur_secs']
+
+        self._populate_track_table_from_rows(rows, track_paths)
+
+        total_dur = _fmt_dur(dur_secs) if dur_secs else '—'
+        if label == 'All Tracks':
+            unresolved = total - resolved_count
+            self._status_label.setText(
+                f'All Tracks  ·  {total:,} tracks  ·  {total_dur}'
+                f'  ·  {resolved_count:,} resolved, {unresolved:,} unresolved'
+            )
+        else:
+            self._status_label.setText(
+                f'{label}  ·  {total:,} tracks  ·  {total_dur}'
+            )
+
+        self._track_content_stack.setCurrentIndex(0)
+        self._track_search.setEnabled(True)
+        self._load_worker = None
+
+    def _on_load_errored(self, msg: str) -> None:
+        self._track_content_stack.setCurrentIndex(0)
+        self._track_search.setEnabled(True)
+        self._load_worker = None
+        _ov_alert(self, 'Load Error', f'Failed to load tracks:\n{msg}')
+
     # ── Track table population ─────────────────────────────────────────
+
+    def _populate_track_table_from_rows(
+        self, rows: list, track_paths: list
+    ) -> None:
+        self._track_search.blockSignals(True)
+        self._track_search.clear()
+        self._track_search.blockSignals(False)
+        self._track_table.setSortingEnabled(False)
+        self._track_table.setRowCount(0)
+        self._track_table.setRowCount(len(rows))
+        self._original_track_paths = list(track_paths)
+
+        for row_idx, row in enumerate(rows):
+            if row['resolved']:
+                self._populate_resolved_row_from_data(row_idx, row)
+            else:
+                self._populate_unresolved_row(row_idx, row['track_path'])
+
+        self._track_table.setSortingEnabled(True)
+        self._track_table.sortByColumn(self._sort_col, self._sort_order)
+        if not self._settings.value(_SETTINGS_KEY):
+            self._size_pos_column(len(rows))
+            QTimer.singleShot(100, self._enforce_min_col_widths)
+
+    def _populate_resolved_row_from_data(self, row: int, d: dict) -> None:
+        tp       = d['track_path']
+        path_str = d['path_str']
+
+        pos_cell = _NumericItem(str(row + 1))
+        pos_cell.setData(Qt.ItemDataRole.UserRole,     row + 1)
+        pos_cell.setData(Qt.ItemDataRole.UserRole + 1, tp)
+        self._track_table.setItem(row, TC_POS, pos_cell)
+
+        values = [
+            d['title'], d['artist'], d['album'], d['dur'], d['genre'],
+            d['tags'], d['bpm'], d['date_str'], d['fmt'], d['year'],
+            d['bitrate'], d['comment'], d['path'],
+        ]
+        for i, val in enumerate(values):
+            col  = i + 1
+            cell = QTableWidgetItem(val)
+            cell.setData(Qt.ItemDataRole.UserRole,     path_str)
+            cell.setData(Qt.ItemDataRole.UserRole + 1, tp)
+            if col == TC_TITLE:
+                cell.setIcon(_get_note_icon())
+            if col == TC_DATE and d['date_ts']:
+                cell = _NumericItem(val)
+                cell.setData(Qt.ItemDataRole.UserRole,     d['date_ts'])
+                cell.setData(Qt.ItemDataRole.UserRole + 1, tp)
+                self._track_table.setItem(row, col, cell)
+                continue
+            self._track_table.setItem(row, col, cell)
+
+        if d['comment']:
+            self._track_table.item(row, TC_COMMENT).setToolTip(d['comment'])
 
     def _populate_track_table(self, track_paths: list[str]) -> None:
         self._track_search.blockSignals(True)
@@ -2071,6 +2549,8 @@ class CrateManagerView(QWidget):
         del_act    = menu.addAction('Delete')
         menu.addSeparator()
         add_t_act  = menu.addAction('Add Tracks…')
+        menu.addSeparator()
+        export_act = menu.addAction('Export Crate to Folder…')
 
         action = menu.exec(self._crate_tree.viewport().mapToGlobal(pos))
         if action == new_act:
@@ -2085,6 +2565,8 @@ class CrateManagerView(QWidget):
             self._crate_delete(key)
         elif action == add_t_act:
             self._crate_add_tracks(key)
+        elif action == export_act:
+            self._export_crate_to_folder(key)
 
     # ── Crate CRUD operations ──────────────────────────────────────────
 
@@ -2096,6 +2578,9 @@ class CrateManagerView(QWidget):
     def _crate_new(self, parent_path: Optional[str]) -> None:
         name = _NameInputDialog(self, 'New Crate', 'Crate name:').get_name()
         if not name:
+            return
+        if err := _validate_crate_name(name):
+            _ov_alert(self, 'Invalid Crate Name', err)
             return
         writer     = self._writer()
         if not writer:
@@ -2118,6 +2603,9 @@ class CrateManagerView(QWidget):
     def _crate_new_sub(self, parent_path: str) -> None:
         name = _NameInputDialog(self, 'New Subcrate', 'Subcrate name:').get_name()
         if not name:
+            return
+        if err := _validate_crate_name(name):
+            _ov_alert(self, 'Invalid Crate Name', err)
             return
         writer = self._writer()
         if not writer:
@@ -2144,6 +2632,9 @@ class CrateManagerView(QWidget):
         old_name = crate.name
         new_name = _NameInputDialog(self, 'Rename Crate', 'New name:', prefill=old_name).get_name()
         if not new_name or new_name == old_name:
+            return
+        if err := _validate_crate_name(new_name):
+            _ov_alert(self, 'Invalid Crate Name', err)
             return
         parent   = crate.parent
         new_path = f'{parent}/{new_name}' if parent else new_name
@@ -2283,6 +2774,97 @@ class CrateManagerView(QWidget):
 
     def _reload_current_crate(self) -> None:
         self._refresh(select=self._current_crate_path)
+
+    # ── Export Crate to Folder ─────────────────────────────────────────
+
+    def _count_export_tracks(self, crate_path: str) -> int:
+        if not self._crate_library or crate_path not in self._crate_library.crates:
+            return 0
+        crate = self._crate_library.crates[crate_path]
+        return len(crate.tracks) + sum(
+            self._count_export_tracks(child) for child in crate.children
+        )
+
+    def _export_crate_to_folder(self, crate_path: str) -> None:
+        if not self._crate_library or crate_path not in self._crate_library.crates:
+            _ov_alert(self, 'Export Crate', 'Crate data unavailable.')
+            return
+
+        total = self._count_export_tracks(crate_path)
+        if total == 0:
+            _ov_alert(self, 'Export Crate', 'This crate has no tracks that could be found on disk.')
+            return
+
+        dest_str = QFileDialog.getExistingDirectory(
+            self, 'Choose Export Destination', str(Path.home())
+        )
+        if not dest_str:
+            return
+
+        crate_name = crate_path.split('/')[-1]
+        crate      = self._crate_library.crates[crate_path]
+
+        # Inform the user when subcrates are present — they export as _Name folders
+        if crate.children:
+            subcrate_names = sorted(child.split('/')[-1] for child in crate.children)
+            prefixed       = ', '.join(f'_{n}' for n in subcrate_names)
+            msg = (
+                f'{prefixed}\n\n'
+                f'Subcrate folders — sorted above your artists. Continue?'
+            )
+            if not _ov_confirm(self, 'Export Crate to Folder', msg):
+                return
+
+        self._export_dialog = _ExportProgressDialog(crate_name, total, self)
+        self._export_worker = _ExportCrateWorker(
+            crate_library=self._crate_library,
+            root_crate_path=crate_path,
+            inventory_by_path=dict(self._inventory_by_path),
+            inventory_by_name=dict(self._inventory_by_name),
+            edits=dict(self._edits),
+            library_path=self._library_path,
+            total=total,
+            dest_folder=Path(dest_str),
+            parent=self,
+        )
+
+        self._export_worker.progress.connect(self._on_export_progress)
+        self._export_worker.finished.connect(self._on_export_finished)
+        self._export_worker.errored.connect(self._on_export_errored)
+        self._export_dialog.cancelled.connect(self._on_export_cancelled)
+
+        self._export_worker.start()
+        self._export_dialog.exec()
+
+    def _on_export_progress(self, done: int, total: int, _filename: str) -> None:
+        if self._export_dialog:
+            self._export_dialog.update_progress(done, total)
+
+    def _on_export_finished(self, result: dict) -> None:
+        if self._export_dialog:
+            self._export_dialog.close()
+        self._export_dialog = None
+        self._export_worker = None
+        copied = result['copied']
+        failed = result['failed']
+        dest   = result['dest']
+        msg = f'Exported {copied:,} track{"s" if copied != 1 else ""} to:\n{dest}'
+        if failed:
+            msg += f'\n\n⚠ {failed} file{"s" if failed != 1 else ""} could not be copied.'
+        _ov_alert(self, 'Export Complete', msg)
+
+    def _on_export_errored(self, msg: str) -> None:
+        if self._export_dialog:
+            self._export_dialog.close()
+        self._export_dialog = None
+        self._export_worker = None
+        _ov_alert(self, 'Export Failed', f'Export failed:\n{msg[:500]}')
+
+    def _on_export_cancelled(self) -> None:
+        if self._export_worker:
+            self._export_worker.cancel()
+        self._export_dialog = None
+        self._export_worker = None
 
     # ── Track context menu ─────────────────────────────────────────────
 

@@ -10,11 +10,17 @@ CrateSuite is a professional digital and vinyl music library management ecosyste
 1. **CrateSort**: A cross-platform desktop application (macOS-first) that organizes a DJ's digital music files (MP3s, AIFFs, WAVs, and music videos) and manages their Serato DJ Pro crate structure on disk.
 2. **CrateView**: A custom WordPress child theme for vinyl record collection management and shelf mapping.
 
-### Core Philosophy: The Single Writer / Reader Separation
+### Core Philosophy & Positioning
 * **CrateSort is the Single Writer; Serato is the Reader.** Performance software like Serato is built to read and mix music, not to organize files. CrateSort owns the file structures, directory nesting, file renaming, metadata tagging, and crate organization. When Serato launches, it simply reads the outputs prepared by CrateSort.
 * **The Folder is the Home; The Crate is the Connection.** Every audio/video file lives in exactly one physical location on disk (structured by Genre and Artist). A Serato crate is a virtual connection—one physical file can be referenced in multiple crates.
 * **Inform First, Act Second.** Every organizational change must first be presented as a safe preview before the user clicks to execute.
 * **Non-Destructive by Default.** When files are organized, original folders are quarantined (not deleted), and a detailed JSON rollback log is generated so a user can completely undo the organization with one click.
+* **The "Carfax" Model (Pre-Flight Health Check).** CrateSort is not just a one-time organization tool. It is a recurring pre-flight diagnostic check run before every gig. By running a quick startup scan against the local `checkpoint.json` before opening Serato, the DJ ensures there are no missing files ("holes") or scrambled crates waiting to blow up mid-set.
+* **Multiple Product Narratives.** The application resolves several key pain points:
+  1. *The Rescue*: Reverting Serato database scrambles, subcrate reorganization, and silent song-swaps (e.g. Method Man getting replaced by Dorothy Ashby) caused by macOS unsafe drive disconnects or laptop battery failures.
+  2. *The Chaos*: Clean physical directory restructures and duplicate file consolidation ("Rinse").
+  3. *Human Error*: Safety via universal undo/redo (`Cmd+Z`) for crate management.
+  4. *The Collector*: The CrateView vinyl bridge for aligning physical and digital libraries.
 
 ---
 

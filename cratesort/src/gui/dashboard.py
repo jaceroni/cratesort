@@ -31,7 +31,7 @@ sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
 
 from cratesort.src.utils.checkpoint import save_checkpoint, load_checkpoint, detect_changes
 from cratesort.src.serato.database_reader import read_track_add_dates
-from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _create_dialog_layout
 
 _ASSETS         = Path(__file__).parent.parent.parent / 'assets'
 _LOGO_SVG       = _ASSETS / 'logo' / 'cs-logo-mascot-stacked.svg'
@@ -273,7 +273,7 @@ class _WorkflowCard(QFrame):
 
         desc_lbl = QLabel(desc)
         desc_lbl.setStyleSheet(
-            'font-size: 11px; color: #666; background: transparent; border: none;'
+            'font-size: 11px; color: #a89b85; background: transparent; border: none;'
         )
         desc_lbl.setWordWrap(True)
         col.addWidget(desc_lbl)
@@ -346,32 +346,23 @@ class _ChangeReviewDialog(_CrateSortDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setMinimumSize(540, 400)
+        self.setMinimumSize(540, 480)
 
         self._serato_dir         = serato_dir
         self._updated_crates     = dict(current_crates)
         self._pending_reverts:   set[int] = set()   # indices into self._changes
         self._changes            = list(changes)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+        # Use the standard dialog layout builder with Orange accent (selection/confirm)
+        layout = _create_dialog_layout(self, '#D17D34')
 
-        container = QFrame()
-        container.setObjectName('crd_c')
-        container.setStyleSheet(
-            'QFrame#crd_c { background-color: #2F2F2F; '
-            'border: 1px solid #444444; border-radius: 12px; }'
-        )
-        root.addWidget(container)
-
-        layout = QVBoxLayout(container)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 16)
-
-        # ── Header ───────────────────────────────────────────────────────────
         title = QLabel('Serato Library Changes Detected')
-        title.setStyleSheet('font-size: 16px; font-weight: 600; color: #f1e3c8;')
+        title.setStyleSheet(
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+        )
         layout.addWidget(title)
+        layout.addSpacing(6)
 
         if checkpoint_timestamp:
             day = checkpoint_timestamp.day
@@ -385,10 +376,13 @@ class _ChangeReviewDialog(_CrateSortDialog):
                 'Changes detected since your last CrateSort session. '
                 'Mark any changes to revert before syncing.'
             )
-        desc = QLabel(desc_text)
-        desc.setStyleSheet('color: #a89b85; font-size: 12px;')
+        desc = QLabel()
+        desc.setTextFormat(Qt.TextFormat.RichText)
+        desc.setText(f'<div style="line-height: 145%;">{desc_text}</div>')
+        desc.setStyleSheet('color: #d5c7ad; font-size: 13px; background: transparent; border: none;')
         desc.setWordWrap(True)
         layout.addWidget(desc)
+        layout.addSpacing(12)
 
         # ── Change rows ───────────────────────────────────────────────────────
         scroll = QScrollArea()
@@ -411,34 +405,31 @@ class _ChangeReviewDialog(_CrateSortDialog):
         self._rows_layout.addStretch()
 
         # ── Buttons ───────────────────────────────────────────────────────────
-        sep = QFrame()
-        sep.setFixedHeight(1)
-        sep.setStyleSheet('background: #383838; border: none;')
-        layout.addWidget(sep)
-
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
+        btn_row.setSpacing(12)
 
         self._cancel_btn = QPushButton('Cancel')
+        self._cancel_btn.setFixedHeight(36)
         self._cancel_btn.setStyleSheet(
-            'QPushButton { background: #C75B5B; color: #ffffff; font-weight: 400; '
-            'border-radius: 6px; border: none; padding: 7px 18px; }'
-            'QPushButton:hover { background: #b24c4c; }'
-            'QPushButton:pressed { background: #9c3b3b; }'
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         self._cancel_btn.clicked.connect(self.reject)
 
-        self._sync_btn = QPushButton('Sync && Proceed')
+        self._sync_btn = QPushButton('Sync & Proceed')
+        self._sync_btn.setFixedHeight(36)
         self._sync_btn.setStyleSheet(
-            'QPushButton { background: #428175; color: #ffffff; font-weight: 600; '
-            'border-radius: 6px; border: none; padding: 7px 18px; }'
-            'QPushButton:hover { background: #38706a; }'
-            'QPushButton:pressed { background: #2d6358; }'
+            'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #be6e2c; }'
+            'QPushButton:pressed { background-color: #aa5d21; }'
         )
         self._sync_btn.clicked.connect(self._on_sync)
 
-        btn_row.addStretch()
         btn_row.addWidget(self._cancel_btn)
+        btn_row.addStretch()
         btn_row.addWidget(self._sync_btn)
         layout.addLayout(btn_row)
 
@@ -649,6 +640,7 @@ class DashboardWidget(QWidget):
     organize_requested        = pyqtSignal()
     new_crate_requested       = pyqtSignal()
     new_smart_crate_requested = pyqtSignal()
+    duplicates_requested      = pyqtSignal()   # user clicked the duplicate banner
     status_message            = pyqtSignal(str, str)  # (message, state)
 
     def __init__(self, parent=None, saved_path: Optional[Path] = None):
@@ -663,6 +655,8 @@ class DashboardWidget(QWidget):
         self._sync_pending = False
         self._detected_changes = []
         self._current_crates = {}
+        self._dup_groups: list = []
+        self._dup_summary = None
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -717,7 +711,7 @@ class DashboardWidget(QWidget):
         layout = QVBoxLayout(w)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(20)
-        layout.setContentsMargins(60, 60, 60, 60)
+        layout.setContentsMargins(60, 60, 60, 100) # bottom headroom for media player
 
         if _SVG_AVAILABLE and _LOGO_SVG.exists():
             logo = QSvgWidget(str(_LOGO_SVG))
@@ -735,89 +729,120 @@ class DashboardWidget(QWidget):
         tagline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(tagline)
 
+        beta_badge = QLabel('BETA')
+        beta_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        beta_badge.setStyleSheet(
+            'color: #D17D34; font-size: 10px; font-weight: 700; letter-spacing: 2px; '
+            'border: 1px solid #D17D34; border-radius: 4px; padding: 2px 8px; '
+            'background: transparent;'
+        )
+        layout.addWidget(beta_badge, alignment=Qt.AlignmentFlag.AlignCenter)
+
         layout.addSpacing(8)
 
+        # Welcome Card wrapping all action controls
+        welcome_card = QFrame()
+        welcome_card.setObjectName('welcome_card')
+        welcome_card.setFixedWidth(440)
+        welcome_card.setStyleSheet(
+            'QFrame#welcome_card { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
+        )
+        card_layout = QVBoxLayout(welcome_card)
+        card_layout.setContentsMargins(28, 24, 28, 24)
+        card_layout.setSpacing(16)
+
         if saved_path is None:
-            instr = QLabel(
-                'Select the root folder of your music library.\n'
+            instr = QLabel()
+            instr.setTextFormat(Qt.TextFormat.RichText)
+            instr.setText(
+                '<div style="line-height: 145%; text-align: center;">'
+                'Select the root folder of your music library.<br>'
                 'CrateSort will scan all media files inside it, including subfolders.'
+                '</div>'
             )
-            instr.setProperty('role', 'muted')
             instr.setAlignment(Qt.AlignmentFlag.AlignCenter)
             instr.setWordWrap(True)
-            layout.addWidget(instr)
+            instr.setStyleSheet('color: #d5c7ad; font-size: 13px; background: transparent; border: none;')
+            card_layout.addWidget(instr)
 
             btn = QPushButton('Select Music Library…')
-            btn.setFixedWidth(220)
             btn.setMinimumHeight(42)
+            btn.setStyleSheet(
+                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'border-radius: 6px; font-size: 13px; font-weight: 600; }'
+                'QPushButton:hover { background-color: #be6e2c; }'
+                'QPushButton:pressed { background-color: #aa5d21; }'
+            )
             btn.clicked.connect(self._on_select_library)
-            layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(btn)
 
         elif not saved_path.exists():
-            # Returning user whose library path was deleted or moved.
-            content_container = QWidget()
-            content_container.setFixedWidth(440)
-            cc_layout = QVBoxLayout(content_container)
-            cc_layout.setContentsMargins(0, 0, 0, 0)
-            cc_layout.setSpacing(10)
-            layout.addWidget(content_container, alignment=Qt.AlignmentFlag.AlignCenter)
-
             not_found = QLabel('Your previous library could not be found.')
-            not_found.setStyleSheet('font-size: 14px; color: #f1e3c8;')
+            not_found.setStyleSheet('font-size: 14px; font-weight: 500; color: #f1e3c8; background: transparent; border: none;')
             not_found.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cc_layout.addWidget(not_found)
+            card_layout.addWidget(not_found)
 
             path_text = QLabel()
             path_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            path_text.setStyleSheet('font-size: 12px; color: #7a6a55;')
+            path_text.setStyleSheet(
+                'QLabel { background-color: #1a1a1a; border: 1px solid #383838; border-radius: 6px; '
+                'color: #7a6a55; font-family: monospace; font-size: 12px; padding: 10px; }'
+            )
             fm = QFontMetrics(path_text.font())
-            elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 400)
+            elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 360)
             path_text.setText(elided_path)
             path_text.setToolTip(str(saved_path))
-            cc_layout.addWidget(path_text)
+            card_layout.addWidget(path_text)
 
             btn = QPushButton('Select Music Library…')
-            btn.setFixedWidth(220)
             btn.setMinimumHeight(42)
+            btn.setStyleSheet(
+                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'border-radius: 6px; font-size: 13px; font-weight: 600; }'
+                'QPushButton:hover { background-color: #be6e2c; }'
+                'QPushButton:pressed { background-color: #aa5d21; }'
+            )
             btn.clicked.connect(self._on_select_library)
-            cc_layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(btn)
 
         else:
-            content_container = QWidget()
-            content_container.setFixedWidth(440)
-            cc_layout = QVBoxLayout(content_container)
-            cc_layout.setContentsMargins(0, 0, 0, 0)
-            cc_layout.setSpacing(10)
-            layout.addWidget(content_container, alignment=Qt.AlignmentFlag.AlignCenter)
-
             last_lbl = QLabel('Last library:')
-            last_lbl.setProperty('role', 'muted')
+            last_lbl.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
             last_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cc_layout.addWidget(last_lbl)
+            card_layout.addWidget(last_lbl)
 
             path_text = QLabel()
             path_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            path_text.setStyleSheet('font-size: 12px; color: #f1e3c8;')
+            path_text.setStyleSheet(
+                'QLabel { background-color: #1a1a1a; border: 1px solid #383838; border-radius: 6px; '
+                'color: #f1e3c8; font-family: monospace; font-size: 12px; padding: 10px; }'
+            )
             fm = QFontMetrics(path_text.font())
-            elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 400)
+            elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 360)
             path_text.setText(elided_path)
             path_text.setToolTip(str(saved_path))
-            cc_layout.addWidget(path_text)
+            card_layout.addWidget(path_text)
 
             load_btn = QPushButton('Manage Last Library')
             load_btn.setMinimumHeight(42)
+            load_btn.setStyleSheet(
+                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'border-radius: 6px; font-size: 13px; font-weight: 600; }'
+                'QPushButton:hover { background-color: #be6e2c; }'
+                'QPushButton:pressed { background-color: #aa5d21; }'
+            )
 
             choose_btn = QPushButton('Choose Different Library')
-            choose_btn.setProperty('flat', 'true')
             choose_btn.setMinimumHeight(42)
+            choose_btn.setStyleSheet(
+                'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+                'border-radius: 6px; font-size: 13px; font-weight: 500; }'
+                'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+                'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
+            )
 
-            btns = QWidget()
-            btns_layout = QVBoxLayout(btns)
-            btns_layout.setContentsMargins(0, 0, 0, 0)
-            btns_layout.setSpacing(8)
-            btns_layout.addWidget(load_btn)
-            btns_layout.addWidget(choose_btn)
-            cc_layout.addWidget(btns)
+            card_layout.addWidget(load_btn)
+            card_layout.addWidget(choose_btn)
 
             always_cb = QCheckBox('Always load without asking')
             always_cb.setStyleSheet(
@@ -826,7 +851,7 @@ class DashboardWidget(QWidget):
                 f'QCheckBox::indicator:unchecked {{ image: url("{_ICON_UNCHECKED}"); }}'
                 f'QCheckBox::indicator:checked   {{ image: url("{_ICON_CHECKED}");   }}'
             )
-            cc_layout.addWidget(always_cb, alignment=Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(always_cb, alignment=Qt.AlignmentFlag.AlignCenter)
 
             def _on_load():
                 self._settings.setValue('always_load_last', always_cb.isChecked())
@@ -837,6 +862,20 @@ class DashboardWidget(QWidget):
             load_btn.clicked.connect(_on_load)
             choose_btn.clicked.connect(self._on_select_library)
 
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet('background: #383838; border: none; max-height: 1px;')
+        card_layout.addWidget(sep)
+
+        backup_warning = QLabel('⚠  Beta build — back up your library before scanning.')
+        backup_warning.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        backup_warning.setWordWrap(True)
+        backup_warning.setStyleSheet(
+            'color: #a89b85; font-size: 11px; background: transparent; border: none;'
+        )
+        card_layout.addWidget(backup_warning)
+
+        layout.addWidget(welcome_card, alignment=Qt.AlignmentFlag.AlignCenter)
         return w
 
     # ── Scanning screen (state 1) ─────────────────────────────────────
@@ -896,8 +935,8 @@ class DashboardWidget(QWidget):
     _PANEL    = '#2F2F2F'
     _SEP      = '#383838'
     _CREAM    = '#f1e3c8'
-    _MUTED    = '#888888'
-    _VMUTED   = '#555555'
+    _MUTED    = '#a89b85'
+    _VMUTED   = '#a89b85'
     _ORANGE   = '#D17D34'
     _TEAL     = '#428175'
     _ROW_ALT  = '#222222'
@@ -918,6 +957,8 @@ class DashboardWidget(QWidget):
             layout.addWidget(self._build_sync_warning_banner())
 
         layout.addWidget(self._build_stat_cards_section(summary, inv))
+        if self._dup_groups:
+            layout.addWidget(self._build_dup_banner())
         layout.addWidget(self._make_divider())
         layout.addWidget(self._build_action_cards_section())
         layout.addWidget(self._make_divider())
@@ -983,6 +1024,47 @@ class DashboardWidget(QWidget):
         QTimer.singleShot(460, lambda: cards[3].start_animation(1300))
 
         return outer
+
+    def _build_dup_banner(self) -> QFrame:
+        from cratesort.src.core.duplicate_detector import fmt_bytes
+        summary = self._dup_summary
+        n       = summary.total_groups if summary else len(self._dup_groups)
+        space   = fmt_bytes(summary.space_recoverable) if summary else ''
+
+        banner = QFrame()
+        banner.setStyleSheet(
+            'QFrame { background: #2a1a00; border: 1px solid #D17D34; border-radius: 8px; }'
+        )
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(20, 14, 20, 14)
+
+        txt_col = QVBoxLayout()
+        title = QLabel(f'{n:,} Potential Duplicate{"s" if n != 1 else ""} Found')
+        title.setStyleSheet('color: #D17D34; font-size: 14px; font-weight: 700; background: transparent;')
+        txt_col.addWidget(title)
+
+        sub_parts = []
+        if space:
+            sub_parts.append(f'{space} could be reclaimed')
+        sub_parts.append('Rinse your library before you classify.')
+        sub = QLabel('  ·  '.join(sub_parts))
+        sub.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent;')
+        txt_col.addWidget(sub)
+
+        row.addLayout(txt_col, stretch=1)
+
+        btn = QPushButton('Review Duplicates →')
+        btn.setFixedHeight(36)
+        btn.setStyleSheet(
+            'QPushButton { background: #D17D34; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 0 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background: #be6e2c; }'
+            'QPushButton:pressed { background: #aa5d21; }'
+        )
+        btn.clicked.connect(self.duplicates_requested.emit)
+        row.addWidget(btn)
+
+        return banner
 
     def _build_action_cards_section(self) -> QWidget:
         outer = QWidget()
@@ -1363,11 +1445,24 @@ class DashboardWidget(QWidget):
                 else:
                     save_checkpoint(serato_dir, self._current_crates)
 
+    def _run_duplicate_detection(self) -> None:
+        if not self._inventory:
+            return
+        try:
+            from cratesort.src.core.duplicate_detector import DuplicateDetector
+            groups, summary = DuplicateDetector().detect(self._inventory)
+            self._dup_groups  = groups
+            self._dup_summary = summary
+        except Exception:
+            self._dup_groups  = []
+            self._dup_summary = None
+
     def _show_dashboard(self) -> None:
         try:
             if self._scan_cancelled or self._summary is None:
                 return
             self._check_serato_sync()
+            self._run_duplicate_detection()
             self._populate_dashboard()
             self._stack.setCurrentIndex(2)
             self.scan_finished.emit()

@@ -30,11 +30,20 @@ A cross-platform desktop app (macOS-first, Python 3.x / PyQt6) that organizes a 
 
 **Tagline**: "Get your shit together."
 
+### The "Carfax" model — Pre-flight check
+
+CrateSort is not just a one-time cleaning utility. We position it as a routine pre-flight check (like a Carfax report) that DJs run before every single gig. By running a quick diagnostic scan against the local `checkpoint.json` before opening Serato, the DJ guarantees their library is fully aligned, there are no missing files ("holes"), and no scrambled crates. It shifts CrateSort from a transactional chore to a habitual safety routine.
+
 ### Why it exists — the wound
 
-Serato scrambles crates when a drive disconnects unsafely. Files with the same name get silently swapped into the wrong crates. There is no undo. Accidentally delete a crate — it's gone. No recovery except a backup. Files get corrupted references constantly. Third-party solutions charge too much and still don't respect the DJ's time.
+DJs carry their music on external drives and depend on laptop battery life. When a battery dies or a drive disconnects unsafely, macOS throws a "Disk Not Ejected Properly" warning. But the real trauma occurs when booting Serato next:
+- Crates are shuffled randomly throughout the crate tree.
+- Subcrates are scrambled or completely flattened.
+- Track paths get silently swapped. If two tracks share a song title (e.g. Tupac and the Beatles sharing a title or similar name), Serato's resolver crosses the streams and swaps them into the wrong crates.
 
-CrateSort was built to fix that. Every design and engineering decision flows from this origin. When something doesn't feel right, it's because it forgot where it came from.
+The files on disk are untouched, but the database references are scrambled. No warning or dialog is shown; the DJ only finds out mid-set when they load up a Wu-Tang track and out plays a Dorothy Ashby harp instrumental. There is no undo, no built-in recovery except backups, and third-party solutions are overpriced.
+
+CrateSort was built to fix that by keeping a rock-solid, local, session-scoped checkpoint of the crate structures so they can be restored with a single click after a crash. Every design and engineering decision flows from this origin. When something doesn't feel right, it's because it forgot where it came from.
 
 ### The five screens — each an independent job
 

@@ -19,7 +19,7 @@ from cratesort.src.core.classifier import ClassificationResult, Confidence
 from cratesort.src.core.file_organizer import (
     ExecutionResult, FileOrganizer, ReorganizationPlan,
 )
-from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm, _create_dialog_layout
 
 # ── Color constants (match CLAUDE-CS.md design language) ─────────────────────
 
@@ -338,28 +338,17 @@ class _OrganizeStatCard(QFrame):
 class _WarningsDetailDialog(_CrateSortDialog):
     def __init__(self, plan: ReorganizationPlan, parent=None):
         super().__init__(parent)
+        self._elastic = False
         self.setMinimumWidth(620)
-        self.setMinimumHeight(440)
+        self.setMinimumHeight(480)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+        # Use standard Red accent layout (warnings/conflicts)
+        layout = _create_dialog_layout(self, '#C75B5B')
 
-        container = QFrame()
-        container.setObjectName('warn_dlg_c')
-        container.setStyleSheet(
-            f'QFrame#warn_dlg_c {{ background-color: {_PANEL}; '
-            f'border: 1px solid #444444; border-radius: 12px; }}'
-        )
-        root.addWidget(container)
-
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(20, 20, 20, 16)
-        layout.setSpacing(12)
-
-        title_lbl = QLabel('Plan Warnings && Conflicts')
+        title_lbl = QLabel('Plan Warnings & Conflicts')
         title_lbl.setStyleSheet(
-            f'color: {_CREAM}; font-size: 15px; font-weight: 600; '
-            f'background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
         layout.addWidget(title_lbl)
 
@@ -404,15 +393,74 @@ class _WarningsDetailDialog(_CrateSortDialog):
 
         close_btn = QPushButton('Close')
         close_btn.setFixedWidth(100)
+        close_btn.setFixedHeight(36)
         close_btn.setStyleSheet(
             f'QPushButton {{ background-color: {_TEAL}; color: #ffffff; '
-            f'border: none; border-radius: 5px; padding: 7px 16px; '
+            f'border: none; border-radius: 6px; '
             f'font-size: 13px; font-weight: 600; }}'
             f'QPushButton:hover {{ background-color: #38706a; }}'
             f'QPushButton:pressed {{ background-color: #2d6358; }}'
         )
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+
+class _UnclassifiedWarningDialog(_CrateSortDialog):
+    def __init__(self, count: int, parent=None):
+        super().__init__(parent)
+        self._elastic = False
+        self.setMinimumWidth(480)
+
+        # Satsuma Orange accent for warning selection/confirm
+        layout = _create_dialog_layout(self, '#D17D34')
+
+        title_lbl = QLabel('Unclassified Tracks Detected')
+        title_lbl.setStyleSheet(
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+        )
+        layout.addWidget(title_lbl)
+        layout.addSpacing(6)
+
+        body = QLabel()
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setText(
+            f'<div style="line-height: 145%;">{count:,} track{"s" if count != 1 else ""} have no genre assignment '
+            f'and will be moved to an Unclassified folder in your Media directory. '
+            f'You can reclassify them later.</div>'
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet('color: #d5c7ad; font-size: 14px; background: transparent; border: none;')
+        layout.addWidget(body)
+        layout.addSpacing(12)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+
+        go_back_btn = QPushButton('Go Back to Library')
+        go_back_btn.setFixedHeight(36)
+        go_back_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
+        )
+        go_back_btn.clicked.connect(self.reject)
+
+        proceed_btn = QPushButton('Proceed')
+        proceed_btn.setFixedHeight(36)
+        proceed_btn.setStyleSheet(
+            'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #be6e2c; }'
+            'QPushButton:pressed { background-color: #aa5d21; }'
+        )
+        proceed_btn.clicked.connect(self.accept)
+
+        btn_row.addWidget(go_back_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(proceed_btn)
+        layout.addLayout(btn_row)
 
 
 # ---------------------------------------------------------------------------
@@ -451,8 +499,10 @@ class OrganizeView(QWidget):
         self._exec_worker: Optional[_ExecutionWorker] = None
         self._rb_worker:   Optional[_RollbackWorker]  = None
 
-        # Session plan cache — survives tab switches and cancel; cleared on execute/rollback
-        self._cached_plan: Optional[ReorganizationPlan] = None
+        # Session plan cache — survives tab switches; cleared on execute/rollback or when
+        # library_edits.json is modified after the plan was built.
+        self._cached_plan:       Optional[ReorganizationPlan] = None
+        self._cached_plan_mtime: Optional[float]              = None
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -474,9 +524,17 @@ class OrganizeView(QWidget):
         Restores the Preview screen if a plan was built this session and the
         library hasn't changed; otherwise shows the gate screen with history.
         """
-        # Invalidate the cache if a different library is being loaded
-        if self._cached_plan is not None and self._cached_plan.library_root != library_path:
-            self._cached_plan = None
+        # Invalidate the cache if a different library is loaded or edits have changed since plan was built
+        if self._cached_plan is not None:
+            if self._cached_plan.library_root != library_path:
+                self._cached_plan = None
+                self._cached_plan_mtime = None
+            else:
+                edits_file = library_path / '_CrateSort' / 'library_edits.json'
+                current_mtime = edits_file.stat().st_mtime if edits_file.exists() else None
+                if current_mtime != self._cached_plan_mtime:
+                    self._cached_plan = None
+                    self._cached_plan_mtime = None
 
         self._inventory    = inventory
         self._library_path = library_path
@@ -683,56 +741,7 @@ class OrganizeView(QWidget):
 
     def _warn_unclassified(self, count: int) -> bool:
         """Show warning dialog for unclassified tracks. Returns True to proceed."""
-        from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout, QPushButton
-        dlg = QDialog(self)
-        dlg.setWindowTitle('Unclassified Tracks Detected')
-        dlg.setMinimumWidth(440)
-        dlg.setStyleSheet(f'QDialog {{ background-color: {_BG}; }}')
-
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(24, 20, 24, 16)
-        layout.setSpacing(12)
-
-        title_lbl = QLabel('Unclassified Tracks Detected')
-        title_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 15px; font-weight: 600;')
-        layout.addWidget(title_lbl)
-
-        body = QLabel(
-            f'{count:,} track{"s" if count != 1 else ""} have no genre assignment '
-            f'and will be moved to an Unclassified folder in your Media directory. '
-            f'You can reclassify them later.'
-        )
-        body.setWordWrap(True)
-        body.setStyleSheet(f'color: {_MUTED}; font-size: 13px;')
-        layout.addWidget(body)
-        layout.addSpacing(8)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        go_back_btn = QPushButton('Go Back to Library')
-        go_back_btn.setStyleSheet(
-            f'QPushButton {{ background-color: {_DANGER}; color: #ffffff; border: none; '
-            f'border-radius: 5px; padding: 7px 16px; font-size: 13px; font-weight: 600; }}'
-            f'QPushButton:hover {{ background-color: #b24c4c; }}'
-            f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
-        )
-        go_back_btn.clicked.connect(dlg.reject)
-
-        proceed_btn = QPushButton('Proceed')
-        proceed_btn.setStyleSheet(
-            f'QPushButton {{ background-color: {_TEAL}; color: #ffffff; border: none; '
-            f'border-radius: 5px; padding: 7px 16px; font-size: 13px; font-weight: 600; }}'
-            f'QPushButton:hover {{ background-color: #38706a; }}'
-            f'QPushButton:pressed {{ background-color: #2d6358; }}'
-        )
-        proceed_btn.clicked.connect(dlg.accept)
-
-        btn_row.addWidget(go_back_btn)
-        btn_row.addStretch()
-        btn_row.addWidget(proceed_btn)
-        layout.addLayout(btn_row)
-
+        dlg = _UnclassifiedWarningDialog(count, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.navigate_to_library.emit()
             return False
@@ -1078,7 +1087,7 @@ class OrganizeView(QWidget):
             f'font-size: 13px; font-weight: 600; min-height: 28px; }}'
             f'QPushButton:hover {{ background-color: #b24c4c; }}'
             f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
-            f'QPushButton:disabled {{ background-color: #3a3a3a; color: #666666; }}'
+            f'QPushButton:disabled {{ background-color: #3a3a3a; color: #a89b85; }}'
         )
         self._rollback_btn.clicked.connect(self._on_rollback_requested)
         layout.addWidget(self._rollback_btn, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -1107,6 +1116,8 @@ class OrganizeView(QWidget):
     def _on_plan_ready(self, plan: ReorganizationPlan) -> None:
         self._plan        = plan
         self._cached_plan = plan
+        edits_file = (self._library_path / '_CrateSort' / 'library_edits.json') if self._library_path else None
+        self._cached_plan_mtime = edits_file.stat().st_mtime if edits_file and edits_file.exists() else None
         self._populate_preview(plan)
         self._stack.setCurrentIndex(_STATE_PREVIEW)
         self.status_message.emit(
@@ -1189,7 +1200,7 @@ class OrganizeView(QWidget):
         )
 
     def _on_exec_finished(self, result: ExecutionResult) -> None:
-        self._cached_plan = None   # plan consumed — force re-plan on next visit
+        self._cached_plan = None; self._cached_plan_mtime = None   # plan consumed — force re-plan on next visit
         self._exec_result = result
         self._rollback_log_path = result.rollback_log_path
         moved   = len(result.completed)
@@ -1221,7 +1232,7 @@ class OrganizeView(QWidget):
         )
 
     def _on_exec_error(self, message: str) -> None:
-        self._cached_plan = None   # execution failed — state is uncertain, require re-plan
+        self._cached_plan = None; self._cached_plan_mtime = None   # execution failed — state is uncertain, require re-plan
         self.status_message.emit('Execution failed.', 'error')
         _ov_alert(self, 'Execution Error', f'Reorganization failed:\n\n{message[:400]}')
         self._stack.setCurrentIndex(_STATE_PREVIEW)
@@ -1279,7 +1290,7 @@ class OrganizeView(QWidget):
         self._rb_worker.start()
 
     def _on_rollback_finished(self, result: dict) -> None:
-        self._cached_plan = None   # library state changed — plan no longer valid
+        self._cached_plan = None; self._cached_plan_mtime = None   # library state changed — plan no longer valid
         restored = result.get('restored', 0)
         failed   = result.get('failed', 0)
         self._done_label.setText('Rollback complete.')

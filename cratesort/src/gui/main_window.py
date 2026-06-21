@@ -26,6 +26,7 @@ from cratesort.src.gui.library_browser import LibraryBrowserView
 from cratesort.src.gui.crate_manager import CrateManagerView
 from cratesort.src.gui.organize_view import OrganizeView
 from cratesort.src.gui.settings_view import SettingsView
+from cratesort.src.gui.duplicate_review_view import DuplicateReviewView
 from cratesort.src.utils.undo_manager import UndoManager
 
 _ASSETS = Path(__file__).parent.parent.parent / 'assets'
@@ -128,6 +129,7 @@ class MainWindow(QMainWindow):
         self._dashboard.new_crate_requested.connect(self._on_new_crate_requested)
         self._dashboard.new_smart_crate_requested.connect(self._on_new_smart_crate_requested)
         self._dashboard.scan_finished.connect(self._on_scan_finished)
+        self._dashboard.duplicates_requested.connect(self._on_duplicates_requested)
         self._content.addWidget(self._dashboard)
 
         # Library Browser — index 1
@@ -155,6 +157,11 @@ class MainWindow(QMainWindow):
         self._settings_view.library_changed.connect(self._on_library_changed_from_settings)
         self._settings_view.repair_requested.connect(self._on_repair_crate_paths)
         self._content.addWidget(self._settings_view)
+
+        # Duplicate Review — index 5 (not a nav item; launched from dashboard banner)
+        self._duplicate_review = DuplicateReviewView()
+        self._duplicate_review.done.connect(lambda: self._content.setCurrentIndex(0))
+        self._content.addWidget(self._duplicate_review)
 
         root.addWidget(self._content)
 
@@ -548,6 +555,18 @@ class MainWindow(QMainWindow):
             self._show_sync_warning()
             return
         self._on_nav_by_id('organize')
+
+    def _on_duplicates_requested(self) -> None:
+        groups  = self._dashboard._dup_groups
+        summary = self._dashboard._dup_summary
+        lib     = self._dashboard._library_path
+        if not groups or not lib:
+            return
+        serato_dir = lib / '_Serato_'
+        if not serato_dir.exists():
+            return
+        self._duplicate_review.load(groups, summary, lib, serato_dir)
+        self._content.setCurrentIndex(5)
 
     def _on_library_changed_from_settings(self, path: Path) -> None:
         self._on_library_changed(path)

@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from cratesort.src.core.classifier import PARENT_GENRES
-from cratesort.src.gui.overlays import _CrateSortDialog
+from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
 
 # Regex: detect collaboration patterns in artist fields (feat., ft., &, vs., comma-not-sort)
 _COLLAB_RE = re.compile(
@@ -525,31 +525,25 @@ class _ClassifyWorker(QThread):
 class _ChangeGenreDialog(_CrateSortDialog):
     def __init__(self, artist: str, current_genre: str, parent=None):
         super().__init__(parent)
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(480)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        container = QFrame()
-        container.setObjectName('cgd_c')
-        container.setStyleSheet(
-            'QFrame#cgd_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
-        )
-        root.addWidget(container)
-
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(20, 20, 20, 16)
-        layout.setSpacing(12)
+        # Use standard Teal accent layout (safe action/selection)
+        layout = _create_dialog_layout(self, '#428175')
 
         headline = QLabel('Change Genre')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
         layout.addWidget(headline)
+        layout.addSpacing(6)
 
-        sub = QLabel(f'Select genre for <b>{artist}</b>:')
-        sub.setStyleSheet('color: #a89b85; font-size: 13px; background: transparent; border: none;')
+        sub = QLabel()
+        sub.setTextFormat(Qt.TextFormat.RichText)
+        sub.setText(f'<div style="line-height: 145%;">Select genre for <b>{artist}</b>:</div>')
+        sub.setStyleSheet('color: #d5c7ad; font-size: 14px; background: transparent; border: none;')
         layout.addWidget(sub)
+        layout.addSpacing(4)
 
         self._combo = QComboBox()
         self._combo.setStyleSheet(
@@ -562,20 +556,21 @@ class _ChangeGenreDialog(_CrateSortDialog):
         layout.addWidget(self._combo)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        btn_row.setSpacing(12)
         cancel_btn = QPushButton('Cancel')
         cancel_btn.setFixedHeight(36)
         cancel_btn.setStyleSheet(
-            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
-            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel_btn.clicked.connect(self.reject)
         ok_btn = QPushButton('Apply')
         ok_btn.setFixedHeight(36)
         ok_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
@@ -601,31 +596,25 @@ class _ChangeGenreDialog(_CrateSortDialog):
 class _ReassignArtistDialog(_CrateSortDialog):
     def __init__(self, existing_artists: list[str], parent=None):
         super().__init__(parent)
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(480)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        container = QFrame()
-        container.setObjectName('rad_c')
-        container.setStyleSheet(
-            'QFrame#rad_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
-        )
-        root.addWidget(container)
-
-        layout = QVBoxLayout(container)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 16)
+        # Use standard Teal accent layout (safe action/selection)
+        layout = _create_dialog_layout(self, '#428175')
 
         headline = QLabel('Reassign Artist')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
         layout.addWidget(headline)
+        layout.addSpacing(6)
 
-        prompt_lbl = QLabel('Enter or select an artist name:')
-        prompt_lbl.setStyleSheet('color: #a89b85; font-size: 13px; background: transparent; border: none;')
+        prompt_lbl = QLabel()
+        prompt_lbl.setTextFormat(Qt.TextFormat.RichText)
+        prompt_lbl.setText('<div style="line-height: 145%;">Enter or select an artist name:</div>')
+        prompt_lbl.setStyleSheet('color: #d5c7ad; font-size: 14px; background: transparent; border: none;')
         layout.addWidget(prompt_lbl)
+        layout.addSpacing(4)
 
         self._edit = QLineEdit()
         self._edit.setPlaceholderText('Start typing…')
@@ -649,20 +638,21 @@ class _ReassignArtistDialog(_CrateSortDialog):
         layout.addWidget(note)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        btn_row.setSpacing(12)
         cancel_btn = QPushButton('Cancel')
         cancel_btn.setFixedHeight(36)
         cancel_btn.setStyleSheet(
-            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
-            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel_btn.clicked.connect(self.reject)
         ok_btn = QPushButton('Reassign')
         ok_btn.setFixedHeight(36)
         ok_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
@@ -685,39 +675,39 @@ class _EditTagsDialog(_CrateSortDialog):
     def __init__(self, track: TrackInfo, parent=None):
         super().__init__(parent)
         self._track = track
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(480)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        container = QFrame()
-        container.setObjectName('etd_c')
-        container.setStyleSheet(
-            'QFrame#etd_c { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
-        )
-        root.addWidget(container)
-
-        layout = QVBoxLayout(container)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 16)
+        # Use standard Teal accent layout (safe action/tagging)
+        layout = _create_dialog_layout(self, '#428175')
 
         headline = QLabel('Edit Style Tags')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 15px; font-weight: 600; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
         layout.addWidget(headline)
+        layout.addSpacing(6)
 
-        track_lbl = QLabel(f'<b>{track.title or track.filename}</b>')
-        track_lbl.setStyleSheet('color: #f1e3c8; font-size: 13px; background: transparent; border: none;')
+        track_lbl = QLabel()
+        track_lbl.setTextFormat(Qt.TextFormat.RichText)
+        track_lbl.setText(f'<div style="line-height: 145%;"><b>{track.title or track.filename}</b></div>')
+        track_lbl.setStyleSheet('color: #f1e3c8; font-size: 14px; background: transparent; border: none;')
         layout.addWidget(track_lbl)
+        layout.addSpacing(4)
 
-        info = QLabel(f'Current genre tag: {track.genre_tag or "(none)"}')
+        info = QLabel()
+        info.setTextFormat(Qt.TextFormat.RichText)
+        info.setText(f'<div style="line-height: 145%;">Current genre tag: {track.genre_tag or "(none)"}</div>')
         info.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
         layout.addWidget(info)
+        layout.addSpacing(4)
 
-        tags_lbl = QLabel('Style tags (comma-separated):')
-        tags_lbl.setStyleSheet('color: #a89b85; font-size: 13px; background: transparent; border: none;')
+        tags_lbl = QLabel()
+        tags_lbl.setTextFormat(Qt.TextFormat.RichText)
+        tags_lbl.setText('<div style="line-height: 145%;">Style tags (comma-separated):</div>')
+        tags_lbl.setStyleSheet('color: #d5c7ad; font-size: 13px; background: transparent; border: none;')
         layout.addWidget(tags_lbl)
+        layout.addSpacing(4)
 
         self._tags_edit = QLineEdit(', '.join(track.tags))
         self._tags_edit.setPlaceholderText('e.g. Boom Bap, Jazzy Hip-Hop')
@@ -733,20 +723,21 @@ class _EditTagsDialog(_CrateSortDialog):
         layout.addWidget(note)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        btn_row.setSpacing(12)
         cancel_btn = QPushButton('Cancel')
         cancel_btn.setFixedHeight(36)
         cancel_btn.setStyleSheet(
-            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #555; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; }'
-            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; }'
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel_btn.clicked.connect(self.reject)
         ok_btn = QPushButton('Save Tags')
         ok_btn.setFixedHeight(36)
         ok_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
@@ -1154,7 +1145,7 @@ class _ClassifierViewLegacy(QWidget):
             # DJ Tools entries get a distinct tint
             if entry.artist == DJ_TOOLS_LABEL:
                 for col in range(8):
-                    item.setForeground(col, QBrush(QColor('#888888')))
+                    item.setForeground(col, QBrush(QColor('#a89b85')))
 
             # Track children
             for track in entry.tracks:

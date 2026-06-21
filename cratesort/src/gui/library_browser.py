@@ -9,7 +9,7 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QByteArray, QEvent, QRect, QSettings, QSize, QTimer, pyqtSignal
 
-from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert
+from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _create_dialog_layout
 from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
 
 try:
@@ -247,14 +247,14 @@ class GenreSidebarDelegate(QStyledItemDelegate):
         elif is_uc:
             name_color = '#C75B5B'
         else:
-            name_color = '#aaa'
+            name_color = '#a89b85'
 
         if is_uc:
             sub_color = '#C75B5B'
         elif is_sel:
             sub_color = '#a07850'
         else:
-            sub_color = '#666'
+            sub_color = '#a89b85'
 
         left_pad  = 14
         right_pad = 10
@@ -296,49 +296,38 @@ class GenreSidebarDelegate(QStyledItemDelegate):
 class _UnsavedChangesDialog(_CrateSortDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumWidth(440)
+        self._elastic = False
+        self.setMinimumWidth(480)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        container = QFrame()
-        container.setObjectName('unsaved_container')
-        container.setStyleSheet(
-            'QFrame#unsaved_container { background-color: #2F2F2F; '
-            'border: 1px solid #444444; border-radius: 12px; }'
-        )
-        root.addWidget(container)
-
-        inner = QVBoxLayout(container)
-        inner.setContentsMargins(24, 20, 24, 16)
-        inner.setSpacing(10)
+        # Use standard Red accent layout (warning/danger/discard)
+        layout = _create_dialog_layout(self, '#C75B5B')
 
         headline = QLabel('Unsaved Classification Changes')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 15px; font-weight: 600; '
-            'background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
-        inner.addWidget(headline)
+        layout.addWidget(headline)
+        layout.addSpacing(6)
 
-        body = QLabel(
-            'You have unsaved changes in Classify mode. '
-            'If you leave now, your corrections will be lost.'
-        )
+        body = QLabel()
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setText('<div style="line-height: 145%;">You have unsaved changes in Classify mode. If you leave now, your corrections will be lost.</div>')
         body.setWordWrap(True)
         body.setStyleSheet(
-            'color: #a89b85; font-size: 13px; background: transparent; border: none;'
+            'color: #d5c7ad; font-size: 14px; background: transparent; border: none;'
         )
-        inner.addWidget(body)
-        inner.addSpacing(4)
+        layout.addWidget(body)
+        layout.addSpacing(12)
 
         btns = QHBoxLayout()
-        btns.setSpacing(10)
+        btns.setSpacing(12)
 
         leave_btn = QPushButton('Leave Anyway')
         leave_btn.setFixedHeight(36)
         leave_btn.setStyleSheet(
-            'QPushButton { background: #C75B5B; color: #f1e3c8; border: none; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton { background: #C75B5B; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background: #b24c4c; }'
             'QPushButton:pressed { background: #9c3b3b; }'
         )
@@ -347,17 +336,17 @@ class _UnsavedChangesDialog(_CrateSortDialog):
         stay_btn = QPushButton('Stay and Finish')
         stay_btn.setFixedHeight(36)
         stay_btn.setStyleSheet(
-            'QPushButton { background: #428175; color: #f1e3c8; border: none; '
-            'border-radius: 5px; padding: 8px 18px; font-size: 13px; font-weight: 600; }'
-            'QPushButton:hover { background: #38706a; }'
-            'QPushButton:pressed { background: #2d6358; }'
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
         )
         stay_btn.clicked.connect(self.reject)
 
         btns.addWidget(leave_btn)
         btns.addStretch()
         btns.addWidget(stay_btn)
-        inner.addLayout(btns)
+        layout.addLayout(btns)
 
 # ---------------------------------------------------------------------------
 # _AnimatedStatCardWidget — count-up stat card for the Analyze Library modal
@@ -433,39 +422,30 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(520, 280)
+        self.setFixedSize(520, 320)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-
-        container = QFrame()
-        container.setObjectName('modal_container')
-        container.setStyleSheet(
-            'QFrame#modal_container { background-color: #2F2F2F; '
-            'border: 1px solid #444444; border-radius: 12px; }'
-        )
-        root.addWidget(container)
-
-        inner = QVBoxLayout(container)
-        inner.setContentsMargins(28, 24, 28, 20)
-        inner.setSpacing(14)
+        # Use standard Teal accent layout (safe action/progress)
+        layout = _create_dialog_layout(self, '#428175')
 
         headline = QLabel('Analyzing Library')
-        headline.setProperty('role', 'heading')
         headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 16px; font-weight: 600; '
-            'background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
+            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
         )
-        inner.addWidget(headline)
+        layout.addWidget(headline)
+        layout.addSpacing(6)
 
-        subtitle = QLabel('Analyzing your DJ library and media files – validating artists and genres...')
-        subtitle.setProperty('role', 'muted')
+        subtitle = QLabel()
+        subtitle.setTextFormat(Qt.TextFormat.RichText)
+        subtitle.setText('<div style="line-height: 145%; text-align: center;">Analyzing your DJ library and media files – validating artists and genres...</div>')
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet(
-            'color: #a89b85; font-size: 12px; background: transparent; border: none;'
+            'color: #d5c7ad; font-size: 13px; background: transparent; border: none;'
         )
-        inner.addWidget(subtitle)
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+        layout.addSpacing(8)
 
         # Stat cards row
         cards_row = QHBoxLayout()
@@ -476,7 +456,7 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
         cards_row.addWidget(self._card_tracks)
         cards_row.addWidget(self._card_artists)
         cards_row.addWidget(self._card_fixes)
-        inner.addLayout(cards_row)
+        layout.addLayout(cards_row)
 
         # Action stack — fixed height keeps modal dimensions stable on transition
         self._action_stack = QStackedWidget()
@@ -506,11 +486,10 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._review_btn = QPushButton('Review Results')
-        self._review_btn.setProperty('secondary', True)
         self._review_btn.setFixedSize(180, 36)
         self._review_btn.setStyleSheet(
-            'QPushButton { background-color: #428175; color: #f1e3c8; '
-            'border: none; border-radius: 5px; font-size: 13px; font-weight: 600; }'
+            'QPushButton { background-color: #428175; color: #ffffff; '
+            'border: none; border-radius: 6px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
@@ -518,7 +497,7 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
         btn_layout.addWidget(self._review_btn)
         self._action_stack.addWidget(btn_wrapper)  # index 1
 
-        inner.addWidget(self._action_stack)
+        layout.addWidget(self._action_stack)
 
     def update_stats(self, tracks_count: int, artists_count: int) -> None:
         self._card_tracks.update_target(tracks_count)
@@ -867,7 +846,7 @@ class LibraryBrowserView(QWidget):
         layout.setContentsMargins(40, 40, 40, 40)
 
         icon_lbl = QLabel('♪')
-        icon_lbl.setStyleSheet('font-size: 48px; color: #333; background: transparent;')
+        icon_lbl.setStyleSheet('font-size: 48px; color: #a89b85; background: transparent;')
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(icon_lbl)
 
@@ -883,7 +862,7 @@ class LibraryBrowserView(QWidget):
             'Hit Classify Library to assign genres, clean up filenames, '
             'and get your library organized.'
         )
-        subline.setStyleSheet('font-size: 12px; color: #666; background: transparent;')
+        subline.setStyleSheet('font-size: 12px; color: #a89b85; background: transparent;')
         subline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subline.setWordWrap(True)
         subline.setMaximumWidth(380)
@@ -950,7 +929,7 @@ class LibraryBrowserView(QWidget):
 
         header = QLabel('GENRES')
         header.setStyleSheet(
-            'color: #555; font-size: 9px; letter-spacing: 1px; '
+            'color: #a89b85; font-size: 9px; letter-spacing: 1px; '
             'padding: 12px 14px 8px; background: transparent; border: none;'
         )
         layout.addWidget(header)
@@ -2197,7 +2176,7 @@ class LibraryBrowserView(QWidget):
                 'MEDIUM':  '#9fa4c7',
                 'LOW':     '#D17D34',
                 'NONE':    '#C75B5B',
-            }.get(confidence, '#aaa')
+            }.get(confidence, '#a89b85')
             item.setForeground(LC_CLS_CONF, QBrush(QColor(conf_color)))
 
             # Status
@@ -2300,8 +2279,10 @@ class LibraryBrowserView(QWidget):
         if _last_accept_artist:
             self._last_edited_artist  = _last_accept_artist
             self._last_assigned_genre = _last_accept_genre
+
         self._exit_classify_mode_cancel()
-        self._populate_genre_sidebar()
+        if self._inventory and self._library_path:
+            self.load(self._inventory, self._library_path)
 
         if disk_failures:
             n = self._tree.topLevelItemCount()

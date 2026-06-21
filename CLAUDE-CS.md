@@ -789,13 +789,24 @@ Covers inline track metadata edits (title, album, tags, BPM, year, comment) made
 - **`write_file_metadata()` never raises** — any call site in `library_browser.py` that does not check the return value is a bug. Always check the bool and handle failure by reverting the UI or showing a count-label warning.
 - **`library_edits.json` staging is not replaced by disk writes** — both happen. The JSON staging is the Organize fallback; the disk write delivers immediate free-tier value. They are never mutually exclusive.
 - **`_looks_like_sort_form()` uses an explicit allowlist** — it does NOT use a heuristic. Only `{'the', 'a', 'an', 'jr', 'sr', 'jr.', 'sr.', 'ii', 'iii', 'iv'}` trigger sort-form treatment. Any new suffix must be added to the allowlist explicitly.
-- **Organize plan cache** — `_cached_plan` survives Cancel and tab switches. It is cleared only on execute, rollback, or library change. Do not clear it in `_on_cancel_preview`.
+- **Organize plan cache** — `_cached_plan` in `OrganizeView` is stored alongside `_cached_plan_mtime` (mtime of `library_edits.json` at plan-build time). On `load()`, if the edits file mtime has changed since the plan was built, the cache is invalidated. Also cleared on execute complete/fail, rollback, library change. Never cleared on cancel or tab switch.
 - **Collision suffix format** — destination filename collisions in `build_plan()` are resolved with ` (N)` suffix (space before paren, integer ≥ 2). Do not use underscores, hyphens, or other separators.
 - **`_looks_like_sort_form()` allowlist** — the sort-form heuristic in `classifier_view.py` uses `_SORT_FORM_PARTICLES = {'the', 'a', 'an', 'jr', 'sr', 'jr.', 'sr.', 'ii', 'iii', 'iv'}`. Only particles in this allowlist trigger sort-form treatment. Single-word collaboration names (e.g. "Outlaws") must never be treated as sort-forms. Do not remove or loosen this allowlist without explicit approval.
 - **`_build_destination()` sibling rule** — when `use_subfolders=True` and `artist != winner`, the variant folder must be placed as a sibling under `genre_folder`, never nested inside the winner folder. The winner folder segment must not appear in the variant's destination path.
 - **Destination collision handling** — `build_plan()` must detect destination filename conflicts and resolve them with sequential number suffixes (` (2)`, ` (3)`) before returning the plan. Every operation in the returned plan must have a unique destination path. `execute()` must never silently skip a file — any skip must be logged to the rollback log with `reason='destination_exists_hash_mismatch'`.
-- **`_cached_plan` in `OrganizeView`** — the plan built by `_PlanWorker` is stored as `self._cached_plan` and restored on `load()` if the library root matches. It must be cleared on execute complete, execute error, rollback, and library change. It must NOT be cleared on cancel or tab switch. Never remove this persistence without replacing it — forcing users to re-plan on every visit breaks the testing and real-world workflow.
 - **`write_file_metadata()` is the free tier write path** — this public function in `file_organizer.py` is the single entry point for immediate metadata writes to disk. It must never raise — always catch, log, return bool. Failed writes must never appear as successful edits in the UI. `library_edits.json` writes still happen alongside disk writes — they are not mutually exclusive. Style tags remain virtual/deferred and must not be written to disk by this function.
+- **Accept Reclassifications refresh** — `_exit_classify_mode_accept()` must call `self.load(self._inventory, self._library_path)` after `_exit_classify_mode_cancel()` to fully rebuild session_genre, edits dict, and the artist tree. Partial rebuilds (_rebuild_tree alone, _load_edits alone) are insufficient because self._session_genre is not updated by those paths.
+- **Crates tab async loading** — `_CrateLoadWorker(QThread)` in `crate_manager.py` handles all track data resolution off the main thread. `_track_content_stack` shows the loading overlay (index 1) during load; switches back to table (index 0) on `finished`. Progress bar is always determinate — `progress(done, total, label)` emitted per track. No spinners. Ever. `_start_load_worker()` cancels any running worker before starting a new one.
+- **Crate name validation** — `_validate_crate_name(name)` blocks `/`, `\`, `%` in all name-entry paths (New Crate, New Subcrate, Rename). Must be called before any `CrateWriter` call. Returns error string or None.
+- **Export Crate to Folder** — `_ExportCrateWorker` in `crate_manager.py` exports recursively, preserving subcrate hierarchy. Subcrate folders are prefixed with `_` (sorts above artist folders). `_count_export_tracks(crate_path)` counts recursively for accurate progress total. Pre-export confirmation dialog shown when crate has children. Filename collisions: `stem_2.ext`, `stem_3.ext`. Album art writes (`_write_album_art`, `_remove_album_art`) use `audio.save()` directly — this is a legitimate exemption from `write_file_metadata()` since they handle binary image data, not text metadata fields.
+- **No spinners** — any loading state must use a determinate `QProgressBar` with `setRange(0, N)` + `setValue(done)`. `setRange(0, 0)` (indeterminate) is forbidden. Workers must emit `progress(int, int, str)` per item.
+- **Color palette** — border color is `#444444` (never `#555555`). Muted text is `#a89b85` (never `#888`, `#666`, `#aaa`, `#555`, `#333`). All interactive elements must have hover states. These are enforced by Brandy (`/brandy`) and Annie (`/annie`).
+- **Agent skills** — Brandy, Dez, Draper, and Annie are live local slash-command agents in `.claude/skills/`. Invoke with `/brandy`, `/dez`, `/draper`, `/annie`. Requires Claude Code restart to pick up after initial creation. AL and Cody are live A2A agents on Arora MCP.
+- **Duplicate detection architecture** — `DuplicateDetector` in `duplicate_detector.py` classifies groups as `tier='true_duplicate'` (duration ±1s, bitrate ±32kbps, no variant keywords) or `tier='variant'` (remix/extended keywords, or spread exceeds thresholds). Winner scoring: `(crate_count, play_count, bitrate, meta_completeness, has_comment, has_stems)`. Detection runs synchronously in `DashboardWidget._show_dashboard()` after scan — pure Python, no I/O. `build_crate_count_map(crate_library)` builds the crate presence map. Pass it into `DuplicateDetector().detect(inventory, crate_count_map)`.
+- **Duplicate consolidation** — `DuplicateConsolidator` in `duplicate_consolidator.py`. Critical order: `PathRewriter.rewrite()` (reroute all crate references) MUST complete before any loser file is deleted. Never delete first and reroute second. Logs to `RollbackLog` with `duplicate=True` for special rollback handling. SHA256 checksums on each deleted file.
+- **Duplicate review flow** — `DuplicateReviewView` at `main_window._content` index 5. Not a nav item. Launched via `_on_duplicates_requested()` from dashboard. `done` signal returns to index 0 (dashboard). Dashboard shows orange `_build_dup_banner()` when `self._dup_groups` is non-empty after scan.
+- **The Rinse** — duplicate review must happen before classification. If user classifies before rinsing, they may assign different genres to copies of the same song, creating a metadata conflict on consolidation. Dashboard banner enforces this order by surfacing duplicates immediately after scan.
+- **Design with intent** — every feature must leave the library better than it was found. Duplicate detection doesn't just flag — it consolidates, reroutes crates, and preserves the DJ's history (play counts, cue points, comments) in the winner file. Phase C Full (deferred): `database_writer.py` for writing merged Serato metadata back to database V2.
 
 ---
 
@@ -1355,7 +1366,14 @@ Not "does it follow the rules." Not "is it technically correct." Does it belong 
 
 CrateSort didn't start as a product idea. It started as frustration.
 
-A hard drive disconnects from Serato without being safely ejected. On the next launch, crates are scrambled. Files that share the same song title — same name, different artist — get silently swapped into the wrong crates. No alert. No warning. No indication that anything went wrong. You only find out when you're at the gig.
+Most DJs carry their media on an external hard drive and rely on their laptop battery. When that battery dies, or the media drive is unexpectedly disconnected, macOS penalizes you with the dreaded "Disk Not Ejected Properly" warning. But the real trauma happens when you boot up Serato again.
+
+Because the drive disconnected mid-session, Serato's database gets its streams crossed:
+- Crates are shuffled randomly throughout the crate tree.
+- Nested subcrates are completely reorganized or flattened (e.g., expanding `Hip-Hop` -> `Best Of` -> `Tupac` only to find the subcrates scrambled).
+- Track paths get silently swapped. If two tracks share a song title (e.g., a Tupac track and a Beatles track with matching or similar titles), Serato's resolver crosses the streams. It will swap the Beatles song into the Tupac crate and vice-versa. 
+
+The files on disk are completely untouched, but the database references are scrambled. No warning, no dialog, no alert. You only find out mid-set when you're rocking a gig, load up Method Man, hit play, and out comes a Dorothy Ashby harp instrumental.
 
 You accidentally hover over a crate instead of a track and hit delete. The crate is gone. No undo. No recovery except restoring a backup — if you have one, if it's recent enough, if the crate was in it.
 
@@ -1386,6 +1404,17 @@ A library management tool for working DJs. Not a performance tool. Not a streami
 **Organize** — the big move. Only when the DJ is ready. Takes all the classification and metadata work and physically restructures the drive: Genre/Artist/Track hierarchy, clean filenames, Serato crate paths updated automatically. Full rollback available even after the app is closed. This is the most consequential action in the app and it should feel like it — weighty, deliberate, and completely reversible.
 
 **Nav order is locked:** Dashboard → Classification → Library → Crates → Organize → Settings. Organize stays at the end. It is a destination, not a routine step. The Dashboard action cards (01/02/03) provide the guided journey nudge without forcing the order on anyone.
+
+---
+
+## The "Carfax" model — Pre-flight gig verification
+
+CrateSort is designed to be utilized as a routine pre-flight check, not just a one-time library organization chore. While a DJ might use CrateSort to execute physical directory restructures or metadata edits, the recurring loop is safety: **before every gig, you run your library through CrateSort before firing up Serato.**
+
+This positioning establishes the app as a diagnostic scanner for your music library:
+- **Zero Unknowns**: The startup scan checks the current state of files and crates against the local `checkpoint.json`. It acts as a history report (like a Carfax) showing exactly what changed, what drifted, and what needs attention.
+- **Pre-flight Guarantee**: Running CrateSort before a gig guarantees that you will not load your library in the booth only to find broken file references ("holes") or scrambled subcrates. It verifies the database is fully aligned with what's actually on the drive.
+- **Habitual Utility**: This changes CrateSort from a transactional utility (run once and close) to a habitual utility (run before every gig for peace of mind).
 
 ---
 
