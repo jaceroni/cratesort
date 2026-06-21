@@ -527,10 +527,11 @@ class LibraryBrowserView(QWidget):
     """
 
     # Emitted when a track is selected (for album art panel)
-    track_selected   = pyqtSignal(str)   # file path
-    album_art_requested = pyqtSignal(str)
+    track_selected       = pyqtSignal(str)   # file path
+    album_art_requested  = pyqtSignal(str)
+    add_tracks_requested = pyqtSignal()      # open library folder for adding files
     # Emitted after an inline edit is committed (file_path, field, new_value)
-    track_field_changed = pyqtSignal(str, str, str)
+    track_field_changed  = pyqtSignal(str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -818,6 +819,18 @@ class LibraryBrowserView(QWidget):
         row.addWidget(self._format_cb)
 
         row.addStretch()
+
+        add_tracks_btn = QPushButton('Add Tracks to Library')
+        add_tracks_btn.setStyleSheet(
+            'QPushButton { background-color: transparent; color: #a89b85; '
+            'font-size: 11px; font-weight: 500; border: 1px solid #444444; border-radius: 4px; '
+            'padding: 6px 12px; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
+        )
+        add_tracks_btn.setFixedHeight(30)
+        add_tracks_btn.clicked.connect(self.add_tracks_requested.emit)
+        row.addWidget(add_tracks_btn)
 
         clear = QPushButton('Clear Filters')
         clear.setProperty('flat', 'true')
@@ -2284,15 +2297,20 @@ class LibraryBrowserView(QWidget):
         if self._inventory and self._library_path:
             self.load(self._inventory, self._library_path)
 
+        n = self._tree.topLevelItemCount()
+        t = len(self._inventory)
+        norm = f'{n:,} artists · {t:,} tracks'
         if disk_failures:
-            n = self._tree.topLevelItemCount()
-            t = len(self._inventory)
-            norm = f'{n:,} artists · {t:,} tracks'
             self._count_label.setText(
                 f'⚠ Classification accepted. {disk_failures} file(s) could not be '
                 f'updated on disk — check that the drive is connected and files are not locked.'
             )
             QTimer.singleShot(7000, lambda s=norm: self._count_label.setText(s))
+        else:
+            self._count_label.setText(
+                '✓ Metadata clean — run Organize to also rename your files on disk.'
+            )
+            QTimer.singleShot(8000, lambda s=norm: self._count_label.setText(s))
 
     # ── Persistence ───────────────────────────────────────────────────
 

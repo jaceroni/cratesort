@@ -665,7 +665,16 @@ class _CrateLoadWorker(QThread):
             key = str(self._library_path / track_path)
             if key in self._inventory_by_path:
                 return self._inventory_by_path[key]
-        return self._inventory_by_name.get(Path(track_path).name)
+        rec = self._inventory_by_name.get(Path(track_path).name)
+        if rec:
+            return rec
+        stem = Path(track_path).stem.lower()
+        if len(stem) >= 5:
+            for candidate in self._inventory_by_name.values():
+                cs = Path(candidate.filename).stem.lower()
+                if cs == stem or stem in cs or cs in stem:
+                    return candidate
+        return None
 
     def run(self) -> None:
         try:
@@ -852,7 +861,16 @@ class _ExportCrateWorker(QThread):
             key = str(self._library_path / track_path)
             if key in self._inventory_by_path:
                 return self._inventory_by_path[key]
-        return self._inventory_by_name.get(Path(track_path).name)
+        rec = self._inventory_by_name.get(Path(track_path).name)
+        if rec:
+            return rec
+        stem = Path(track_path).stem.lower()
+        if len(stem) >= 5:
+            for candidate in self._inventory_by_name.values():
+                cs = Path(candidate.filename).stem.lower()
+                if cs == stem or stem in cs or cs in stem:
+                    return candidate
+        return None
 
     @staticmethod
     def _unique_dest(path: Path) -> Path:
@@ -1663,8 +1681,17 @@ class CrateManagerView(QWidget):
             return
         self._current_crate_path = key
         if key == _ALL_TRACKS_KEY:
+            self._track_search.setPlaceholderText('Search all tracks by title, artist, or album…')
             self._load_all_tracks()
         else:
+            name = (
+                self._crate_library.crates[key].name
+                if self._crate_library and key in self._crate_library.crates
+                else key.split('/')[-1]
+            )
+            self._track_search.setPlaceholderText(
+                f'Searching "{name}" — select All Tracks to search your full library…'
+            )
             self._load_crate_tracks(key)
 
     def _load_all_tracks(self) -> None:
@@ -2520,8 +2547,18 @@ class CrateManagerView(QWidget):
             if key in self._inventory_by_path:
                 return self._inventory_by_path[key]
 
-        fname = Path(track_path).name
-        return self._inventory_by_name.get(fname)
+        rec = self._inventory_by_name.get(Path(track_path).name)
+        if rec:
+            return rec
+
+        stem = Path(track_path).stem.lower()
+        if len(stem) >= 5:
+            for candidate in self._inventory_by_name.values():
+                cs = Path(candidate.filename).stem.lower()
+                if cs == stem or stem in cs or cs in stem:
+                    return candidate
+
+        return None
 
     # ── Crate context menu ─────────────────────────────────────────────
 

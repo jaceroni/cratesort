@@ -130,11 +130,13 @@ class MainWindow(QMainWindow):
         self._dashboard.new_smart_crate_requested.connect(self._on_new_smart_crate_requested)
         self._dashboard.scan_finished.connect(self._on_scan_finished)
         self._dashboard.duplicates_requested.connect(self._on_duplicates_requested)
+        self._dashboard.add_tracks_requested.connect(self._on_add_tracks_requested)
         self._content.addWidget(self._dashboard)
 
         # Library Browser — index 1
         self._library_browser = LibraryBrowserView()
         self._library_browser.album_art_requested.connect(self._update_album_art)
+        self._library_browser.add_tracks_requested.connect(self._on_add_tracks_requested)
         self._content.addWidget(self._library_browser)
 
         # Crate Manager — index 2
@@ -150,6 +152,7 @@ class MainWindow(QMainWindow):
         self._organize_view.navigate_to_dashboard.connect(lambda: self._on_nav_by_id('dashboard'))
         self._organize_view.reorg_completed.connect(self._on_reorg_completed)
         self._organize_view.status_message.connect(self._update_status)
+        self._organize_view.add_tracks_requested.connect(self._on_add_tracks_requested)
         self._content.addWidget(self._organize_view)
 
         # Settings — index 4
@@ -556,9 +559,23 @@ class MainWindow(QMainWindow):
             return
         self._on_nav_by_id('organize')
 
+    def _on_add_tracks_requested(self) -> None:
+        lib = getattr(self._dashboard, '_library_path', None)
+        if not lib:
+            return
+        import subprocess
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open', str(lib)])
+        elif sys.platform == 'win32':
+            subprocess.Popen(['explorer', str(lib)])
+
     def _on_rinse_done(self) -> None:
         self._dashboard.clear_duplicates()
+        self._nav_btns['dashboard'].setChecked(True)
         self._content.setCurrentIndex(0)
+        lib = self._dashboard._library_path
+        if lib:
+            self._dashboard.start_scan(lib)
 
     def _on_duplicates_requested(self) -> None:
         groups  = self._dashboard._dup_groups
@@ -570,6 +587,10 @@ class MainWindow(QMainWindow):
         if not serato_dir.exists():
             return
         self._duplicate_review.load(groups, summary, lib, serato_dir)
+        self._nav_group.setExclusive(False)
+        for btn in self._nav_btns.values():
+            btn.setChecked(False)
+        self._nav_group.setExclusive(True)
         self._content.setCurrentIndex(5)
 
     def _on_library_changed_from_settings(self, path: Path) -> None:

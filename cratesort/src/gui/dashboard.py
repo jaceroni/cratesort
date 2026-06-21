@@ -641,6 +641,7 @@ class DashboardWidget(QWidget):
     new_crate_requested       = pyqtSignal()
     new_smart_crate_requested = pyqtSignal()
     duplicates_requested      = pyqtSignal()   # user clicked the duplicate banner
+    add_tracks_requested      = pyqtSignal()   # user wants to add files to library folder
     status_message            = pyqtSignal(str, str)  # (message, state)
 
     def __init__(self, parent=None, saved_path: Optional[Path] = None):
@@ -1092,9 +1093,10 @@ class DashboardWidget(QWidget):
 
         _icons = _ASSETS / 'icons'
         goto_cards = [
-            ('01', 'Manage Library',   'Browse and edit your track library', self.classify_requested.emit,    _icons / 'icon-library.svg'),
-            ('02', 'Manage Crates',    'Build crates and edit tracks',       self.crates_requested.emit,      _icons / 'icon-crates.svg'),
-            ('03', 'Organize Media',   'Manage folders and file locations',  self.organize_requested.emit,    _icons / 'icon-organize.svg'),
+            ('01', 'Manage Library',   'Browse and edit your track library',          self.classify_requested.emit,    _icons / 'icon-library.svg'),
+            ('02', 'Manage Crates',    'Build crates and edit tracks',                self.crates_requested.emit,      _icons / 'icon-crates.svg'),
+            ('03', 'Organize Media',   'Manage folders and file locations',           self.organize_requested.emit,    _icons / 'icon-organize.svg'),
+            ('04', 'Add Tracks',       'Drop files in your library — no Serato needed', self.add_tracks_requested.emit,  _icons / 'icon-add-tracks.svg'),
         ]
 
         goto_widget = QWidget()

@@ -204,6 +204,15 @@ class CrateReader:
                 if p.name == fname:
                     return True
 
+        # Stem-based fallback for renamed files (e.g. "Track - 12in Mix.mp3" → "track.mp3")
+        if inventory_paths:
+            stem = Path(track_path).stem.lower()
+            if len(stem) >= 5:
+                for p in inventory_paths:
+                    ps = p.stem.lower()
+                    if ps == stem or stem in ps or ps in stem:
+                        return True
+
         return False
 
     def _build_hierarchy(self, crates: dict[str, Crate]) -> None:

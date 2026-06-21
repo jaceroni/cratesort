@@ -152,7 +152,7 @@ class DuplicateReviewView(QWidget):
 
         # Header bar
         hdr = QFrame()
-        hdr.setStyleSheet(f'background: {_PANEL}; border-bottom: 1px solid {_SEP};')
+        hdr.setStyleSheet(f'background: {_PANEL}; border: none;')
         hdr_row = QHBoxLayout(hdr)
         hdr_row.setContentsMargins(32, 20, 32, 20)
 

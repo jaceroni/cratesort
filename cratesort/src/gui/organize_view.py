@@ -484,6 +484,7 @@ class OrganizeView(QWidget):
     navigate_to_dashboard  = pyqtSignal()
     reorg_completed        = pyqtSignal()   # emitted after a reorg or rollback finishes
     status_message         = pyqtSignal(str, str)   # (message, state)
+    add_tracks_requested   = pyqtSignal()   # open library folder for adding files
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -591,6 +592,31 @@ class OrganizeView(QWidget):
         )
         plan_btn.clicked.connect(self._on_plan_clicked)
         layout.addWidget(plan_btn)
+        layout.addSpacing(16)
+
+        add_hint = QLabel('Have new tracks to add to your library first?')
+        add_hint.setStyleSheet(f'color: #5a5a5a; font-size: 12px;')
+        layout.addWidget(add_hint)
+        layout.addSpacing(6)
+
+        open_folder_btn = QPushButton('Open Library Folder')
+        open_folder_btn.setFixedWidth(160)
+        open_folder_btn.setMinimumHeight(34)
+        open_folder_btn.setStyleSheet(
+            f'QPushButton {{ background-color: transparent; color: #a89b85; '
+            f'border: 1px solid #444444; border-radius: 5px; padding: 5px 12px; '
+            f'font-size: 12px; font-weight: 500; }}'
+            f'QPushButton:hover {{ color: #f1e3c8; border-color: #a89b85; background: rgba(241,227,200,0.05); }}'
+            f'QPushButton:pressed {{ background: rgba(241,227,200,0.1); }}'
+        )
+        open_folder_btn.clicked.connect(self.add_tracks_requested.emit)
+        layout.addWidget(open_folder_btn)
+        layout.addSpacing(4)
+
+        serato_note = QLabel('Drop files in, then come back and plan a new reorganization — no Serato import required.')
+        serato_note.setWordWrap(True)
+        serato_note.setStyleSheet('color: #3d3d3d; font-size: 11px;')
+        layout.addWidget(serato_note)
 
         # ── Separator ─────────────────────────────────────────────────
         layout.addSpacing(20)

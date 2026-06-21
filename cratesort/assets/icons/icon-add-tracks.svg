@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 78 78">
+  <defs>
+    <style>.c{fill:#d17d34}</style>
+  </defs>
+  <path class="c" fill-rule="evenodd" d="M39,0A39,39,0,0,1,78,39A39,39,0,0,1,39,78A39,39,0,0,1,0,39A39,39,0,0,1,39,0ZM42.5,35.5H58V42.5H42.5V58H35.5V42.5H20V35.5H35.5V20H42.5Z"/>
+</svg>
