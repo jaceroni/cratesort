@@ -1030,7 +1030,7 @@ class _ClassifierViewLegacy(QWidget):
         layout.addWidget(self._footer_label)
         layout.addStretch()
 
-        back_btn = QPushButton('← Back to Dashboard')
+        back_btn = QPushButton('Back to Dashboard')
         back_btn.setProperty('flat', 'true')
         back_btn.clicked.connect(self.back.emit)
         layout.addWidget(back_btn)

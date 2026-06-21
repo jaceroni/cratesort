@@ -160,7 +160,7 @@ class MainWindow(QMainWindow):
 
         # Duplicate Review — index 5 (not a nav item; launched from dashboard banner)
         self._duplicate_review = DuplicateReviewView()
-        self._duplicate_review.done.connect(lambda: self._content.setCurrentIndex(0))
+        self._duplicate_review.done.connect(self._on_rinse_done)
         self._content.addWidget(self._duplicate_review)
 
         root.addWidget(self._content)
@@ -248,7 +248,7 @@ class MainWindow(QMainWindow):
         ur_layout.setContentsMargins(13, 0, 13, 8)
         ur_layout.setSpacing(6)
 
-        self._undo_btn = QPushButton('← Undo')
+        self._undo_btn = QPushButton('Undo')
         self._undo_btn.setEnabled(False)
         self._undo_btn.setStyleSheet(
             f'QPushButton {{ background: transparent; color: {C["text_muted"]}; '
@@ -259,7 +259,7 @@ class MainWindow(QMainWindow):
         )
         self._undo_btn.clicked.connect(self._do_undo)
 
-        self._redo_btn = QPushButton('Redo →')
+        self._redo_btn = QPushButton('Redo')
         self._redo_btn.setEnabled(False)
         self._redo_btn.setStyleSheet(self._undo_btn.styleSheet())
         self._redo_btn.clicked.connect(self._do_redo)
@@ -555,6 +555,10 @@ class MainWindow(QMainWindow):
             self._show_sync_warning()
             return
         self._on_nav_by_id('organize')
+
+    def _on_rinse_done(self) -> None:
+        self._dashboard.clear_duplicates()
+        self._content.setCurrentIndex(0)
 
     def _on_duplicates_requested(self) -> None:
         groups  = self._dashboard._dup_groups

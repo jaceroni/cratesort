@@ -5,9 +5,13 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QFrame, QHBoxLayout, QLabel, QProgressBar,
+    QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
+
+_ASSETS        = Path(__file__).parent.parent.parent / 'assets'
+_ICON_CHECKED  = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
+_ICON_UNCHECKED = str(_ASSETS / 'icons' / 'checkbox-unchecked.svg')
 
 from cratesort.src.core.duplicate_detector import (
     DuplicateGroup, DuplicateCopy, DuplicateSummary, fmt_bytes,
@@ -171,7 +175,7 @@ class DuplicateReviewView(QWidget):
         self._skip_btn.clicked.connect(self.done.emit)
         hdr_row.addWidget(self._skip_btn)
 
-        self._consolidate_btn = QPushButton('Consolidate All')
+        self._consolidate_btn = QPushButton('Consolidate Checked')
         self._consolidate_btn.setFixedHeight(36)
         self._consolidate_btn.setStyleSheet(
             f'QPushButton {{ background: {_TEAL}; color: {_CREAM}; border: none; '
@@ -209,6 +213,20 @@ class DuplicateReviewView(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
+        # Skipped-track disclosure — shown before any results, every time
+        skipped = self._summary.skipped_count if self._summary else 0
+        if skipped > 0:
+            n = skipped
+            notice = QLabel(
+                f'{n:,} untagged track{"s" if n != 1 else ""} '
+                f'{"were" if n != 1 else "was"} skipped and may still contain duplicates.'
+            )
+            notice.setWordWrap(True)
+            notice.setStyleSheet(
+                f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
+            )
+            self._results_layout.insertWidget(0, notice)
+
         tier1 = [g for g in self._groups if g.tier == 'true_duplicate']
         tier2 = [g for g in self._groups if g.tier == 'variant']
 
@@ -217,8 +235,8 @@ class DuplicateReviewView(QWidget):
                 self._results_layout.count() - 1,
                 self._build_section_header(
                     f'True Duplicates — {len(tier1)} group{"s" if len(tier1) != 1 else ""}',
-                    f'Same file in multiple locations. '
-                    f'We\'ll keep the best copy and reroute all your crates to it.',
+                    'Same file found in multiple locations. '
+                    'We\'ve selected the best copy — confirm or choose a different one.',
                     _RED,
                 )
             )
@@ -247,32 +265,69 @@ class DuplicateReviewView(QWidget):
                     )
 
         if not tier1 and not tier2:
-            empty = QLabel('No duplicates found. Your library is clean.')
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setStyleSheet(f'color: {_MUTED}; font-size: 14px; background: transparent;')
-            self._results_layout.insertWidget(0, empty)
             self._consolidate_btn.setEnabled(False)
+            if skipped > 0:
+                headline = QLabel('Nothing to review.')
+                headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                headline.setStyleSheet(
+                    f'color: {_CREAM}; font-size: 16px; font-weight: 600; '
+                    f'background: transparent; border: none;'
+                )
+                body = QLabel(
+                    'No tracks had enough metadata to compare.\n'
+                    'Add artist and title tags to your tracks, then rescan.'
+                )
+                body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                body.setWordWrap(True)
+                body.setStyleSheet(
+                    f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
+                )
+                self._results_layout.insertWidget(
+                    self._results_layout.count() - 1, headline
+                )
+                self._results_layout.insertWidget(
+                    self._results_layout.count() - 1, body
+                )
+            else:
+                empty = QLabel('No duplicates found. Your library is clean.')
+                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                empty.setStyleSheet(
+                    f'color: {_MUTED}; font-size: 14px; background: transparent; border: none;'
+                )
+                self._results_layout.insertWidget(0, empty)
 
     def _build_section_header(self, title: str, subtitle: str, accent: str) -> QFrame:
         f = QFrame()
-        f.setStyleSheet('background: transparent;')
-        layout = QVBoxLayout(f)
-        layout.setContentsMargins(0, 8, 0, 4)
-        layout.setSpacing(4)
+        f.setStyleSheet('background: transparent; border: none;')
+        outer = QVBoxLayout(f)
+        outer.setContentsMargins(0, 36, 0, 14)
+        outer.setSpacing(0)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f'background: {accent}; border: none; max-height: 2px;')
-        layout.addWidget(sep)
+        # Accent bar spans the full height of title + subtitle
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+
+        bar = QFrame()
+        bar.setFixedWidth(4)
+        bar.setStyleSheet(f'background: {accent}; border: none; border-radius: 2px;')
+        row.addWidget(bar)  # no alignment= → stretches to full row height
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(6)
 
         t = QLabel(title)
-        t.setStyleSheet(f'color: {_CREAM}; font-size: 15px; font-weight: 700; background: transparent;')
-        layout.addWidget(t)
+        t.setStyleSheet(f'color: {_CREAM}; font-size: 15px; font-weight: 700; background: transparent; border: none;')
+        text_col.addWidget(t)
 
         s = QLabel(subtitle)
         s.setWordWrap(True)
-        s.setStyleSheet(f'color: {_MUTED}; font-size: 12px; background: transparent;')
-        layout.addWidget(s)
+        s.setStyleSheet(f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;')
+        text_col.addWidget(s)
+
+        row.addLayout(text_col, stretch=1)
+        outer.addLayout(row)
 
         return f
 
@@ -283,65 +338,99 @@ class DuplicateReviewView(QWidget):
         )
         layout = QVBoxLayout(card)
         layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         # Title row
         title_row = QHBoxLayout()
         song_lbl = QLabel(f'{group.canonical_artist}  —  {group.canonical_title}')
-        song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 14px; font-weight: 600; background: transparent;')
+        song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 14px; font-weight: 600; background: transparent; border: none;')
         title_row.addWidget(song_lbl, stretch=1)
 
         savings_lbl = QLabel(f'saves {fmt_bytes(group.space_savings)}')
-        savings_lbl.setStyleSheet(f'color: {_TEAL}; font-size: 12px; background: transparent;')
+        savings_lbl.setStyleSheet(f'color: {_TEAL}; font-size: 12px; background: transparent; border: none;')
         title_row.addWidget(savings_lbl)
         layout.addLayout(title_row)
 
-        # Copy rows
-        winner = self._winner_overrides.get(idx, group.recommended_winner)
-        for copy in group.copies:
-            layout.addWidget(self._build_copy_row(idx, group, copy, copy == winner))
+        # Radio button group — one selection per group, no page rebuild
+        btn_group = QButtonGroup(card)
+        btn_group.setExclusive(True)
 
-        # Metadata conflicts warning
+        winner = self._winner_overrides.get(idx, group.recommended_winner)
+        copy_rows: list[tuple] = []
+
+        for copy in group.copies:
+            is_winner = (copy == winner)
+            radio, row = self._build_copy_row(copy, is_winner, winner)
+            btn_group.addButton(radio)
+            if is_winner:
+                radio.setChecked(True)
+            copy_rows.append((radio, row, copy))
+            layout.addWidget(row)
+
+        def _update_selection(_btn: QCheckBox, checked: bool) -> None:
+            if not checked:
+                return
+            for r, row_frame, c in copy_rows:
+                is_w = r.isChecked()
+                bg     = _ROW  if is_w else _ROW2
+                border = f'2px solid {_TEAL}' if is_w else f'1px solid {_SEP}'
+                row_frame.setStyleSheet(
+                    f'QFrame {{ background: {bg}; border: {border}; border-radius: 6px; }}'
+                )
+                if is_w:
+                    self._winner_overrides[idx] = c
+
+        btn_group.buttonToggled.connect(_update_selection)
+
+        # Metadata note — only shown when copies genuinely disagree on a tag value
         if group.metadata_conflicts:
-            conflict_fields = ', '.join(c.field for c in group.metadata_conflicts)
-            warn = QLabel(f'⚠  Metadata differs across copies: {conflict_fields}. Winner\'s values will be kept.')
+            fields = ', '.join(c.field for c in group.metadata_conflicts)
+            warn = QLabel(
+                f'These copies have different {fields} tag{"s" if len(group.metadata_conflicts) > 1 else ""}. '
+                f'The checked copy\'s {"values" if len(group.metadata_conflicts) > 1 else "value"} win{"" if len(group.metadata_conflicts) > 1 else "s"}.'
+            )
             warn.setWordWrap(True)
-            warn.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent;')
+            warn.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
             layout.addWidget(warn)
 
         return card
 
-    def _build_copy_row(
-        self, group_idx: int, group: DuplicateGroup,
-        copy: DuplicateCopy, is_winner: bool
-    ) -> QFrame:
+    def _build_copy_row(self, copy: DuplicateCopy, is_winner: bool, winner: Optional[DuplicateCopy] = None) -> tuple:
         row = QFrame()
-        bg = _ROW if is_winner else _ROW2
+        bg     = _ROW  if is_winner else _ROW2
         border = f'2px solid {_TEAL}' if is_winner else f'1px solid {_SEP}'
         row.setStyleSheet(
             f'QFrame {{ background: {bg}; border: {border}; border-radius: 6px; }}'
         )
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
         h = QHBoxLayout(row)
-        h.setContentsMargins(12, 10, 12, 10)
-        h.setSpacing(12)
+        h.setContentsMargins(12, 12, 12, 12)
+        h.setSpacing(14)
 
-        # Winner badge
-        badge = QLabel('KEEP' if is_winner else '')
-        badge.setFixedWidth(40)
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setStyleSheet(
-            f'color: {_TEAL}; font-size: 9px; font-weight: 700; '
-            f'letter-spacing: 1px; background: transparent;'
+        # Checkbox selector (exclusive per group via QButtonGroup)
+        radio = QCheckBox()
+        radio.setStyleSheet(
+            f'QCheckBox {{ background: transparent; border: none; spacing: 0; }}'
+            f'QCheckBox::indicator {{ width: 16px; height: 16px; }}'
+            f'QCheckBox::indicator:unchecked {{ image: url("{_ICON_UNCHECKED}"); }}'
+            f'QCheckBox::indicator:checked   {{ image: url("{_ICON_CHECKED}");   }}'
         )
-        h.addWidget(badge)
+        h.addWidget(radio, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         # File info
         info_col = QVBoxLayout()
-        info_col.setSpacing(2)
+        info_col.setSpacing(3)
+
+        # Filename first — the primary differentiator between copies
+        name_lbl = QLabel(copy.file_path.name)
+        name_lbl.setStyleSheet(
+            f'color: {_CREAM}; font-size: 13px; font-weight: 600; background: transparent; border: none;'
+        )
+        info_col.addWidget(name_lbl)
 
         fmt_str = copy.format
         if copy.bitrate:
-            fmt_str += f' {copy.bitrate} kbps'
+            fmt_str += f'  ·  {copy.bitrate} kbps'
         if copy.duration:
             mins = int(copy.duration // 60)
             secs = int(copy.duration % 60)
@@ -349,44 +438,67 @@ class DuplicateReviewView(QWidget):
         fmt_str += f'  ·  {fmt_bytes(copy.file_size)}'
 
         fmt_lbl = QLabel(fmt_str)
-        fmt_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 12px; background: transparent;')
+        fmt_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 12px; background: transparent; border: none;')
         info_col.addWidget(fmt_lbl)
 
         path_lbl = QLabel(copy.folder_context)
-        path_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent;')
+        path_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
         info_col.addWidget(path_lbl)
 
-        crate_txt = ''
+        # Supporting data — orange on winner (earns attention), muted on non-winner (context only)
+        detail_color = _ORANGE if is_winner else _MUTED
+
+        def _detail(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(f'color: {detail_color}; font-size: 12px; background: transparent; border: none;')
+            return lbl
+
         if copy.crate_count > 0:
-            crate_txt = f'{copy.crate_count} crate{"s" if copy.crate_count != 1 else ""}'
+            info_col.addWidget(_detail(
+                f'In {copy.crate_count} crate{"s" if copy.crate_count != 1 else ""}'
+            ))
+        if copy.play_count and copy.play_count > 0:
+            info_col.addWidget(_detail(f'{copy.play_count} plays in Serato'))
         if copy.comment:
-            crate_txt += ('  ·  ' if crate_txt else '') + f'"{copy.comment[:40]}"'
-        if crate_txt:
-            crate_lbl = QLabel(crate_txt)
-            crate_lbl.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent;')
-            info_col.addWidget(crate_lbl)
+            info_col.addWidget(_detail(f'Comment: "{copy.comment[:60]}"'))
+        if copy.genre_tag:
+            info_col.addWidget(_detail(f'Genre: {copy.genre_tag}'))
+        if copy.bpm:
+            info_col.addWidget(_detail(f'BPM: {int(copy.bpm)}'))
+
+        if is_winner:
+            rec_lbl = QLabel('✳  We recommend keeping this one')
+            rec_lbl.setStyleSheet(
+                f'color: {_TEAL}; font-size: 11px; font-weight: 600; background: transparent; border: none;'
+            )
+            info_col.addWidget(rec_lbl)
+
+        elif winner is not None:
+            # Orange only for data this copy has that the winner doesn't — worth the user's attention
+            if copy.comment and not winner.comment:
+                warn = QLabel(f'Choosing this preserves Comment: "{copy.comment[:60]}"')
+                warn.setWordWrap(True)
+                warn.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;')
+                info_col.addWidget(warn)
+            if copy.play_count and copy.play_count > (winner.play_count or 0):
+                warn = QLabel(f'Choosing this preserves {copy.play_count} plays in Serato')
+                warn.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;')
+                info_col.addWidget(warn)
+            if copy.crate_count > winner.crate_count:
+                warn = QLabel(
+                    f'Choosing this preserves {copy.crate_count} crate{"s" if copy.crate_count != 1 else ""}'
+                )
+                warn.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;')
+                info_col.addWidget(warn)
 
         h.addLayout(info_col, stretch=1)
 
-        # "Keep this one" button (only on non-winner rows)
-        if not is_winner:
-            keep_btn = QPushButton('Keep this one')
-            keep_btn.setFixedHeight(28)
-            keep_btn.setStyleSheet(
-                f'QPushButton {{ background: transparent; color: {_MUTED}; '
-                f'border: 1px solid #444444; border-radius: 4px; font-size: 11px; padding: 0 10px; }}'
-                f'QPushButton:hover {{ color: {_CREAM}; border-color: {_CREAM}; }}'
-            )
-            _copy = copy
-            _idx  = group_idx
-            keep_btn.clicked.connect(lambda _, c=_copy, gi=_idx: self._on_override_winner(gi, c))
-            h.addWidget(keep_btn)
+        # Clicking anywhere on the row toggles the checkbox
+        _r = radio
+        row.mousePressEvent = lambda event: _r.toggle()
 
-        return row
-
-    def _on_override_winner(self, group_idx: int, copy: DuplicateCopy) -> None:
-        self._winner_overrides[group_idx] = copy
-        self._populate_results()
+        return radio, row
 
     # ── Progress screen (State 1) ───────────────────────────────────────────
 
@@ -431,46 +543,77 @@ class DuplicateReviewView(QWidget):
     def _build_celebration(self) -> QWidget:
         w = QWidget()
         w.setStyleSheet(f'background: {_BG};')
-        layout = QVBoxLayout(w)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Outer: vertical centering via stretches, horizontal centering via HBox
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addStretch()
+
+        # Fixed-width inner container — forces text to fill a real width instead of collapsing
+        inner_w = QWidget()
+        inner_w.setFixedWidth(560)
+        inner_w.setStyleSheet('background: transparent;')
+        layout = QVBoxLayout(inner_w)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(20)
 
         check = QLabel('✓')
         check.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        check.setStyleSheet(f'color: {_TEAL}; font-size: 56px; background: transparent;')
+        check.setStyleSheet(f'color: {_TEAL}; font-size: 56px; background: transparent; border: none;')
         layout.addWidget(check)
 
         self._celeb_headline = QLabel('Rinsed.')
         self._celeb_headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._celeb_headline.setStyleSheet(
-            f'color: {_CREAM}; font-size: 28px; font-weight: 700; background: transparent;'
+            f'color: {_CREAM}; font-size: 28px; font-weight: 700; background: transparent; border: none;'
         )
         layout.addWidget(self._celeb_headline)
 
         self._celeb_stat = QLabel()
         self._celeb_stat.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._celeb_stat.setWordWrap(True)
-        self._celeb_stat.setStyleSheet(f'color: {_TEAL}; font-size: 16px; background: transparent;')
+        self._celeb_stat.setStyleSheet(
+            f'color: {_TEAL}; font-size: 16px; background: transparent; border: none;'
+        )
         layout.addWidget(self._celeb_stat)
 
-        self._celeb_tip = QLabel(
-            'Need those tracks on a USB for a gig? Right-click any crate\n'
-            'and Export Crate to Folder — everything\'s right there.'
+        self._celeb_tip = QLabel()
+        self._celeb_tip.setTextFormat(Qt.TextFormat.RichText)
+        self._celeb_tip.setText(
+            '<div style="line-height: 145%; text-align: center;">'
+            'Don\'t worry, the duplicate tracks that were in multiple folders will be rerouted '
+            'by CrateSort so your crates will still work in your DJ software.'
+            '</div>'
         )
         self._celeb_tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._celeb_tip.setStyleSheet(f'color: {_MUTED}; font-size: 13px; background: transparent;')
+        self._celeb_tip.setWordWrap(True)
+        self._celeb_tip.setStyleSheet(
+            f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
+        )
         layout.addWidget(self._celeb_tip)
+
+        self._celeb_skipped_lbl = QLabel()
+        self._celeb_skipped_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._celeb_skipped_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._celeb_skipped_lbl.setWordWrap(True)
+        self._celeb_skipped_lbl.setStyleSheet(
+            f'color: {_MUTED}; font-size: 12px; background: transparent; border: none;'
+        )
+        self._celeb_skipped_lbl.hide()
+        layout.addWidget(self._celeb_skipped_lbl)
 
         self._celeb_errors_lbl = QLabel()
         self._celeb_errors_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._celeb_errors_lbl.setWordWrap(True)
-        self._celeb_errors_lbl.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent;')
+        self._celeb_errors_lbl.setStyleSheet(
+            f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;'
+        )
         self._celeb_errors_lbl.hide()
         layout.addWidget(self._celeb_errors_lbl)
 
-        classify_btn = QPushButton('Classify Library →')
+        classify_btn = QPushButton('Go Back to Dashboard')
         classify_btn.setFixedHeight(44)
-        classify_btn.setFixedWidth(220)
+        classify_btn.setFixedWidth(260)
         classify_btn.setStyleSheet(
             f'QPushButton {{ background: {_TEAL}; color: {_CREAM}; border: none; '
             f'border-radius: 6px; font-size: 14px; font-weight: 600; }}'
@@ -479,6 +622,13 @@ class DuplicateReviewView(QWidget):
         )
         classify_btn.clicked.connect(self.done.emit)
         layout.addWidget(classify_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        h_row = QHBoxLayout()
+        h_row.addStretch()
+        h_row.addWidget(inner_w)
+        h_row.addStretch()
+        outer.addLayout(h_row)
+        outer.addStretch()
 
         return w
 
@@ -536,6 +686,19 @@ class DuplicateReviewView(QWidget):
             self._celeb_errors_lbl.show()
         else:
             self._celeb_errors_lbl.hide()
+
+        skipped = self._summary.skipped_count if self._summary else 0
+        if skipped > 0:
+            self._celeb_skipped_lbl.setText(
+                f'<div style="line-height: 145%; text-align: center;">'
+                f'{skipped:,} untagged track{"s" if skipped != 1 else ""} '
+                f'{"weren\'t" if skipped != 1 else "wasn\'t"} evaluated. '
+                f'Fix the tags and rescan to cover your full library.'
+                f'</div>'
+            )
+            self._celeb_skipped_lbl.show()
+        else:
+            self._celeb_skipped_lbl.hide()
 
         self._stack.setCurrentIndex(_STATE_CELEBRATION)
 

@@ -902,7 +902,7 @@ class OrganizeView(QWidget):
         self._execute_btn.setProperty('secondary', 'true')
         self._execute_btn.clicked.connect(self._on_execute)
 
-        cancel_btn = QPushButton('← Cancel && Go Back to Dashboard')
+        cancel_btn = QPushButton('Cancel && Go Back to Dashboard')
         cancel_btn.setProperty('flat', 'true')
         cancel_btn.setStyleSheet(f'QPushButton {{ color: {_DANGER}; }} QPushButton:hover {{ color: #b24c4c; }}')
         cancel_btn.clicked.connect(self._on_cancel_preview)

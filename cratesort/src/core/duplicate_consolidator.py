@@ -134,6 +134,7 @@ class DuplicateConsolidator:
                         op.sha256_source = _sha256(loser.file_path)
                         op.executed_at   = datetime.now().isoformat()
                         loser.file_path.unlink()
+                        _cleanup_empty_parents(loser.file_path.parent, self._library_path)
                         op.status = 'completed'
                         files_removed += 1
                         space_freed   += loser.file_size
@@ -167,6 +168,30 @@ class DuplicateConsolidator:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_MACOS_JUNK = frozenset({'.DS_Store', '.localized', '.Spotlight-V100', '.fseventsd'})
+
+
+def _cleanup_empty_parents(start: Path, stop_at: Path) -> None:
+    """Walk up from start, removing each directory if empty. Stops at stop_at.
+    Strips macOS metadata files (.DS_Store etc.) before checking emptiness."""
+    current = start
+    while current != stop_at and current != current.parent:
+        try:
+            if not current.exists():
+                break
+            # Remove macOS metadata files that would block rmdir
+            for item in current.iterdir():
+                if item.name in _MACOS_JUNK:
+                    item.unlink(missing_ok=True)
+            if not any(current.iterdir()):
+                current.rmdir()
+                current = current.parent
+            else:
+                break
+        except Exception:
+            break
+
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()

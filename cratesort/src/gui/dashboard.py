@@ -657,6 +657,7 @@ class DashboardWidget(QWidget):
         self._current_crates = {}
         self._dup_groups: list = []
         self._dup_summary = None
+        self._dup_banner_widget = None
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -958,7 +959,10 @@ class DashboardWidget(QWidget):
 
         layout.addWidget(self._build_stat_cards_section(summary, inv))
         if self._dup_groups:
-            layout.addWidget(self._build_dup_banner())
+            self._dup_banner_widget = self._build_dup_banner()
+            layout.addWidget(self._dup_banner_widget)
+        else:
+            self._dup_banner_widget = None
         layout.addWidget(self._make_divider())
         layout.addWidget(self._build_action_cards_section())
         layout.addWidget(self._make_divider())
@@ -1040,20 +1044,25 @@ class DashboardWidget(QWidget):
 
         txt_col = QVBoxLayout()
         title = QLabel(f'{n:,} Potential Duplicate{"s" if n != 1 else ""} Found')
-        title.setStyleSheet('color: #D17D34; font-size: 14px; font-weight: 700; background: transparent;')
+        title.setStyleSheet('color: #D17D34; font-size: 14px; font-weight: 700; background: transparent; border: none;')
         txt_col.addWidget(title)
 
         sub_parts = []
         if space:
             sub_parts.append(f'{space} could be reclaimed')
-        sub_parts.append('Rinse your library before you classify.')
+        if summary and summary.skipped_count > 0:
+            s = summary.skipped_count
+            sub_parts.append(
+                f'{s:,} track{"s" if s != 1 else ""} skipped — no metadata'
+            )
+        sub_parts.append('Review before you classify.')
         sub = QLabel('  ·  '.join(sub_parts))
-        sub.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent;')
+        sub.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
         txt_col.addWidget(sub)
 
         row.addLayout(txt_col, stretch=1)
 
-        btn = QPushButton('Review Duplicates →')
+        btn = QPushButton('Review Duplicates')
         btn.setFixedHeight(36)
         btn.setStyleSheet(
             'QPushButton { background: #D17D34; color: #ffffff; border: none; '
@@ -1065,6 +1074,15 @@ class DashboardWidget(QWidget):
         row.addWidget(btn)
 
         return banner
+
+    def clear_duplicates(self) -> None:
+        """Called after a successful Rinse — removes the duplicate banner immediately."""
+        self._dup_groups = []
+        self._dup_summary = None
+        if self._dup_banner_widget is not None:
+            self._dup_banner_widget.hide()
+            self._dup_banner_widget.deleteLater()
+            self._dup_banner_widget = None
 
     def _build_action_cards_section(self) -> QWidget:
         outer = QWidget()

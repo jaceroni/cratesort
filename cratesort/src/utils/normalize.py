@@ -29,11 +29,13 @@ def normalize_artist(name: str) -> str:
 def normalize_title(title: str) -> str:
     """
     Normalize a track title for duplicate comparison.
-    Strips parenthesized version suffixes that don't affect musical identity,
-    then strips punctuation.
+    Strips version suffixes, featured artists, years, and track number
+    prefixes that don't affect musical identity, then strips punctuation.
     """
     title = title.strip().lower()
-    # Strip parenthesized/bracketed version suffixes
+    # Strip leading track numbers: "02 Title", "02. Title", "02 - Title"
+    title = re.sub(r'^\d{1,3}[\s\.\-]+', '', title)
+    # Strip parenthesized/bracketed version suffixes: "Title (Original Mix)"
     title = re.sub(
         r'\s*[\(\[]\s*'
         r'(?:remaster(?:ed)?(?:\s+\d{4})?'
@@ -41,6 +43,20 @@ def normalize_title(title: str) -> str:
         r'|single\s+version'
         r'|mono|stereo'
         r'|bonus\s+track)\s*[\)\]]',
+        '', title, flags=re.I,
+    )
+    # Strip parenthesized years: "Title (1982)", "Title (2023)"
+    title = re.sub(r'\s*[\(\[]\s*\d{4}\s*[\)\]]', '', title)
+    # Strip hyphenated version qualifiers: "Title - Original", "Title - 12 Inch Mix"
+    title = re.sub(
+        r'\s*[-–]\s*(?:original|remix(?:ed)?|extended|instrumental|'
+        r'radio\s+edit|club\s+mix|dub|live|acoustic|'
+        r'remaster(?:ed)?|12["\s]?inch)\s*$',
+        '', title, flags=re.I,
+    )
+    # Strip featured artist suffixes: "Title ft. Someone", "Title feat. Someone"
+    title = re.sub(
+        r'\s*(?:ft\.?|feat\.?|featuring|with)\s+.+$',
         '', title, flags=re.I,
     )
     # Strip punctuation

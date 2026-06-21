@@ -18,6 +18,11 @@ _TIER1_DURATION_TOLERANCE = 1.0
 # Bitrate spread (kbps) within which we consider files the same encode.
 _TIER1_BITRATE_SPREAD = 32
 
+# File size spread (fraction) for strong physical match override.
+# Files within 2% of each other in size are treated as the same encode
+# even if a variant keyword appears in the filename.
+_TIER1_SIZE_SPREAD = 0.02
+
 # Keywords in filename that signal an intentional variant.
 _VARIANT_KEYWORDS = re.compile(
     r'\b(remix|remixed|extended|instrumental|acapella|a[- ]?cappella|'
@@ -74,6 +79,7 @@ class DuplicateSummary:
     groups_auto_approvable: int
     tier1_groups: int             # true duplicates
     tier2_groups: int             # variants needing review
+    skipped_count: int = 0        # tracks without artist/title — not evaluated
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +118,19 @@ class DuplicateDetector:
 
     def _fast_pass(self, inventory: list[TrackRecord]) -> list[DuplicateGroup]:
         buckets: dict[tuple[str, str], list[TrackRecord]] = defaultdict(list)
+        self._skipped_count = 0
         for rec in inventory:
-            if not rec.artist or not rec.title:
-                continue
-            key = (normalize_artist(rec.artist), normalize_title(rec.title))
+            if rec.artist and rec.title:
+                key = (normalize_artist(rec.artist), normalize_title(rec.title))
+            else:
+                # Filename fallback: folder name → artist, filename stem → title.
+                # Covers yt-dl / ripped files that landed with no tags.
+                folder_artist  = normalize_artist(rec.path.parent.name)
+                filename_title = normalize_title(rec.path.stem)  # normalize_title strips leading track numbers
+                if not folder_artist or not filename_title:
+                    self._skipped_count += 1
+                    continue
+                key = (folder_artist, filename_title)
             buckets[key].append(rec)
 
         groups: list[DuplicateGroup] = []
@@ -211,16 +226,20 @@ class DuplicateDetector:
 
     def _classify_tier(self, copies: list[DuplicateCopy]) -> str:
         """
-        Tier 1 (true_duplicate): files are likely the same physical recording.
-        - All copies within ±1s duration
-        - No variant keywords in any filename
-        - Bitrate spread ≤ 32kbps (or all None)
+        Tier 1 (true_duplicate): files are physically the same recording.
+        - Strong physical match (duration ±1s, bitrate ±32kbps, size ±2%) overrides
+          any variant keyword in the filename — physical evidence wins.
+        - OR: no variant keywords AND duration/bitrate within tolerances.
 
         Tier 2 (variant): intentionally different versions.
-        - Any copy has variant keywords in filename, OR
-        - Duration spread > 1s, OR
-        - Bitrate spread > 32kbps between copies
+        - Has variant keywords AND physical metrics don't all agree, OR
+        - Duration spread > 1s, OR bitrate spread > 32kbps.
         """
+        # Strong physical match overrides filename annotation.
+        # If the bits agree this closely, the filename is irrelevant.
+        if self._is_strong_physical_match(copies):
+            return 'true_duplicate'
+
         # Variant keyword in any filename → Tier 2
         for c in copies:
             if _VARIANT_KEYWORDS.search(c.file_path.name):
@@ -240,6 +259,22 @@ class DuplicateDetector:
 
         return 'true_duplicate'
 
+    def _is_strong_physical_match(self, copies: list[DuplicateCopy]) -> bool:
+        """Duration, bitrate, AND file size all agree — physically the same file."""
+        durations = [c.duration for c in copies if c.duration is not None]
+        if len(durations) >= 2 and max(durations) - min(durations) > _TIER1_DURATION_TOLERANCE:
+            return False
+
+        bitrates = [c.bitrate for c in copies if c.bitrate is not None]
+        if len(bitrates) >= 2 and max(bitrates) - min(bitrates) > _TIER1_BITRATE_SPREAD:
+            return False
+
+        sizes = [c.file_size for c in copies if c.file_size > 0]
+        if len(sizes) >= 2 and (max(sizes) - min(sizes)) / max(sizes) > _TIER1_SIZE_SPREAD:
+            return False
+
+        return True
+
     # ── Winner selection ──────────────────────────────────────────────────────
 
     def _pick_winner(self, copies: list[DuplicateCopy]) -> Optional[DuplicateCopy]:
@@ -248,14 +283,16 @@ class DuplicateDetector:
 
         def score(c: DuplicateCopy) -> tuple:
             # Priority (descending): crate presence, play count, bitrate,
-            # metadata completeness, has comment, has stems
-            crate_count      = c.crate_count
-            play_count       = c.play_count or 0
-            bitrate          = c.bitrate or 0
+            # metadata completeness, has comment, has stems, clean filename
+            crate_count       = c.crate_count
+            play_count        = c.play_count or 0
+            bitrate           = c.bitrate or 0
             meta_completeness = sum(1 for v in [c.genre_tag, c.year_tag, c.bpm] if v)
-            has_comment      = int(bool(c.comment))
-            has_stems        = int(c.has_stems)
-            return (crate_count, play_count, bitrate, meta_completeness, has_comment, has_stems)
+            has_comment       = int(bool(c.comment))
+            has_stems         = int(c.has_stems)
+            # Prefer filenames without leading track numbers (e.g. "02 Title.mp3")
+            clean_filename    = 0 if re.match(r'^\d+[\s\.\-]', c.file_path.stem) else 1
+            return (crate_count, play_count, bitrate, meta_completeness, has_comment, has_stems, clean_filename)
 
         return max(copies, key=score)
 
@@ -287,9 +324,8 @@ class DuplicateDetector:
             values = {str(c.file_path): getter(c) for c in copies}
             non_none = [v for v in values.values() if v]
             if len(set(non_none)) > 1:
+                # Genuine disagreement — both copies have a value but they differ
                 conflicts.append(MetadataConflict(field=field_name, values=values))
-            elif field_name == 'comment' and non_none and len(non_none) < len(copies):
-                conflicts.append(MetadataConflict(field='comment (migrate)', values=values))
 
         return conflicts
 
@@ -322,6 +358,7 @@ class DuplicateDetector:
             groups_auto_approvable=auto,
             tier1_groups=tier1,
             tier2_groups=tier2,
+            skipped_count=getattr(self, '_skipped_count', 0),
         )
 
 
