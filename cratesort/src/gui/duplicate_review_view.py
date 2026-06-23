@@ -5,13 +5,13 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QFrame, QHBoxLayout, QLabel, QProgressBar,
-    QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
+    QButtonGroup, QFrame, QHBoxLayout, QLabel, QProgressBar,
+    QPushButton, QRadioButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-_ASSETS        = Path(__file__).parent.parent.parent / 'assets'
-_ICON_CHECKED  = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
-_ICON_UNCHECKED = str(_ASSETS / 'icons' / 'checkbox-unchecked.svg')
+_ASSETS          = Path(__file__).parent.parent.parent / 'assets'
+_ICON_RADIO_ON   = str(_ASSETS / 'icons' / 'radio-checked.svg')
+_ICON_RADIO_OFF  = str(_ASSETS / 'icons' / 'radio-unchecked.svg')
 
 from cratesort.src.core.duplicate_detector import (
     DuplicateGroup, DuplicateCopy, DuplicateSummary, fmt_bytes,
@@ -39,6 +39,8 @@ _DIM    = '#666666'
 _STATE_RESULTS      = 0
 _STATE_PROGRESS     = 1
 _STATE_CELEBRATION  = 2
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,21 @@ def _winner_reason(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> str:
         return 'cleaner filename'
 
     return 'best available copy'
+
+
+def _winner_metadata_advantages(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> list[str]:
+    """
+    Return field names where the winner has data that at least one loser is missing.
+    Only reports fields where the winner has an exclusive advantage — both sides
+    having the same field doesn't count.
+    """
+    adv = []
+    if winner.comment    and any(not l.comment    for l in losers): adv.append('comment')
+    if winner.genre_tag  and any(not l.genre_tag  for l in losers): adv.append('genre')
+    if winner.bpm        and any(not l.bpm        for l in losers): adv.append('BPM')
+    if winner.year_tag   and any(not l.year_tag   for l in losers): adv.append('year')
+    if winner.has_artwork and any(not l.has_artwork for l in losers): adv.append('artwork')
+    return adv
 
 
 def _comment_merge_note(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> str:
@@ -176,7 +193,8 @@ class DuplicateReviewView(QWidget):
     Emits `done` when the user dismisses the celebration or skips entirely.
     """
 
-    done = pyqtSignal()   # user finished — return to dashboard
+    done           = pyqtSignal()    # user finished — return to dashboard
+    track_selected = pyqtSignal(str) # file path → populate sidebar artwork
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -244,7 +262,7 @@ class DuplicateReviewView(QWidget):
         title_col.addWidget(subtitle)
         hdr_row.addLayout(title_col, stretch=1)
 
-        self._skip_btn = QPushButton('Skip for Now')
+        self._skip_btn = QPushButton('Cancel — Don\'t Consolidate')
         self._skip_btn.setFixedHeight(36)
         self._skip_btn.setStyleSheet(
             f'QPushButton {{ background: transparent; color: {_MUTED}; '
@@ -446,7 +464,7 @@ class DuplicateReviewView(QWidget):
             copy_rows.append((radio, row, copy))
             layout.addWidget(row)
 
-        def _update_selection(_btn: QCheckBox, checked: bool) -> None:
+        def _update_selection(_btn: QRadioButton, checked: bool) -> None:
             if not checked:
                 return
             for r, row_frame, c in copy_rows:
@@ -461,15 +479,58 @@ class DuplicateReviewView(QWidget):
 
         btn_group.buttonToggled.connect(_update_selection)
 
-        # Metadata note — only shown when copies genuinely disagree on a tag value
-        if group.metadata_conflicts:
-            fields = ', '.join(c.field for c in group.metadata_conflicts)
+        # Bottom note — different messaging for variants vs true duplicates
+        if group.tier == 'variant':
+            # Surface any meaningful differences to help the user decide
+            durations = [c.duration for c in group.copies if c.duration]
+            sizes     = [c.file_size for c in group.copies if c.file_size]
+            hints: list[str] = []
+            if len(durations) >= 2 and max(durations) - min(durations) > 2.0:
+                def _fmt_dur(s: float) -> str:
+                    return f'{int(s // 60)}:{int(s % 60):02d}'
+                hints.append(
+                    f'durations differ ({_fmt_dur(min(durations))} vs {_fmt_dur(max(durations))})'
+                )
+            if len(sizes) >= 2 and max(sizes) / max(min(sizes), 1) > 1.5:
+                hints.append(
+                    f'file sizes differ ({fmt_bytes(min(sizes))} vs {fmt_bytes(max(sizes))})'
+                )
+            if hints:
+                note_text = (
+                    f'These files have different {" and ".join(hints)} — they are likely '
+                    f'different recordings that share the same track name. '
+                    f'Only consolidate if you are certain they are the same file.'
+                )
+            else:
+                note_text = (
+                    'These may be different versions of the same song. '
+                    'Only consolidate if you are certain they are actual duplicates.'
+                )
+            note = QLabel(note_text)
+            note.setWordWrap(True)
+            note.setStyleSheet(
+                f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;'
+            )
+            layout.addWidget(note)
+
+        elif group.metadata_conflicts:
+            # Tier 1: plain-language metadata conflict note
+            conflicting = [c.field.upper() for c in group.metadata_conflicts]
+            if len(conflicting) == 1:
+                conflict_str = conflicting[0]
+            elif len(conflicting) == 2:
+                conflict_str = f'{conflicting[0]} and {conflicting[1]}'
+            else:
+                conflict_str = ', '.join(conflicting[:-1]) + f', and {conflicting[-1]}'
             warn = QLabel(
-                f'These copies have different {fields} tag{"s" if len(group.metadata_conflicts) > 1 else ""}. '
-                f'The checked copy\'s {"values" if len(group.metadata_conflicts) > 1 else "value"} win{"" if len(group.metadata_conflicts) > 1 else "s"}.'
+                f'{conflict_str} {"differs" if len(conflicting) == 1 else "differ"} '
+                f'between copies — the winner\'s '
+                f'{"value" if len(conflicting) == 1 else "values"} will be kept.'
             )
             warn.setWordWrap(True)
-            warn.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
+            warn.setStyleSheet(
+                f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;'
+            )
             layout.addWidget(warn)
 
         return card
@@ -492,12 +553,12 @@ class DuplicateReviewView(QWidget):
         h.setContentsMargins(12, 12, 12, 12)
         h.setSpacing(14)
 
-        radio = QCheckBox()
+        radio = QRadioButton()
         radio.setStyleSheet(
-            f'QCheckBox {{ background: transparent; border: none; spacing: 0; }}'
-            f'QCheckBox::indicator {{ width: 16px; height: 16px; }}'
-            f'QCheckBox::indicator:unchecked {{ image: url("{_ICON_UNCHECKED}"); }}'
-            f'QCheckBox::indicator:checked   {{ image: url("{_ICON_CHECKED}");   }}'
+            f'QRadioButton {{ background: transparent; border: none; spacing: 0; }}'
+            f'QRadioButton::indicator {{ width: 16px; height: 16px; }}'
+            f'QRadioButton::indicator:unchecked {{ image: url("{_ICON_RADIO_OFF}"); }}'
+            f'QRadioButton::indicator:checked   {{ image: url("{_ICON_RADIO_ON}");  }}'
         )
         h.addWidget(radio, alignment=Qt.AlignmentFlag.AlignVCenter)
 
@@ -561,10 +622,13 @@ class DuplicateReviewView(QWidget):
 
         if is_winner:
             reason = _winner_reason(copy, others)
+            advantages = _winner_metadata_advantages(copy, others)
             comment_note = _comment_merge_note(copy, others)
             label_text = f'✳  Keeping this one — {reason}'
+            if advantages:
+                label_text += f' — also has: {", ".join(advantages)}'
             if comment_note:
-                label_text += f' · {comment_note}'
+                label_text += f' — {comment_note}'
             rec_lbl = QLabel(label_text)
             rec_lbl.setWordWrap(True)
             rec_lbl.setStyleSheet(
@@ -589,7 +653,13 @@ class DuplicateReviewView(QWidget):
         h.addLayout(info_col, stretch=1)
 
         _r = radio
-        row.mousePressEvent = lambda event: _r.toggle()
+        _fp = str(copy.file_path)
+
+        def _on_row_press(_event, _radio=_r, _path=_fp) -> None:
+            _radio.toggle()
+            self.track_selected.emit(_path)
+
+        row.mousePressEvent = _on_row_press
 
         return radio, row
 

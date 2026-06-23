@@ -418,7 +418,7 @@ class _ChangeReviewDialog(_CrateSortDialog):
         )
         self._cancel_btn.clicked.connect(self.reject)
 
-        self._sync_btn = QPushButton('Sync & Proceed')
+        self._sync_btn = QPushButton('Sync && Proceed')
         self._sync_btn.setFixedHeight(36)
         self._sync_btn.setStyleSheet(
             'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
@@ -530,6 +530,36 @@ class _ChangeReviewDialog(_CrateSortDialog):
                 'QPushButton:hover { background: #383838; }'
             )
 
+        self._update_sync_btn_state()
+
+    def _update_sync_btn_state(self) -> None:
+        n_pending = len(self._pending_reverts)
+        n_total   = len(self._changes)
+        if n_pending == 0:
+            self._sync_btn.setText('Sync && Proceed')
+            self._sync_btn.setStyleSheet(
+                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+                'QPushButton:hover { background-color: #be6e2c; }'
+                'QPushButton:pressed { background-color: #aa5d21; }'
+            )
+        elif n_pending == n_total:
+            self._sync_btn.setText('Accept && Continue')
+            self._sync_btn.setStyleSheet(
+                'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+                'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+                'QPushButton:hover { background-color: #38706a; }'
+                'QPushButton:pressed { background-color: #2d6358; }'
+            )
+        else:
+            self._sync_btn.setText('Apply && Proceed')
+            self._sync_btn.setStyleSheet(
+                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+                'QPushButton:hover { background-color: #be6e2c; }'
+                'QPushButton:pressed { background-color: #aa5d21; }'
+            )
+
     # ── Sync action ───────────────────────────────────────────────────────────
 
     def _on_sync(self) -> None:
@@ -604,9 +634,9 @@ class _ChangeReviewDialog(_CrateSortDialog):
     def _can_revert(self, change: dict) -> bool:
         """Return True if this change type can be reverted."""
         ctype = change.get('type', '')
-        if ctype == 'crate_added':
-            return True   # just delete the file — no prev_tracks needed
-        return bool(change.get('prev_tracks'))   # all other types need the old track list
+        if ctype in ('crate_added', 'crate_removed'):
+            return True   # crate_added: delete the file; crate_removed: recreate (even if empty)
+        return bool(change.get('prev_tracks'))   # track changes need the old track list to restore
 
     @staticmethod
     def _fmt_time(dt: Optional[datetime]) -> str:
@@ -687,7 +717,7 @@ class DashboardWidget(QWidget):
 
     def refresh(self) -> None:
         if self._library_path and self._summary is not None:
-            self._check_serato_sync()
+            self._run_duplicate_detection()
             self._populate_dashboard()
 
     def set_library_path(self, path: Path) -> None:

@@ -3170,21 +3170,27 @@ class CrateManagerView(QWidget):
         if not new_paths:
             self._set_status(f'All {len(paths)} track(s) already in "{crate.name}"', teal=True)
             return
-        writer = self._writer()
-        if not writer:
+        if not self._writer():
             return
-        result = writer.add_tracks(crate_path, new_paths)
-        if not result.success:
-            _ov_alert(self, 'Add Tracks', f'Failed: {result.error}')
-            return
-        self._refresh(select=self._current_crate_path)
+        if self._undo_manager:
+            cmd = AddTracksCommand(
+                self, crate_path, new_paths, crate.name,
+                stay_on_crate=self._current_crate_path,
+            )
+            self._undo_manager.push(cmd)
+        else:
+            result = self._writer().add_tracks(crate_path, new_paths)
+            if not result.success:
+                _ov_alert(self, 'Add Tracks', f'Failed: {result.error}')
+                return
+            self._refresh(select=self._current_crate_path)
         if skip_count:
             self._set_status(
-                f'Added {result.tracks_affected} track(s) to "{crate.name}" '
+                f'Added {len(new_paths)} track(s) to "{crate.name}" '
                 f'({skip_count} already present, skipped)', teal=True
             )
         else:
-            self._set_status(f'Added {result.tracks_affected} track(s) to "{crate.name}"', teal=True)
+            self._set_status(f'Added {len(new_paths)} track(s) to "{crate.name}"', teal=True)
 
     def _on_header_clicked(self, _col: int) -> None:
         # Qt has already updated the sort indicator and re-sorted the table.

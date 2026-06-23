@@ -164,6 +164,7 @@ class MainWindow(QMainWindow):
         # Duplicate Review — index 5 (not a nav item; launched from dashboard banner)
         self._duplicate_review = DuplicateReviewView()
         self._duplicate_review.done.connect(self._on_rinse_done)
+        self._duplicate_review.track_selected.connect(self._update_album_art)
         self._content.addWidget(self._duplicate_review)
 
         root.addWidget(self._content)

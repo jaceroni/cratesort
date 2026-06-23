@@ -634,6 +634,8 @@ class LibraryBrowserView(QWidget):
         if not self._is_classification_complete() and self.isVisible():
             self._on_classify_clicked(auto_classify=True)
 
+        self._refresh_classify_btn()
+
     # ── Empty state ───────────────────────────────────────────────────
 
     def _build_empty(self) -> QWidget:
@@ -910,13 +912,19 @@ class LibraryBrowserView(QWidget):
         self._track_stack.setCurrentIndex(1 if has_genres else 0)
 
     def _count_unclassified_artists(self) -> int:
+        """Count artists that are Unclassified AND have no explicit genre in library_edits.
+        Artists set to Unclassified via right-click or accept are considered handled.
+        """
         _UC = {'', '—', 'Unclassified', 'Untagged'}
         count = 0
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
             if genre in _UC:
-                count += 1
+                data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+                artist = data.get('artist', '')
+                if 'genre' not in self._edits.get(f'__artist__{artist}', {}):
+                    count += 1
         return count
 
     def has_unsaved_classify_changes(self) -> bool:
@@ -927,6 +935,11 @@ class LibraryBrowserView(QWidget):
             return False
         flag_path = self._library_path / '_CrateSort' / 'classification_accepted.flag'
         return flag_path.exists()
+
+    def _refresh_classify_btn(self) -> None:
+        if self._classify_mode:
+            return
+        self._classify_btn.setEnabled(self._count_unclassified_artists() > 0)
 
     def _build_genre_sidebar(self) -> QFrame:
         frame = QFrame()
@@ -1393,15 +1406,18 @@ class LibraryBrowserView(QWidget):
         self._flash_row_text(item)
 
     def _flash_row_text(self, item: QTreeWidgetItem) -> None:
-        """Flash all cells in the row to teal for 1.5s, then restore cream."""
-        n    = self._tree.columnCount()
+        """Flash all cells in the row to teal for 1.5s, then restore original colors."""
+        n = self._tree.columnCount()
+        original = [item.foreground(c) for c in range(n)]
         teal = QBrush(QColor('#428175'))
-        cream = QBrush(QColor('#f1e3c8'))
         for c in range(n):
             item.setForeground(c, teal)
-        QTimer.singleShot(1500, lambda it=item: [
-            it.setForeground(c, cream) for c in range(n)
-        ])
+
+        def _restore(it=item, colors=original) -> None:
+            for c, brush in enumerate(colors):
+                it.setForeground(c, brush)
+
+        QTimer.singleShot(1500, _restore)
 
     def _cancel_active_editor(self) -> None:
         """Cancel the open editor: close without saving, no flash (Escape key)."""
@@ -2261,6 +2277,18 @@ class LibraryBrowserView(QWidget):
                 _last_accept_genre  = proposed
                 for rec in data.get('tracks', []):
                     _accepted_tracks.append((rec, proposed))
+
+        # Acknowledge any remaining Unclassified artists that have no existing edit entry.
+        # This records "seen and accepted as Unclassified" so the Classify button can disable.
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            artist = data.get('artist', '')
+            artist_key = f'__artist__{artist}'
+            if artist_key not in edits:
+                current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+                if current_genre in _UC:
+                    edits[artist_key] = {'genre': 'Unclassified'}
 
         edits_path.parent.mkdir(parents=True, exist_ok=True)
         save_success = False
