@@ -10,18 +10,31 @@ logger = logging.getLogger(__name__)
 
 _DB_FILENAME = 'database V2'
 
-# Module-level cache: serato_dir path → {file_path: datetime}
-_CACHE: dict[str, dict[str, datetime]] = {}
+
+# ---------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------
+
+class TrackDbEntry:
+    """Parsed per-track data from Serato's database V2."""
+    __slots__ = ('add_date', 'play_count')
+
+    def __init__(self, add_date: Optional[datetime], play_count: Optional[int]):
+        self.add_date   = add_date
+        self.play_count = play_count
 
 
-def read_track_add_dates(serato_dir: str | Path) -> dict[str, datetime]:
+# Module-level cache: serato_dir path → {file_path: TrackDbEntry}
+_CACHE: dict[str, dict[str, TrackDbEntry]] = {}
+
+
+def read_track_metadata(serato_dir: str | Path) -> dict[str, TrackDbEntry]:
     """
     Parse Serato's `database V2` and return a mapping of track file path
-    (from the `pfil` field) to the date the track was added to the library
-    (from the `uadd` field).
+    (from the `pfil` field) to a TrackDbEntry with add_date and play_count.
 
-    Results are cached in memory — the file is only parsed once per session
-    per serato_dir.  Returns an empty dict on any error; never raises.
+    Results are cached per serato_dir for the session lifetime.
+    Returns an empty dict on any error; never raises.
     """
     serato_dir = Path(serato_dir)
     cache_key  = str(serato_dir)
@@ -35,14 +48,38 @@ def read_track_add_dates(serato_dir: str | Path) -> dict[str, datetime]:
         return {}
 
     try:
-        result = _parse_database(db_path)
+        result = _parse_database_full(db_path)
     except Exception as exc:
         logger.warning('[DatabaseReader] Failed to parse %s: %s', db_path, exc)
         result = {}
 
     _CACHE[cache_key] = result
-    logger.info('[DatabaseReader] Loaded %d add-dates from %s', len(result), db_path)
+    logger.info('[DatabaseReader] Loaded %d track entries from %s', len(result), db_path)
     return result
+
+
+def read_track_play_counts(serato_dir: str | Path) -> dict[str, int]:
+    """
+    Convenience wrapper: returns only the play_count mapping.
+    Tracks with no play count entry are omitted.
+    """
+    return {
+        path: entry.play_count
+        for path, entry in read_track_metadata(serato_dir).items()
+        if entry.play_count is not None
+    }
+
+
+def read_track_add_dates(serato_dir: str | Path) -> dict[str, datetime]:
+    """
+    Return a mapping of track file path → add date.
+    Backed by read_track_metadata; results share the same cache.
+    """
+    return {
+        path: entry.add_date
+        for path, entry in read_track_metadata(serato_dir).items()
+        if entry.add_date is not None
+    }
 
 
 def clear_cache() -> None:
@@ -101,22 +138,22 @@ def _normalize_pfil_keys(raw_path: str) -> list[str]:
 # Internal parser
 # ---------------------------------------------------------------------------
 
-def _parse_database(db_path: Path) -> dict[str, datetime]:
+def _parse_database_full(db_path: Path) -> dict[str, TrackDbEntry]:
     """
     Parse the TLV-format `database V2` file.
 
     Top-level structure:
         vrsn record  (version string)
         otrk record  (one per track, contains inner TLV fields)
-        otrk record
         ...
 
-    Inner fields of interest inside each otrk:
+    Inner fields read from each otrk:
         pfil  — UTF-16 BE string, the track's file path
-        uadd  — 4-byte big-endian unsigned int, Unix timestamp of add date
+        uadd  — uint32 BE, Unix timestamp of add date
+        uply  — uint32 BE, play count
     """
     data   = db_path.read_bytes()
-    result: dict[str, datetime] = {}
+    result: dict[str, TrackDbEntry] = {}
     pos    = 0
     length = len(data)
 
@@ -146,22 +183,23 @@ def _parse_database(db_path: Path) -> dict[str, datetime]:
         pos += 8 + record_len
 
         if tag_str == 'otrk':
-            entry = _parse_otrk(record_data)
-            if entry:
-                file_path, add_ts = entry
+            parsed = _parse_otrk_full(record_data)
+            if parsed:
+                file_path, entry = parsed
                 for key in _normalize_pfil_keys(file_path):
-                    result.setdefault(key, add_ts)  # don't overwrite existing
+                    result.setdefault(key, entry)
 
     return result
 
 
-def _parse_otrk(otrk_data: bytes) -> Optional[tuple[str, datetime]]:
+def _parse_otrk_full(otrk_data: bytes) -> Optional[tuple[str, TrackDbEntry]]:
     """
-    Parse the inner TLV fields of a single `otrk` record.
-    Returns (file_path, add_datetime) or None if either field is missing.
+    Parse inner TLV fields of one `otrk` record.
+    Returns (file_path, TrackDbEntry) or None if pfil is missing.
     """
     file_path:  Optional[str]      = None
     add_date:   Optional[datetime] = None
+    play_count: Optional[int]      = None
     pos  = 0
     dlen = len(otrk_data)
 
@@ -204,10 +242,13 @@ def _parse_otrk(otrk_data: bytes) -> Optional[tuple[str, datetime]]:
             except (struct.error, OSError, OverflowError):
                 pass
 
-        # Early exit once both fields are found
-        if file_path and add_date:
-            return file_path, add_date
+        elif tag_str == 'uply' and field_len == 4:
+            try:
+                count = struct.unpack('>I', value)[0]
+                play_count = count  # 0 is valid (track added but never played)
+            except struct.error:
+                pass
 
-    if file_path and add_date:
-        return file_path, add_date
+    if file_path:
+        return file_path, TrackDbEntry(add_date=add_date, play_count=play_count)
     return None

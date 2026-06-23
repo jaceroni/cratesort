@@ -9,6 +9,7 @@ from typing import Optional
 
 from cratesort.src.core.duplicate_detector import DuplicateCopy, DuplicateGroup
 from cratesort.src.core.file_organizer import FileMoveOp, RollbackLog
+from cratesort.src.core.metadata_merger import merge_metadata
 from cratesort.src.serato.path_rewriter import PathChange, PathRewriter
 
 
@@ -104,6 +105,21 @@ class DuplicateConsolidator:
 
             if not changes:
                 continue
+
+            # Merge play counts, comments, and cue points from losers into winner
+            # before deleting anything — once files are gone, this data is gone.
+            if commit:
+                loser_paths    = [l.file_path for l in losers]
+                loser_comments = [l.comment for l in losers]
+                merge_result   = merge_metadata(
+                    winner_path=winner.file_path,
+                    loser_paths=loser_paths,
+                    winner_comment=winner.comment,
+                    loser_comments=loser_comments,
+                    serato_dir=self._serato_dir,
+                )
+                for err in merge_result.errors:
+                    all_errors.append(f'{group.canonical_title}: merge — {err}')
 
             # Reroute all crate references first (before deleting files)
             rewrite_result = None

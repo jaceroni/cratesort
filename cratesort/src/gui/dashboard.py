@@ -1469,11 +1469,30 @@ class DashboardWidget(QWidget):
         if not self._inventory:
             return
         try:
+            from collections import defaultdict
             from cratesort.src.core.duplicate_detector import DuplicateDetector
-            groups, summary = DuplicateDetector().detect(self._inventory)
+            from cratesort.src.serato.database_reader import read_track_play_counts
+
+            counts: dict[str, int] = defaultdict(int)
+            for tracks in self._current_crates.values():
+                if tracks:
+                    for track in tracks:
+                        counts[track] += 1
+            crate_count_map = dict(counts)
+
+            serato_dir     = self._library_path / '_Serato_' if self._library_path else None
+            play_count_map = read_track_play_counts(serato_dir) if serato_dir and serato_dir.exists() else {}
+
+            groups, summary = DuplicateDetector().detect(
+                self._inventory,
+                crate_count_map=crate_count_map,
+                play_count_map=play_count_map,
+            )
             self._dup_groups  = groups
             self._dup_summary = summary
-        except Exception:
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning('[DupDetect] Detection failed: %s', exc, exc_info=True)
             self._dup_groups  = []
             self._dup_summary = None
 

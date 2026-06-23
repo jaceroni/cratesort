@@ -33,11 +33,90 @@ _RED    = '#C75B5B'
 _SEP    = '#383838'
 _ROW    = '#242424'
 _ROW2   = '#2a2a2a'
+_DIM    = '#666666'
 
 # Stack indices
 _STATE_RESULTS      = 0
 _STATE_PROGRESS     = 1
 _STATE_CELEBRATION  = 2
+
+
+# ---------------------------------------------------------------------------
+# Winner reason helper
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_TRACK_NUM_RE = _re.compile(r'^\d+[\s.\-]')
+
+
+def _winner_reason(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> str:
+    """
+    Return a plain-language phrase explaining why this copy was chosen.
+    Checks criteria in priority order; reports the first one that actually
+    differentiates the winner from the losers.
+    """
+    if not losers:
+        return 'best available copy'
+
+    # Lossless format beats lossy
+    if winner.format in ('FLAC', 'WAV', 'AIFF'):
+        if any(l.format not in ('FLAC', 'WAV', 'AIFF') for l in losers):
+            return f'{winner.format} — lossless format'
+
+    # Higher bitrate
+    max_loser_br = max((l.bitrate or 0) for l in losers)
+    if (winner.bitrate or 0) > max_loser_br:
+        return f'higher quality ({winner.bitrate} kbps)'
+
+    # Larger file at same bitrate (better rip / more data)
+    max_loser_size = max(l.file_size for l in losers)
+    if winner.file_size > max_loser_size:
+        return 'larger file size'
+
+    # More metadata filled in
+    winner_meta = sum(1 for v in [winner.genre_tag, winner.year_tag, winner.bpm] if v)
+    max_loser_meta = max(sum(1 for v in [l.genre_tag, l.year_tag, l.bpm] if v) for l in losers)
+    if winner_meta > max_loser_meta:
+        return 'more complete metadata'
+
+    # More crates
+    max_loser_crates = max(l.crate_count for l in losers)
+    if winner.crate_count > max_loser_crates:
+        n = winner.crate_count
+        return f'in {n} crate{"s" if n != 1 else ""}'
+
+    # Cleaner filename (no leading track number like "02 Title.mp3")
+    winner_clean  = not bool(_TRACK_NUM_RE.match(winner.file_path.stem))
+    any_loser_messy = any(bool(_TRACK_NUM_RE.match(l.file_path.stem)) for l in losers)
+    if winner_clean and any_loser_messy:
+        return 'cleaner filename'
+
+    return 'best available copy'
+
+
+def _comment_merge_note(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> str:
+    """
+    Return a plain-language note about comment merging, or '' if nothing to say.
+
+    Cases:
+    - Winner has comment, at least one loser has a different comment
+      → 'comments from both copies will be merged'
+    - Winner has no comment, at least one loser has a comment
+      → 'comment from other copy will carry over'
+    - Otherwise → ''
+    """
+    loser_comments = [l.comment for l in losers if l.comment]
+    if not loser_comments:
+        return ''
+    if winner.comment:
+        # Both sides have comments — they'll be merged
+        if any(c != winner.comment for c in loser_comments):
+            return 'comments from both copies will be merged'
+        return ''
+    else:
+        # Winner is blank — loser comment carries over cleanly
+        return 'comment from other copy will carry over'
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +439,7 @@ class DuplicateReviewView(QWidget):
 
         for copy in group.copies:
             is_winner = (copy == winner)
-            radio, row = self._build_copy_row(copy, is_winner, winner)
+            radio, row = self._build_copy_row(copy, is_winner, winner, group.copies)
             btn_group.addButton(radio)
             if is_winner:
                 radio.setChecked(True)
@@ -395,7 +474,13 @@ class DuplicateReviewView(QWidget):
 
         return card
 
-    def _build_copy_row(self, copy: DuplicateCopy, is_winner: bool, winner: Optional[DuplicateCopy] = None) -> tuple:
+    def _build_copy_row(
+        self,
+        copy:       DuplicateCopy,
+        is_winner:  bool,
+        winner:     Optional[DuplicateCopy] = None,
+        all_copies: Optional[list]          = None,
+    ) -> tuple:
         row = QFrame()
         bg     = _ROW  if is_winner else _ROW2
         border = f'2px solid {_TEAL}' if is_winner else f'1px solid {_SEP}'
@@ -407,7 +492,6 @@ class DuplicateReviewView(QWidget):
         h.setContentsMargins(12, 12, 12, 12)
         h.setSpacing(14)
 
-        # Checkbox selector (exclusive per group via QButtonGroup)
         radio = QCheckBox()
         radio.setStyleSheet(
             f'QCheckBox {{ background: transparent; border: none; spacing: 0; }}'
@@ -417,11 +501,9 @@ class DuplicateReviewView(QWidget):
         )
         h.addWidget(radio, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # File info
         info_col = QVBoxLayout()
         info_col.setSpacing(3)
 
-        # Filename first — the primary differentiator between copies
         name_lbl = QLabel(copy.file_path.name)
         name_lbl.setStyleSheet(
             f'color: {_CREAM}; font-size: 13px; font-weight: 600; background: transparent; border: none;'
@@ -438,63 +520,74 @@ class DuplicateReviewView(QWidget):
         fmt_str += f'  ·  {fmt_bytes(copy.file_size)}'
 
         fmt_lbl = QLabel(fmt_str)
-        fmt_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 12px; background: transparent; border: none;')
+        fmt_lbl.setStyleSheet(f'color: {_DIM}; font-size: 12px; background: transparent; border: none;')
         info_col.addWidget(fmt_lbl)
 
-        path_lbl = QLabel(copy.folder_context)
-        path_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
+        path_lbl = QLabel(f'LOCATION: {copy.folder_context.replace("/", " > ").replace(" : ", " / ")}')
+        path_lbl.setStyleSheet(
+            f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;'
+        )
         info_col.addWidget(path_lbl)
 
-        # Supporting data — orange on winner (earns attention), muted on non-winner (context only)
-        detail_color = _ORANGE if is_winner else _MUTED
+        others = [c for c in (all_copies or []) if c != copy]
 
-        def _detail(text: str) -> QLabel:
+        def _differs(val, getter) -> bool:
+            return any(getter(c) != val for c in others)
+
+        def _detail(text: str, color: str = _MUTED) -> QLabel:
             lbl = QLabel(text)
             lbl.setWordWrap(True)
-            lbl.setStyleSheet(f'color: {detail_color}; font-size: 12px; background: transparent; border: none;')
+            lbl.setStyleSheet(f'color: {color}; font-size: 12px; background: transparent; border: none;')
             return lbl
 
         if copy.crate_count > 0:
             info_col.addWidget(_detail(
-                f'In {copy.crate_count} crate{"s" if copy.crate_count != 1 else ""}'
+                f'CRATES: {copy.crate_count}'
             ))
         if copy.play_count and copy.play_count > 0:
-            info_col.addWidget(_detail(f'{copy.play_count} plays in Serato'))
-        if copy.comment:
-            info_col.addWidget(_detail(f'Comment: "{copy.comment[:60]}"'))
-        if copy.genre_tag:
-            info_col.addWidget(_detail(f'Genre: {copy.genre_tag}'))
-        if copy.bpm:
-            info_col.addWidget(_detail(f'BPM: {int(copy.bpm)}'))
+            info_col.addWidget(_detail(f'PLAYS: {copy.play_count}'))
+        info_col.addWidget(_detail(
+            f'COMMENT: "{copy.comment[:60]}"' if copy.comment else 'COMMENT: N/A'
+        ))
+        info_col.addWidget(_detail(
+            f'GENRE: {copy.genre_tag}' if copy.genre_tag else 'GENRE: N/A'
+        ))
+        info_col.addWidget(_detail(
+            f'BPM: {int(copy.bpm)}' if copy.bpm else 'BPM: N/A'
+        ))
+        info_col.addWidget(_detail(
+            'ARTWORK: Yes' if copy.has_artwork else 'ARTWORK: No'
+        ))
 
         if is_winner:
-            rec_lbl = QLabel('✳  We recommend keeping this one')
+            reason = _winner_reason(copy, others)
+            comment_note = _comment_merge_note(copy, others)
+            label_text = f'✳  Keeping this one — {reason}'
+            if comment_note:
+                label_text += f' · {comment_note}'
+            rec_lbl = QLabel(label_text)
+            rec_lbl.setWordWrap(True)
             rec_lbl.setStyleSheet(
                 f'color: {_TEAL}; font-size: 11px; font-weight: 600; background: transparent; border: none;'
             )
             info_col.addWidget(rec_lbl)
 
         elif winner is not None:
-            # Orange only for data this copy has that the winner doesn't — worth the user's attention
-            if copy.comment and not winner.comment:
-                warn = QLabel(f'Choosing this preserves Comment: "{copy.comment[:60]}"')
-                warn.setWordWrap(True)
-                warn.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;')
-                info_col.addWidget(warn)
+            # Comments are always merged into the winner by Phase C Full — no warning needed.
+            # Only flag play count and crate count since those have visible impact.
             if copy.play_count and copy.play_count > (winner.play_count or 0):
-                warn = QLabel(f'Choosing this preserves {copy.play_count} plays in Serato')
-                warn.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;')
+                warn = QLabel(f'Play count from this copy will be added to the winner')
+                warn.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
                 info_col.addWidget(warn)
             if copy.crate_count > winner.crate_count:
                 warn = QLabel(
-                    f'Choosing this preserves {copy.crate_count} crate{"s" if copy.crate_count != 1 else ""}'
+                    f'⚠  Keeping the other copy loses {copy.crate_count} crate{"s" if copy.crate_count != 1 else ""}'
                 )
-                warn.setStyleSheet(f'color: {_ORANGE}; font-size: 11px; background: transparent; border: none;')
+                warn.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
                 info_col.addWidget(warn)
 
         h.addLayout(info_col, stretch=1)
 
-        # Clicking anywhere on the row toggles the checkbox
         _r = radio
         row.mousePressEvent = lambda event: _r.toggle()
 

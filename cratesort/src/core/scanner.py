@@ -58,6 +58,9 @@ class TrackRecord:
     sample_rate: Optional[int] = None  # Hz
     codec: Optional[str] = None
 
+    # Artwork
+    has_artwork: bool = False
+
     # Serato
     stems_path: Optional[Path] = None
 
@@ -280,6 +283,7 @@ class LibraryScanner:
         record.year = self._id3_text(tags, "TDRC")
         record.bpm = self._id3_float(tags, "TBPM")
         record.comment = self._id3_comment(tags)
+        record.has_artwork = any(k.startswith("APIC") for k in tags)
 
     def _read_mp4(self, record: TrackRecord, audio) -> None:
         tags = getattr(audio, "tags", None)
@@ -296,6 +300,7 @@ class LibraryScanner:
                 record.bpm = float(tags["tmpo"][0])
             except (IndexError, TypeError, ValueError):
                 pass
+        record.has_artwork = "covr" in tags
 
     def _read_vorbis(self, record: TrackRecord, audio) -> None:
         tags = getattr(audio, "tags", None)
@@ -313,6 +318,7 @@ class LibraryScanner:
                 record.bpm = float(bpm_str)
             except ValueError:
                 pass
+        record.has_artwork = bool(getattr(audio, "pictures", None))
 
     def _read_asf(self, record: TrackRecord, audio) -> None:
         tags = getattr(audio, "tags", None)

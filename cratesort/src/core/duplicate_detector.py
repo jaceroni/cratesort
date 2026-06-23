@@ -54,8 +54,9 @@ class DuplicateCopy:
     comment: Optional[str]
     bpm: Optional[float]
     has_stems: bool
+    has_artwork: bool
     crate_count: int           # how many crates reference this file
-    play_count: Optional[int]  # from Serato database (Phase C Full — None until implemented)
+    play_count: Optional[int]  # from Serato database
     folder_context: str        # human-readable path context
 
 
@@ -104,12 +105,16 @@ class DuplicateDetector:
         self,
         inventory: list[TrackRecord],
         crate_count_map: Optional[dict[str, int]] = None,
+        play_count_map:  Optional[dict[str, int]] = None,
     ) -> tuple[list[DuplicateGroup], DuplicateSummary]:
         """
         crate_count_map: maps file_path (as posix str) → number of crates that
         reference it. Build from CrateLibrary before calling.
+        play_count_map:  maps file_path (as posix str) → Serato play count.
+        Build from database_reader.read_track_play_counts() before calling.
         """
         self._crate_count_map = crate_count_map or {}
+        self._play_count_map  = play_count_map  or {}
         groups = self._fast_pass(inventory)
         summary = self._summarize(groups)
         return groups, summary
@@ -203,8 +208,9 @@ class DuplicateDetector:
 
     def _make_copy(self, rec: TrackRecord) -> DuplicateCopy:
         parts = rec.path.parts
-        context = str(Path(*parts[-3:-1])) if len(parts) >= 3 else str(rec.path.parent)
+        context = str(Path(*parts[-4:-1])) if len(parts) >= 4 else str(rec.path.parent)
         crate_count = self._crate_count_map.get(rec.path.as_posix(), 0)
+        play_count  = self._play_count_map.get(rec.path.as_posix())
 
         return DuplicateCopy(
             file_path=rec.path,
@@ -217,8 +223,9 @@ class DuplicateDetector:
             comment=rec.comment,
             bpm=rec.bpm,
             has_stems=rec.stems_path is not None,
+            has_artwork=rec.has_artwork,
             crate_count=crate_count,
-            play_count=None,   # Phase C Full: read from Serato database V2
+            play_count=play_count,
             folder_context=context,
         )
 
@@ -282,32 +289,38 @@ class DuplicateDetector:
             return None
 
         def score(c: DuplicateCopy) -> tuple:
-            # Priority (descending): crate presence, play count, bitrate,
-            # metadata completeness, has comment, has stems, clean filename
-            crate_count       = c.crate_count
-            play_count        = c.play_count or 0
+            # Quality-first priority (descending):
+            # 1. Format: lossless (FLAC/WAV/AIFF) beats lossy
+            # 2. Bitrate: higher is better audio quality
+            # 3. File size: larger = better encode at same bitrate
+            # 4. Metadata completeness: more filled fields
+            # 5. Crate count: which copy is actually in use
+            # 6. Has stems
+            # 7. Clean filename (no leading track numbers)
+            # Play count is intentionally excluded — usage ≠ quality.
+            # All plays are summed into the winner regardless of which copy had them.
+            format_rank       = 2 if c.format in ('FLAC', 'WAV', 'AIFF') else 1
             bitrate           = c.bitrate or 0
+            file_size         = c.file_size
             meta_completeness = sum(1 for v in [c.genre_tag, c.year_tag, c.bpm] if v)
-            has_comment       = int(bool(c.comment))
+            crate_count       = c.crate_count
             has_stems         = int(c.has_stems)
-            # Prefer filenames without leading track numbers (e.g. "02 Title.mp3")
             clean_filename    = 0 if re.match(r'^\d+[\s\.\-]', c.file_path.stem) else 1
-            return (crate_count, play_count, bitrate, meta_completeness, has_comment, has_stems, clean_filename)
+            return (format_rank, bitrate, file_size, meta_completeness,
+                    crate_count, has_stems, clean_filename)
 
         return max(copies, key=score)
 
     def _winner_reasoning(self, winner: DuplicateCopy, _all_copies: list[DuplicateCopy]) -> str:
         """Human-readable explanation of why this copy was chosen."""
         reasons = []
+        if winner.format in ('FLAC', 'WAV', 'AIFF'):
+            reasons.append(winner.format)
+        if winner.bitrate:
+            reasons.append(f'{winner.bitrate} kbps')
         if winner.crate_count > 0:
             n = winner.crate_count
             reasons.append(f'in {n} crate{"s" if n != 1 else ""}')
-        if winner.play_count and winner.play_count > 0:
-            reasons.append(f'{winner.play_count} plays')
-        if winner.bitrate:
-            reasons.append(f'{winner.bitrate} kbps')
-        if winner.format:
-            reasons.append(winner.format)
         return ' · '.join(reasons) if reasons else 'best available copy'
 
     # ── Conflict detection ────────────────────────────────────────────────────
