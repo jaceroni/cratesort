@@ -107,11 +107,11 @@ QPushButton {{
     background-color: {C['orange']};
     color: #ffffff;
     border: 1px solid transparent;
-    border-radius: 5px;
-    padding: 7px 16px;
+    border-radius: 6px;
+    padding: 0 16px;
     font-size: 13px;
     font-weight: 600;
-    min-height: 28px;
+    min-height: 36px;
     margin: 0px;
 }}
 QPushButton:hover {{
@@ -132,6 +132,7 @@ QPushButton[secondary="true"] {{
     font-weight: 400;
     border-radius: 6px;
     border: 1px solid transparent;
+    min-height: 36px;
     margin: 0px;
 }}
 QPushButton[secondary="true"]:hover {{
@@ -152,6 +153,7 @@ QPushButton[flat=true] {{
     color: {C['text']};
     border: 1px solid {C['border']};
     font-weight: 400;
+    min-height: 36px;
     margin: 0px;
 }}
 QPushButton[flat="true"]:hover,
@@ -219,7 +221,7 @@ QComboBox {{
     background-color: {C['bg_input']};
     color: {C['text']};
     border: 1px solid {C['border']};
-    border-radius: 4px;
+    border-radius: 6px;
     padding: 5px 8px;
     min-height: 28px;
 }}

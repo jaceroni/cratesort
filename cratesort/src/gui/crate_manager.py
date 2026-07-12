@@ -1057,6 +1057,10 @@ class CrateManagerView(QWidget):
             return
 
         self._stack.setCurrentIndex(1)
+        # This is the actual moment the toolbar/splitter first become visible —
+        # showEvent() on the outer view can fire earlier, while this page was
+        # still hidden behind the empty-state page, syncing against stale sizes.
+        QTimer.singleShot(0, self._on_splitter_moved)
         self._set_status('Loading crates…')
         QApplication.processEvents()
 
@@ -1095,6 +1099,11 @@ class CrateManagerView(QWidget):
         # Reapply selection state after returning to the Crates tab
         if self._prev_selected_item and self._crate_delegate:
             self._on_tree_selection_changed(self._prev_selected_item, None)
+        # The splitter can settle on a different width than requested once actually
+        # shown — a QTimer.singleShot(0, ...) right after construction fires too
+        # early (the view is still hidden inside the tab stack), so sync here
+        # instead, on every real appearance of this tab.
+        self._on_splitter_moved()
 
     def _on_new_crate(self) -> None:
         self._crate_new(parent_path=None)
@@ -1151,16 +1160,100 @@ class CrateManagerView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        layout.addWidget(self._build_toolbar())
+
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
         self._splitter.setHandleWidth(1)
         self._splitter.addWidget(self._build_crate_panel())
         self._splitter.addWidget(self._build_track_panel())
         self._splitter.setSizes([280, 900])
+        self._splitter.splitterMoved.connect(self._on_splitter_moved)
 
         layout.addWidget(self._splitter, stretch=1)
         layout.addWidget(self._build_status_bar())
         return w
+
+    def _build_toolbar(self) -> QFrame:
+        tb = QFrame()
+        tb.setStyleSheet('QFrame { background: #252525; border-bottom: 1px solid #444; }')
+        row = QHBoxLayout(tb)
+        row.setContentsMargins(0, 0, 12, 0)
+        row.setSpacing(0)
+
+        # Crate-search column — fixed width kept in sync with the splitter's left
+        # pane (see _on_splitter_moved) so the divider below lines up exactly.
+        crate_col = QWidget()
+        crate_col.setStyleSheet('background: #252525;')
+        crate_col.setFixedWidth(280)
+        crate_col_layout = QHBoxLayout(crate_col)
+        crate_col_layout.setContentsMargins(12, 16, 12, 16)
+
+        self._crate_search = QLineEdit()
+        self._crate_search.setPlaceholderText('Search crates…')
+        self._crate_search.setClearButtonEnabled(True)
+        self._crate_search.setFixedHeight(36)
+        self._crate_search.textChanged.connect(self._filter_crates)
+        crate_col_layout.addWidget(self._crate_search)
+        row.addWidget(crate_col)
+        self._toolbar_crate_col = crate_col
+
+        # Vertical divider — continues the crate tree's border-right line up
+        # through the toolbar, all the way to the top of the view.
+        divider = QFrame()
+        divider.setFixedWidth(1)
+        divider.setStyleSheet(f'background: {_BORDER};')
+        row.addWidget(divider)
+
+        # Track-search column — same left clearance as the crate search box has.
+        track_col = QWidget()
+        track_col.setStyleSheet('background: #252525;')
+        track_col_layout = QHBoxLayout(track_col)
+        track_col_layout.setContentsMargins(12, 16, 0, 16)
+
+        self._track_search = QLineEdit()
+        self._track_search.setPlaceholderText('Search tracks by title, artist, or album…')
+        self._track_search.setClearButtonEnabled(True)
+        self._track_search.setMaximumWidth(460)
+        self._track_search.setFixedHeight(36)
+        self._track_search.textChanged.connect(self._filter_tracks)
+        track_col_layout.addWidget(self._track_search)
+        row.addWidget(track_col)
+
+        row.addStretch()
+
+        new_crate_btn = QPushButton('＋ New Crate')
+        new_crate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_crate_btn.setFixedHeight(36)
+        new_crate_btn.setStyleSheet(
+            f'QPushButton {{ background: {_ORANGE}; color: #ffffff; font-size: 13px; '
+            f'font-weight: 600; border: none; border-radius: 6px; padding: 0 12px; }}'
+            f'QPushButton:hover {{ background: #b8682a; }}'
+            f'QPushButton:pressed {{ background: #9c5520; }}'
+        )
+        new_crate_btn.clicked.connect(self._on_new_crate)
+        row.addWidget(new_crate_btn)
+
+        row.addSpacing(16)
+
+        smart_crate_btn = QPushButton('✦ Smart Crate')
+        smart_crate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        smart_crate_btn.setFixedHeight(36)
+        smart_crate_btn.setStyleSheet(
+            f'QPushButton {{ background: {_TEAL}; color: #ffffff; font-size: 13px; '
+            f'font-weight: 600; border: none; border-radius: 6px; padding: 0 12px; }}'
+            f'QPushButton:hover {{ background: #38706a; }}'
+            f'QPushButton:pressed {{ background: #2d6358; }}'
+        )
+        smart_crate_btn.clicked.connect(self._on_new_smart_crate)
+        row.addWidget(smart_crate_btn)
+
+        return tb
+
+    def _on_splitter_moved(self, pos: int = 0, index: int = 0) -> None:
+        sizes = self._splitter.sizes()
+        if sizes:
+            self._toolbar_crate_col.setFixedWidth(sizes[0])
 
     # ── Crate panel (left) ─────────────────────────────────────────────
 
@@ -1171,50 +1264,6 @@ class CrateManagerView(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        # ── Search ────────────────────────────────────────────────────────
-        self._crate_search = QLineEdit()
-        self._crate_search.setPlaceholderText('Search crates…')
-        self._crate_search.setClearButtonEnabled(True)
-        self._crate_search.setFixedHeight(36)
-        self._crate_search.setStyleSheet(
-            f'QLineEdit {{ background: #252525; border: none; '
-            f'border-bottom: 1px solid {_BORDER}; '
-            f'color: {_CREAM}; padding: 0px 12px; }}'
-        )
-        self._crate_search.textChanged.connect(self._filter_crates)
-        layout.addWidget(self._crate_search)
-
-        # ── New crate buttons — fixed height matches track table header ──────
-        btn_container = QWidget()
-        btn_container.setFixedHeight(45)
-        btn_row = QHBoxLayout(btn_container)
-        btn_row.setContentsMargins(8, 5, 8, 5)
-        btn_row.setSpacing(6)
-
-        new_crate_btn = QPushButton('＋ New Crate')
-        new_crate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        new_crate_btn.setStyleSheet(
-            f'QPushButton {{ background: {_ORANGE}; color: #ffffff; font-size: 12px; '
-            f'font-weight: 600; border: none; border-radius: 5px; padding: 0 10px; }}'
-            f'QPushButton:hover {{ background: #b8682a; }}'
-            f'QPushButton:pressed {{ background: #9c5520; }}'
-        )
-        new_crate_btn.clicked.connect(self._on_new_crate)
-        btn_row.addWidget(new_crate_btn)
-
-        smart_crate_btn = QPushButton('✦ Smart Crate')
-        smart_crate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        smart_crate_btn.setStyleSheet(
-            f'QPushButton {{ background: {_TEAL}; color: #ffffff; font-size: 12px; '
-            f'font-weight: 600; border: none; border-radius: 5px; padding: 0 10px; }}'
-            f'QPushButton:hover {{ background: #38706a; }}'
-            f'QPushButton:pressed {{ background: #2d6358; }}'
-        )
-        smart_crate_btn.clicked.connect(self._on_new_smart_crate)
-        btn_row.addWidget(smart_crate_btn)
-
-        layout.addWidget(btn_container)
 
         sep = QFrame()
         sep.setFixedHeight(1)
@@ -1307,18 +1356,6 @@ class CrateManagerView(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        self._track_search = QLineEdit()
-        self._track_search.setPlaceholderText('Search tracks by title, artist, or album…')
-        self._track_search.setClearButtonEnabled(True)
-        self._track_search.setFixedHeight(36)
-        self._track_search.setStyleSheet(
-            f'QLineEdit {{ background: #252525; border: none; '
-            f'border-bottom: 1px solid {_BORDER}; '
-            f'color: {_CREAM}; padding: 0px 12px; }}'
-        )
-        self._track_search.textChanged.connect(self._filter_tracks)
-        layout.addWidget(self._track_search)
 
         self._track_table = _ReorderableTable()
         self._track_table.setColumnCount(len(_TRACK_HEADERS))

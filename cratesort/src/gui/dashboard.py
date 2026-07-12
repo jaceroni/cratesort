@@ -32,6 +32,7 @@ sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
 from cratesort.src.utils.checkpoint import save_checkpoint, load_checkpoint, detect_changes
 from cratesort.src.serato.database_reader import read_track_add_dates
 from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _create_dialog_layout
+from cratesort.src.gui.yt_import_dialog import _YTImportDialog
 
 _ASSETS         = Path(__file__).parent.parent.parent / 'assets'
 _LOGO_SVG       = _ASSETS / 'logo' / 'cs-logo-mascot-stacked.svg'
@@ -139,30 +140,88 @@ class _ScanWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Clickable card — full-surface click + hover border
+# Icon action card — text top-left, large muted icon top-right that lights up
+# on hover. Same treatment as _WorkflowCard, sized for a compact row.
 # ---------------------------------------------------------------------------
 
-class _ClickableCard(QFrame):
-    def __init__(self, callback, base_style: str, hover_style: str, parent=None):
+class _IconActionCard(QFrame):
+    _ICON_DIM    = '#2a2a2a'
+    _ICON_ACTIVE = '#D17D34'
+
+    def __init__(
+        self, title: str, desc: str, callback, icon_path,
+        rest_style: str, hover_style: str, icon_size: int = 60, parent=None,
+    ):
         super().__init__(parent)
         self._callback    = callback
-        self._base_style  = base_style
+        self._rest_style  = rest_style
         self._hover_style = hover_style
-        self.setStyleSheet(base_style)
+        self._icon_svg: QSvgWidget | None = None
+        self._svg_bytes: bytes | None = None
+
+        self.setStyleSheet(rest_style)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._callback()
-        super().mousePressEvent(event)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 14, 14, 14)
+        row.setSpacing(8)
+
+        col = QVBoxLayout()
+        col.setSpacing(4)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            'font-size: 13px; font-weight: 500; color: #D17D34; '
+            'background: transparent; border: none;'
+        )
+        col.addWidget(title_lbl)
+
+        desc_lbl = QLabel()
+        desc_lbl.setTextFormat(Qt.TextFormat.RichText)
+        desc_lbl.setText(f'<div style="line-height: 16.5px;">{desc}</div>')
+        desc_lbl.setStyleSheet(
+            'font-size: 12px; color: #a89b85; background: transparent; border: none;'
+        )
+        desc_lbl.setWordWrap(True)
+        col.addWidget(desc_lbl)
+        col.addStretch()
+
+        row.addLayout(col, stretch=1)
+
+        if _SVG_AVAILABLE and icon_path and Path(icon_path).exists():
+            try:
+                self._svg_bytes = Path(icon_path).read_bytes()
+                self._icon_svg = QSvgWidget()
+                self._icon_svg.setFixedSize(icon_size, icon_size)
+                self._icon_svg.setStyleSheet('background: transparent;')
+                self._icon_svg.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                self._load_icon_color(self._ICON_DIM)
+                row.addWidget(self._icon_svg, alignment=Qt.AlignmentFlag.AlignTop)
+            except Exception:
+                pass
+
+    def _load_icon_color(self, color: str) -> None:
+        if self._icon_svg and self._svg_bytes:
+            from PyQt6.QtCore import QByteArray
+            colored = self._svg_bytes.decode('utf-8').replace(
+                '#d17d34', color
+            ).replace('#D17D34', color)
+            self._icon_svg.load(QByteArray(colored.encode('utf-8')))
 
     def enterEvent(self, event):
         self.setStyleSheet(self._hover_style)
+        self._load_icon_color(self._ICON_ACTIVE)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.setStyleSheet(self._base_style)
+        self.setStyleSheet(self._rest_style)
+        self._load_icon_color(self._ICON_DIM)
         super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._callback:
+            self._callback()
+        super().mousePressEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +296,7 @@ class _WorkflowCard(QFrame):
     _ICON_DIM    = '#2a2a2a'
     _ICON_ACTIVE = '#D17D34'
 
-    def __init__(self, _step: str, title: str, desc: str, callback, icon_path=None, highlighted: bool = False, parent=None):
+    def __init__(self, _step: str, title: str, desc: str, callback, icon_path=None, highlighted: bool = False, footer: str = None, parent=None):
         super().__init__(parent)
         self._callback  = callback
         self._icon_path = icon_path
@@ -256,9 +315,12 @@ class _WorkflowCard(QFrame):
         self.setStyleSheet(self.style_rest)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        # Outer row: text on left, icon on right
-        row = QHBoxLayout(self)
-        row.setContentsMargins(18, 14, 14, 14)
+        # Outer column: text/icon row on top, full-width footer at the bottom
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(18, 14, 14, 14)
+        outer_layout.setSpacing(4)
+
+        row = QHBoxLayout()
         row.setSpacing(0)
 
         col = QVBoxLayout()
@@ -271,13 +333,14 @@ class _WorkflowCard(QFrame):
         )
         col.addWidget(title_lbl)
 
-        desc_lbl = QLabel(desc)
+        desc_lbl = QLabel()
+        desc_lbl.setTextFormat(Qt.TextFormat.RichText)
+        desc_lbl.setText(f'<div style="line-height: 16.5px;">{desc}</div>')
         desc_lbl.setStyleSheet(
-            'font-size: 11px; color: #a89b85; background: transparent; border: none;'
+            'font-size: 12px; color: #a89b85; background: transparent; border: none;'
         )
         desc_lbl.setWordWrap(True)
         col.addWidget(desc_lbl)
-
         col.addStretch()
 
         row.addLayout(col, stretch=1)
@@ -294,6 +357,19 @@ class _WorkflowCard(QFrame):
                 row.addWidget(self._icon_svg, alignment=Qt.AlignmentFlag.AlignTop)
             except Exception:
                 pass
+
+        outer_layout.addLayout(row)
+        outer_layout.addStretch()
+
+        if footer:
+            footer_lbl = QLabel()
+            footer_lbl.setTextFormat(Qt.TextFormat.RichText)
+            footer_lbl.setText(f'<div style="line-height: 16.5px;">{footer}</div>')
+            footer_lbl.setStyleSheet(
+                'font-size: 12px; color: #5a5a5a; background: transparent; border: none;'
+            )
+            footer_lbl.setWordWrap(True)
+            outer_layout.addWidget(footer_lbl)
 
     def _load_icon_color(self, color: str) -> None:
         if self._icon_svg and self._svg_bytes:
@@ -473,10 +549,10 @@ class _ChangeReviewDialog(_CrateSortDialog):
         can_revert = self._can_revert(change)
         if can_revert:
             revert_btn = QPushButton('Revert')
-            revert_btn.setFixedHeight(26)
+            revert_btn.setFixedHeight(36)
             revert_btn.setStyleSheet(
-                'QPushButton { background: #C75B5B; color: #ffffff; font-size: 11px; font-weight: 600; '
-                'border: none; border-radius: 4px; padding: 2px 10px; }'
+                'QPushButton { background: #C75B5B; color: #ffffff; font-size: 13px; font-weight: 600; '
+                'border: none; border-radius: 6px; padding: 0 12px; }'
                 'QPushButton:hover { background: #b24c4c; }'
                 'QPushButton:pressed { background: #9c3b3b; }'
             )
@@ -668,10 +744,7 @@ class DashboardWidget(QWidget):
     classify_requested        = pyqtSignal()
     crates_requested          = pyqtSignal()
     organize_requested        = pyqtSignal()
-    new_crate_requested       = pyqtSignal()
-    new_smart_crate_requested = pyqtSignal()
     duplicates_requested      = pyqtSignal()   # user clicked the duplicate banner
-    add_tracks_requested      = pyqtSignal()   # user wants to add files to library folder
     status_message            = pyqtSignal(str, str)  # (message, state)
 
     def __init__(self, parent=None, saved_path: Optional[Path] = None):
@@ -1123,10 +1196,16 @@ class DashboardWidget(QWidget):
 
         _icons = _ASSETS / 'icons'
         goto_cards = [
-            ('01', 'Manage Library',   'Browse and edit your track library',          self.classify_requested.emit,    _icons / 'icon-library.svg'),
-            ('02', 'Manage Crates',    'Build crates and edit tracks',                self.crates_requested.emit,      _icons / 'icon-crates.svg'),
-            ('03', 'Organize Media',   'Manage folders and file locations',           self.organize_requested.emit,    _icons / 'icon-organize.svg'),
-            ('04', 'Add Tracks',       'Drop files in your library — no Serato needed', self.add_tracks_requested.emit,  _icons / 'icon-add-tracks.svg'),
+            ('01', 'Manage Library', 'Start here to clean all of your media files by reviewing '
+                                      'and updating metadata and filenames.',
+             self.classify_requested.emit, _icons / 'icon-library.svg', None),
+            ('02', 'Manage Crates',  'Once your media has been cleaned, come here to browse, '
+                                      'create, edit, and export your Serato crates.',
+             self.crates_requested.emit, _icons / 'icon-crates.svg', None),
+            ('03', 'Organize Media', 'Consolidate duplicates and reorganize all of your media '
+                                      'files without affecting your Serato crates.',
+             self.organize_requested.emit, _icons / 'icon-organize.svg',
+             'CrateSort’s Organization Logic:<br>Your Library Folder > Media > Genre > Artist > Files'),
         ]
 
         goto_widget = QWidget()
@@ -1135,68 +1214,48 @@ class DashboardWidget(QWidget):
         goto_grid.setSpacing(10)
 
         highlight_manage_library = not self._is_classification_complete()
-        for col_idx, (step, title, desc, action, icon_path) in enumerate(goto_cards):
+        for col_idx, (step, title, desc, action, icon_path, footer) in enumerate(goto_cards):
             card = _WorkflowCard(
                 step, title, desc, action, icon_path=icon_path,
                 highlighted=(highlight_manage_library and title == 'Manage Library'),
+                footer=footer,
             )
             goto_grid.addWidget(card, 0, col_idx)
 
         vbox.addWidget(goto_widget)
 
-        # Create cards — each has its own accent color
-        create_defs = [
+        # ── YouTube import cards ──────────────────────────────────────────
+        yt_defs = [
             {
-                'icon': '＋', 'title': 'New Crate', 'desc': 'Start with a fresh crate',
-                'action': self.new_crate_requested.emit,
-                'accent': self._ORANGE,
-                'base':  'QFrame { background-color: #2a2218; border: 0.5px solid #4a3520; border-radius: 10px; }',
-                'hover': f'QFrame {{ background-color: #2e2519; border: 0.5px solid {self._ORANGE}; border-radius: 10px; }}',
+                'icon_path': _icons / 'icon-mp4.svg', 'title': 'YouTube to MP4',
+                'desc': 'Convert to video file  ·  1080p',
+                'action': lambda: self._open_yt_import('mp4'),
+                'base':  _WorkflowCard._STYLE_REST,
+                'hover': _WorkflowCard._STYLE_HOVER,
             },
             {
-                'icon': '✦', 'title': 'New Smart Crate', 'desc': 'Create a rule-based crate',
-                'action': self.new_smart_crate_requested.emit,
-                'accent': self._ORANGE,
-                'base':  'QFrame { background-color: #2a2218; border: 0.5px solid #4a3520; border-radius: 10px; }',
-                'hover': f'QFrame {{ background-color: #2e2519; border: 0.5px solid {self._ORANGE}; border-radius: 10px; }}',
+                'icon_path': _icons / 'icon-mp3.svg', 'title': 'YouTube to MP3',
+                'desc': 'Convert to audio file  ·  VBR',
+                'action': lambda: self._open_yt_import('mp3'),
+                'base':  _WorkflowCard._STYLE_REST,
+                'hover': _WorkflowCard._STYLE_HOVER,
             },
         ]
 
-        create_widget = QWidget()
-        create_grid = QGridLayout(create_widget)
-        create_grid.setContentsMargins(0, 0, 0, 0)
-        create_grid.setSpacing(10)
+        yt_widget = QWidget()
+        yt_grid = QGridLayout(yt_widget)
+        yt_grid.setContentsMargins(0, 0, 0, 0)
+        yt_grid.setSpacing(10)
 
-        for col_idx, defn in enumerate(create_defs):
-            card = _ClickableCard(defn['action'], defn['base'], defn['hover'])
+        for col_idx, defn in enumerate(yt_defs):
+            card = _IconActionCard(
+                defn['title'], defn['desc'], defn['action'], defn['icon_path'],
+                defn['base'], defn['hover'],
+            )
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(14, 16, 14, 16)
-            card_layout.setSpacing(4)
+            yt_grid.addWidget(card, 0, col_idx)
 
-            icon_lbl = QLabel(defn['icon'])
-            icon_lbl.setStyleSheet(
-                f'font-size: 20px; color: {defn["accent"]}; background: transparent; border: none;'
-            )
-            card_layout.addWidget(icon_lbl)
-
-            title_lbl = QLabel(defn['title'])
-            title_lbl.setStyleSheet(
-                f'font-size: 13px; font-weight: 500; color: {self._CREAM}; '
-                f'background: transparent; border: none;'
-            )
-            card_layout.addWidget(title_lbl)
-
-            desc_lbl = QLabel(defn['desc'])
-            desc_lbl.setStyleSheet(
-                'font-size: 11px; color: #7a6a55; background: transparent; border: none;'
-            )
-            desc_lbl.setWordWrap(True)
-            card_layout.addWidget(desc_lbl)
-
-            create_grid.addWidget(card, 0, col_idx)
-
-        vbox.addWidget(create_widget)
+        vbox.addWidget(yt_widget)
         return outer
 
     def _build_activity_section(self, serato_dir: Optional[Path]) -> QWidget:
@@ -1399,6 +1458,19 @@ class DashboardWidget(QWidget):
 
     # ── Slots ─────────────────────────────────────────────────────────
 
+    def _open_yt_import(self, fmt: str) -> None:
+        from cratesort.src.gui.classifier_view import ALL_GENRES
+        library_genres: set[str] = set()
+        if self._summary is not None:
+            library_genres = {g for g in self._summary.unique_genres if g}
+        genres = sorted(library_genres | set(ALL_GENRES), key=str.lower)
+        artists = sorted(
+            {tr.artist for tr in self._inventory if getattr(tr, 'artist', None)},
+            key=str.lower,
+        )
+        dlg = _YTImportDialog(fmt, self._library_path, genres, artists, self)
+        dlg.exec()
+
     def _on_select_library(self) -> None:
         # Reset always_load_last so the dialog appears on next startup
         self._settings.setValue('always_load_last', False)
@@ -1587,13 +1659,14 @@ class DashboardWidget(QWidget):
         btn = QPushButton('Review && Sync…')
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(self._on_review_sync_clicked)
+        btn.setFixedHeight(36)
         btn.setStyleSheet(
-            'QPushButton { background-color: #428175; color: #ffffff; border: none; border-radius: 4px; padding: 6px 14px; font-weight: 600; font-size: 12px; min-width: 170px; }'
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; border-radius: 6px; padding: 0 16px; font-weight: 600; font-size: 13px; min-width: 170px; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
         layout.addWidget(btn)
-        
+
         return banner
 
     def _on_scan_error(self, message: str) -> None:

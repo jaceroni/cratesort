@@ -126,17 +126,13 @@ class MainWindow(QMainWindow):
         self._dashboard.classify_requested.connect(self._on_library_requested)
         self._dashboard.crates_requested.connect(self._on_crates_requested)
         self._dashboard.organize_requested.connect(self._on_organize_requested)
-        self._dashboard.new_crate_requested.connect(self._on_new_crate_requested)
-        self._dashboard.new_smart_crate_requested.connect(self._on_new_smart_crate_requested)
         self._dashboard.scan_finished.connect(self._on_scan_finished)
         self._dashboard.duplicates_requested.connect(self._on_duplicates_requested)
-        self._dashboard.add_tracks_requested.connect(self._on_add_tracks_requested)
         self._content.addWidget(self._dashboard)
 
         # Library Browser — index 1
         self._library_browser = LibraryBrowserView()
         self._library_browser.album_art_requested.connect(self._update_album_art)
-        self._library_browser.add_tracks_requested.connect(self._on_add_tracks_requested)
         self._content.addWidget(self._library_browser)
 
         # Crate Manager — index 2
@@ -254,19 +250,22 @@ class MainWindow(QMainWindow):
 
         self._undo_btn = QPushButton('Undo')
         self._undo_btn.setEnabled(False)
+        self._undo_btn.setFixedHeight(36)
         self._undo_btn.setStyleSheet(
             f'QPushButton {{ background: transparent; color: {C["text_muted"]}; '
-            f'border: 1px solid {C["border"]}; border-radius: 4px; '
-            f'font-size: 11px; padding: 4px 6px; }}'
+            f'border: 1px solid {C["border"]}; border-radius: 6px; '
+            f'font-size: 13px; padding: 0 12px; }}'
             f'QPushButton:enabled {{ color: {C["teal"]}; border-color: {C["teal"]}; }}'
             f'QPushButton:enabled:hover {{ background: rgba(66,129,117,0.15); }}'
         )
         self._undo_btn.clicked.connect(self._do_undo)
+        self._undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._redo_btn = QPushButton('Redo')
         self._redo_btn.setEnabled(False)
         self._redo_btn.setStyleSheet(self._undo_btn.styleSheet())
         self._redo_btn.clicked.connect(self._do_redo)
+        self._redo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         ur_layout.addWidget(self._undo_btn)
         ur_layout.addWidget(self._redo_btn)
@@ -421,7 +420,7 @@ class MainWindow(QMainWindow):
         _active = (
             'QPushButton { background: #428175; color: #ffffff; border: none;'
             ' border-radius: 6px; font-size: 13px; font-weight: 400; padding: 6px 8px;'
-            ' min-height: 28px; cursor: pointer; }'
+            ' min-height: 28px; }'
             'QPushButton:hover { background: #38706a; }'
             'QPushButton:pressed { background: #2d6358; }'
         )
@@ -561,6 +560,7 @@ class MainWindow(QMainWindow):
         self._on_nav_by_id('organize')
 
     def _on_add_tracks_requested(self) -> None:
+        """Organize-view helper: opens the library folder in Finder for manual drops."""
         lib = getattr(self._dashboard, '_library_path', None)
         if not lib:
             return
@@ -570,6 +570,7 @@ class MainWindow(QMainWindow):
         elif sys.platform == 'win32':
             subprocess.Popen(['explorer', str(lib)])
 
+    # ------------------------------------------------------------------
     def _on_rinse_done(self) -> None:
         self._dashboard.clear_duplicates()
         self._nav_btns['dashboard'].setChecked(True)
@@ -670,30 +671,6 @@ class MainWindow(QMainWindow):
         lib = self._dashboard._library_path
         if lib:
             self._dashboard.start_scan(lib)
-
-    def _on_new_crate_requested(self) -> None:
-        if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
-            self._show_sync_warning()
-            return
-        self._on_nav_by_id('crates')
-        inv = self._dashboard._inventory
-        lib = self._dashboard._library_path
-        if inv and lib:
-            self._crate_manager.load(inv, lib)
-        if hasattr(self._crate_manager, '_on_new_crate'):
-            self._crate_manager._on_new_crate()
-
-    def _on_new_smart_crate_requested(self) -> None:
-        if hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
-            self._show_sync_warning()
-            return
-        self._on_nav_by_id('crates')
-        inv = self._dashboard._inventory
-        lib = self._dashboard._library_path
-        if inv and lib:
-            self._crate_manager.load(inv, lib)
-        if hasattr(self._crate_manager, '_on_new_smart_crate'):
-            self._crate_manager._on_new_smart_crate()
 
     # ── Window state ──────────────────────────────────────────────────
 

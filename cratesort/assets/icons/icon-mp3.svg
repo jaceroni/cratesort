@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_2" data-name="Layer 2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: #d17d34;
+      }
+    </style>
+  </defs>
+  <g id="Layer_1-2" data-name="Layer 1">
+    <ellipse class="cls-1" cx="32" cy="74" rx="18" ry="14" transform="rotate(-18 32 74)"/>
+    <rect class="cls-1" x="46" y="10" width="8" height="66" rx="3"/>
+    <path class="cls-1" d="M54,10 C82,16 90,38 70,50 C78,32 68,22 54,27 Z"/>
+  </g>
+</svg>

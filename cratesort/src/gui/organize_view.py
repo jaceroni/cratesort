@@ -601,11 +601,11 @@ class OrganizeView(QWidget):
 
         open_folder_btn = QPushButton('Open Library Folder')
         open_folder_btn.setFixedWidth(160)
-        open_folder_btn.setMinimumHeight(34)
+        open_folder_btn.setFixedHeight(36)
         open_folder_btn.setStyleSheet(
             f'QPushButton {{ background-color: transparent; color: #a89b85; '
-            f'border: 1px solid #444444; border-radius: 5px; padding: 5px 12px; '
-            f'font-size: 12px; font-weight: 500; }}'
+            f'border: 1px solid #444444; border-radius: 6px; padding: 0 12px; '
+            f'font-size: 13px; font-weight: 500; }}'
             f'QPushButton:hover {{ color: #f1e3c8; border-color: #a89b85; background: rgba(241,227,200,0.05); }}'
             f'QPushButton:pressed {{ background: rgba(241,227,200,0.1); }}'
         )
@@ -729,11 +729,11 @@ class OrganizeView(QWidget):
                 row_h.addWidget(rb_lbl)
             else:
                 rb_btn = QPushButton('Rollback')
-                rb_btn.setMinimumHeight(30)
+                rb_btn.setFixedHeight(36)
                 rb_btn.setStyleSheet(
                     f'QPushButton {{ background-color: {_DANGER}; color: #ffffff; '
-                    f'border: none; border-radius: 4px; padding: 4px 12px; '
-                    f'font-size: 12px; font-weight: 600; }}'
+                    f'border: none; border-radius: 6px; padding: 0 12px; '
+                    f'font-size: 13px; font-weight: 600; }}'
                     f'QPushButton:hover {{ background-color: #b24c4c; }}'
                     f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
                 )

@@ -53,4 +53,30 @@ When reviewing duplicates, clicking a track row that has `ARTWORK: Yes` should d
 
 ---
 
-*Last updated: June 22, 2026 (evening)*
+## CrateCleaner — Sister Tool (Separate Product)
+
+A lightweight standalone companion app positioned as a free lead-gen piece for CrateSort. Lets users drop in any audio/video file, see all human-facing metadata fields, get AI-suggested corrections via audio fingerprinting + MusicBrainz/Discogs lookup, and write the cleaned metadata back to the file.
+
+**Core concept:** The "Costco sample" — give someone a polished free tool that demonstrates CrateSuite's quality, speed, and personality before they commit to CrateSort.
+
+**Key aha moments to design for:**
+- "I didn't know my file was this bad" — visual health indicator on drop
+- "I didn't know there were this many fields" — show all human-facing fields, empty ones included
+- "My artwork is poor quality" — flag low-res art, offer to replace
+- "I can add multiple artworks" — front/back/artist photo, most users don't know this exists
+- Fingerprint moment — "we found this track, want us to fill everything in?"
+
+**Scope:**
+- Batch queue (HandBrake-style), no file limit or soft cap (~10)
+- Metadata lookup + suggested fixes, not just manual editing
+- Strictly human-facing fields only — no Hz, kbps, encoder junk
+- Artwork read, replace, and multi-artwork support
+- Strip encoder/muxer garbage fields in one tap
+
+**Form factor:** Native desktop app (Tauri), custom-shaped window following the crate + mascot silhouette. The crate IS the window. Mascot reacts expressively to what he finds in the file.
+
+**Status:** Needs design mockups and further research before build. Image generation prompts drafted — feed to Midjourney/Gemini/GPT to explore visual direction.
+
+---
+
+*Last updated: June 23, 2026*

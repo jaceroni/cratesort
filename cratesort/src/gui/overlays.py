@@ -26,13 +26,13 @@ class _ModalOverlay(QWidget):
     def center_modal(self) -> None:
         if self._modal is None:
             return
-        own_rect = self.geometry()   # QRect in parent_window local coords
+        self._modal.adjustSize()
         mw = self._modal.width()
         mh = self._modal.height()
-        local_x = own_rect.x() + (own_rect.width()  - mw) // 2
-        local_y = own_rect.y() + (own_rect.height() - mh) // 2
-        global_pos = self._parent_window.mapToGlobal(QPoint(local_x, local_y))
-        self._modal.move(global_pos)
+        origin = self._parent_window.mapToGlobal(QPoint(0, 0))
+        cx = origin.x() + (self._parent_window.width()  - mw) // 2
+        cy = origin.y() + (self._parent_window.height() - mh) // 2
+        self._modal.move(cx, cy)
 
     def removeFromParent(self) -> None:
         self._parent_window.removeEventFilter(self)
@@ -67,28 +67,34 @@ class _CrateSortDialog(QDialog):
         self.finished.connect(self._cleanup_overlay)
 
     def showEvent(self, event) -> None:
-        if self._overlay:
-            self._overlay.center_modal()
-            
-        target_rect = self.geometry()
-        w = target_rect.width()
-        h = target_rect.height()
-        
-        if getattr(self, '_elastic', True):
-            start_rect = QRect(
-                target_rect.x() + int(w * 0.15),
-                target_rect.y() + int(h * 0.15),
-                int(w * 0.7),
-                int(h * 0.7)
-            )
+        # Ensure layout is computed so width()/height() are accurate before centering.
+        self.adjustSize()
+        w, h = self.width(), self.height()
+
+        # Calculate the final centered position directly — never read geometry()
+        # after move(), which is async and returns stale coords on some platforms.
+        if self._overlay is not None:
+            parent_win = self._overlay._parent_window
+            origin = parent_win.mapToGlobal(QPoint(0, 0))
+            cx = origin.x() + (parent_win.width()  - w) // 2
+            cy = origin.y() + (parent_win.height() - h) // 2
         else:
-            start_rect = QRect(
-                target_rect.x() + int(w * 0.05),
-                target_rect.y() + int(h * 0.05),
-                int(w * 0.9),
-                int(h * 0.9)
-            )
-            
+            g = self.geometry()
+            cx, cy = g.x(), g.y()
+
+        target_rect = QRect(cx, cy, w, h)
+
+        if getattr(self, '_elastic', True):
+            sw, sh = int(w * 0.7), int(h * 0.7)
+        else:
+            sw, sh = int(w * 0.9), int(h * 0.9)
+
+        start_rect = QRect(
+            cx + (w - sw) // 2,
+            cy + (h - sh) // 2,
+            sw, sh,
+        )
+
         self.setGeometry(start_rect)
         super().showEvent(event)
         self.run_bounce_animation(target_rect, start_rect)

@@ -239,6 +239,12 @@ Three classes live in `library_browser.py`, inserted before `LibraryBrowserView`
 
 `_ModalOverlay` must have `self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)` set in `__init__` to render its stylesheet background color. Without it the scrim is invisible. This is a known PyQt6 behavior for custom `QWidget` subclasses.
 
+### Classify Library button auto-disable
+
+`_refresh_classify_btn()` is called at the end of every `load()`. It disables the Classify Library button when `_count_unclassified_artists()` returns 0. `_count_unclassified_artists()` only counts artists whose genre is in the Unclassified set AND who have no explicit `genre` entry in `self._edits` (i.e., `library_edits.json`). Artists explicitly set to Unclassified via right-click or via `_exit_classify_mode_accept` are counted as handled. If new tracks are added and rescanned, their artists have no edits entry → count > 0 → button re-enables automatically.
+
+`_exit_classify_mode_accept` writes `genre: 'Unclassified'` to the edits dict for any remaining Unclassified artist with no existing entry before saving — this acknowledges them so the button can disable.
+
 ### Classification complete definition
 
 Classification is complete when `_CrateSort/classification_accepted.flag` exists on disk. This flag is written ONLY when the user clicks Accept Reclassifications. Individual right-click genre edits do NOT set this flag.
@@ -368,9 +374,10 @@ Thin public wrapper around the internal mutagen tag helpers. Loads the file with
        - Background: `#1a2e2b`
        - Icon at full teal opacity
        - Returns to standard appearance once classification is complete.
-   - **Create** (2 cards): `＋ New Crate` (orange), `✦ New Smart Crate` (orange). Both use the same orange warm-tinted base/hover style (`#2a2218` base, orange border on hover).
+   - **YouTube import** (2 cards): `YouTube to MP4`, `YouTube to MP3` — built via `_IconActionCard`, matching the Go To cards' gray background / orange headline / muted-icon-lights-up-on-hover treatment (teal is reserved for the Manage Library highlight only; nothing else on the dashboard uses it). Icons are `assets/icons/icon-mp4.svg` (clapperboard) and `icon-mp3.svg` (eighth note) — dimmed `#2a2a2a` at rest, `#D17D34` on hover, same as the Go To cards' SVG recolor technique. There is no longer a "New Crate"/"New Smart Crate" card group on the dashboard — that functionality lives only in the Crates tab toolbar (see Crate Manager Architecture below).
+   - **Organize Media footer**: an extra line below the description — `CrateSort's Organization Logic:` / `Your Library Folder > Media > Genre > Artist > Files` — rendered via `_WorkflowCard(footer=...)`, full-card-width (not confined to the text column), 12px font, 16.5px line-height set via rich-text `<div style="line-height:...">` since Qt's QSS `line-height` property is a silent no-op on plain `QLabel` text.
 
-Dashboard has a `refresh()` method called when navigating to index 0 — re-runs sync check and repopulates dashboard state.
+Dashboard has a `refresh()` method called when navigating to index 0 — re-runs duplicate detection and repopulates dashboard state. **Serato sync check (`_check_serato_sync()`) runs only in `_show_dashboard()` at session start — it is NOT called from `refresh()`.** This prevents CrateSort's own crate writes during a session from being flagged as external Serato changes.
 
 3. **Recent Activity** (`_build_activity_section()`) — combined feed: crate changes, recently added tracks, and reorganization events (teal dot = reorg/addition, orange dot = rollback/removal). Last 30 days, capped at 10 items.
 
@@ -378,7 +385,7 @@ Dashboard has a `refresh()` method called when navigating to index 0 — re-runs
 
 ### Serato sync warning:
 
-When changes are detected on launch, an amber banner appears with a "Review && Sync…" button (min-width 170px, `&&` required for literal ampersand in PyQt6). The `_ChangeReviewDialog` shows each change with timestamp and a **Revert** button. Revert marks the change as pending (row grays out, button becomes Undo). On "Sync && Proceed": reverts execute, checkpoint saves, re-scan triggers. On Cancel: nothing written.
+When changes are detected on launch, an amber banner appears with a "Review && Sync…" button (min-width 170px, `&&` required for literal ampersand in PyQt6). The `_ChangeReviewDialog` shows each change with timestamp and a **Revert** button. Revert marks the change as pending (row grays out, button becomes Undo). The primary action button updates dynamically via `_update_sync_btn_state()`: no reverts → **"Sync && Proceed"** (orange); some reverted → **"Apply && Proceed"** (orange); all reverted → **"Accept && Continue"** (teal). On Cancel: nothing written. `_can_revert()` returns True for both `crate_added` and `crate_removed` — removed crates are always revertable even when `prev_tracks` is empty (empty crate recreated from a `[]` list).
 
 ### Checkpoint system (`src/utils/checkpoint.py`):
 
@@ -393,19 +400,31 @@ When changes are detected on launch, an amber banner appears with a "Review && S
 
 ---
 
+## Library Browser — Toolbar
 
+`src/gui/library_browser.py`, `_build_toolbar()`. Left to right: search box (`_search`, "Search artist, title, album…"), **Clear Filters** (immediately next to the search box, not right-aligned), a stretch, then **Classify Library** pinned to the far right. Toolbar vertical padding is 16px top/bottom, matching the Crates toolbar.
+
+There is no format/file-type dropdown and no "Add Tracks to Library" button — both were removed. The dropdown (`_format_cb`) was cut because native-macOS Qt style ignores the QSS box model for `QComboBox` (wrong rendered height regardless of `setFixedHeight`, plus its own native arrow instead of the QSS-defined one) — rather than keep working around a native-widget quirk for one dropdown, it was removed outright. "Add Tracks to Library" (a file-picker dialog + background scanner worker, `_AddTracksPickerDialog`/`_AddTracksWorker` in `main_window.py`) was removed because it was redundant: `_ScanWorker` already does a full folder walk on every library load, so files dropped straight into the library folder are picked up automatically next time it's opened — exactly the assumption already baked into the Organize tab's "Open Library Folder" button, which is the surviving, simpler pattern for adding tracks.
 
 ---
 
 ## Crate Manager — Current Architecture
 
-### New crate buttons
+### Toolbar (`_build_toolbar()`)
 
-Two buttons at the top of the crate panel (below the search bar), inside a `QWidget` container with `setFixedHeight(45)` and `setContentsMargins(8, 5, 8, 5)`:
-- **＋ New Crate** — orange (`#D17D34`), calls `_on_new_crate()`
-- **✦ Smart Crate** — teal (`#428175`), calls `_on_new_smart_crate()` (Pro stub)
+A single shared row above the crate/track splitter — not per-panel search boxes — containing, left to right:
+- **Crate search** (`_crate_search`) — inside `crate_col`, a `QWidget` whose `setFixedWidth()` is kept in sync with the splitter's left-pane width (see "Splitter/toolbar sync" below). No per-widget stylesheet override; inherits the same global bordered/rounded `QLineEdit` style used everywhere else in the app.
+- **Vertical divider** — a 1px `QFrame`, continuing the crate tree's `border-right` line up through the toolbar to the top of the view. Must stay pixel-aligned with the splitter handle.
+- **Track search** (`_track_search`) — same left clearance (12px) as the crate search box has from the row's left edge.
+- **＋ New Crate** (orange, `_on_new_crate()`) and **✦ Smart Crate** (teal, `_on_new_smart_crate()`, Pro stub), right-aligned, with a 16px gap between them (double the row's normal 8px inter-item spacing — deliberately wider to separate these two from the search boxes).
 
-The container is fixed at 45px. The track table header is also `setFixedHeight(45)` so they align side-by-side in the splitter.
+All controls are 36px tall. Toolbar vertical padding is 16px top/bottom (`row.setContentsMargins(0, 0, 12, 0)` on the outer row; each "column" sub-widget supplies its own 16px top/bottom margin internally so the divider itself can run full-bleed edge-to-edge).
+
+**Splitter/toolbar sync** — `crate_col`'s width must track `self._splitter.sizes()[0]` live, or the divider drifts out of alignment with the actual crate/track panel boundary below it. Wired via `self._splitter.splitterMoved.connect(self._on_splitter_moved)`. Two failure modes discovered the hard way, both now fixed:
+1. `QSplitter.setSizes([280, 900])` before first show is only a *request* — the splitter can settle on a different actual pixel width once laid out. A naive `QTimer.singleShot(0, ...)` right after construction fires too early, because `CrateManagerView` is built while still hidden inside its own internal `self._stack` (empty-state page 0 vs. main content page 1) *and* inside the main window's outer tab stack — at that point `splitter.sizes()` doesn't yet reflect final geometry.
+2. The real "first visible" moment for the toolbar is inside `load()`, right after `self._stack.setCurrentIndex(1)` — *not* the outer view's `showEvent()`, which can fire earlier while the internal stack is still on the empty-state page. The sync call lives in both places now: deferred one tick (`QTimer.singleShot(0, self._on_splitter_moved)`) after `setCurrentIndex(1)` in `load()` (the real fix), and again in `showEvent()` as a safety net for revisits without a fresh `load()` call.
+
+Separately: `crate_col`/`track_col` are plain `QWidget`s with an explicit `background: #252525;` stylesheet (needed — once the app has a global stylesheet, un-styled `QWidget`s default to painting solid black). This background rule does not cascade into child `QLineEdit`s and does not by itself affect `crate_col`'s fixed width; the width bug was purely the splitter-sync timing issue above, not a stylesheet/geometry interaction.
 
 ### Default crate selection
 
@@ -743,6 +762,8 @@ On every launch after scan, CrateSort:
 
 - `src/utils/undo_manager.py` — Command pattern, 10-state stack, global across tabs
 - 9 command classes: `AddTracksCommand`, `RemoveTracksCommand`, `ReorderTracksCommand`, `CreateCrateCommand`, `DeleteCrateCommand`, `RenameCrateCommand`, `ReorderCratesCommand`, `ReparentCrateCommand`, `EditTrackMetadataCommand`
+- `AddTracksCommand` has an optional `stay_on_crate: Optional[str]` parameter. When set, `execute()` calls `_refresh(select=stay_on_crate)` instead of `_refresh(select=crate_path)` — the view stays on the source crate, not the target. `_add_tracks_to_crate()` (the drag-drop handler) passes `stay_on_crate=self._current_crate_path` so the user stays in the crate they were viewing while dragging.
+- `_add_tracks_to_crate()` in `crate_manager.py` now routes through `AddTracksCommand` when `_undo_manager` is present — drag-drop track additions are fully undoable.
 - Undo/Redo buttons in sidebar below album art — teal when active, gray when inactive
 - Cmd+Z / Cmd+Shift+Z keyboard shortcuts
 
@@ -805,6 +826,12 @@ Covers inline track metadata edits (title, album, tags, BPM, year, comment) made
 - **Duplicate detection architecture** — `DuplicateDetector` in `duplicate_detector.py` classifies groups as `tier='true_duplicate'` (duration ±1s, bitrate ±32kbps, no variant keywords) or `tier='variant'` (remix/extended keywords, or spread exceeds thresholds). Winner scoring: `(crate_count, play_count, bitrate, meta_completeness, has_comment, has_stems)`. Detection runs synchronously in `DashboardWidget._show_dashboard()` after scan — pure Python, no I/O. `build_crate_count_map(crate_library)` builds the crate presence map. Pass it into `DuplicateDetector().detect(inventory, crate_count_map)`.
 - **Duplicate consolidation** — `DuplicateConsolidator` in `duplicate_consolidator.py`. Critical order: `PathRewriter.rewrite()` (reroute all crate references) MUST complete before any loser file is deleted. Never delete first and reroute second. Logs to `RollbackLog` with `duplicate=True` for special rollback handling. SHA256 checksums on each deleted file.
 - **Duplicate review flow** — `DuplicateReviewView` at `main_window._content` index 5. Not a nav item. Launched via `_on_duplicates_requested()` from dashboard. `done` signal returns to index 0 (dashboard). Dashboard shows orange `_build_dup_banner()` when `self._dup_groups` is non-empty after scan.
+  - Copy rows use **radio buttons** (`QRadioButton` with `radio-checked.svg` / `radio-unchecked.svg` in `assets/icons/`) — never revert to `QCheckBox`.
+  - `track_selected = pyqtSignal(str)` emitted on row click → connected to `_update_album_art` in `main_window.py` → sidebar artwork populates.
+  - Header "Skip for Now" button is now **"Cancel — Don't Consolidate"**.
+  - Tier 2 groups show an orange callout at card bottom: if duration difference > 2s or file size ratio > 1.5x, specific differences are surfaced; otherwise "may be different versions" fallback. Replaces the old cryptic metadata conflict text.
+  - Tier 1 groups: metadata conflict note rewritten as plain English ("BPM differs between copies — the winner's value will be kept.").
+  - Winner reason line appended with "— also has: comment, genre, BPM, artwork" when winner has exclusive metadata advantages over losers (`_winner_metadata_advantages()`). Em-dash separator throughout, `&&` not needed (no ampersand).
 - **The Rinse** — duplicate review must happen before classification. If user classifies before rinsing, they may assign different genres to copies of the same song, creating a metadata conflict on consolidation. Dashboard banner enforces this order by surfacing duplicates immediately after scan.
 - **Design with intent** — every feature must leave the library better than it was found. Duplicate detection doesn't just flag — it consolidates, reroutes crates, and preserves the DJ's history (play counts, cue points, comments) in the winner file. Phase C Full (deferred): `database_writer.py` for writing merged Serato metadata back to database V2.
 
@@ -1484,3 +1511,18 @@ These are the drift patterns that don't belong to any single specialist — the 
 - Any moment where the app interrupts the user and doesn't make that interruption worth it.
 - The free tier feeling crippled instead of genuinely useful.
 - The absence of delight where delight was possible and wouldn't cost anything.
+
+---
+
+## Locked decisions — June 23 2026
+
+- **`refresh()` must not call `_check_serato_sync()`** — sync check is session-start only (`_show_dashboard()`). Calling it from `refresh()` causes CrateSort's own crate writes to be falsely flagged as external Serato changes mid-session.
+- **`_add_tracks_to_crate()` must use `AddTracksCommand`** — drag-drop track additions must go through the undo manager. Direct `writer.add_tracks()` calls in this method bypass the undo stack.
+- **`AddTracksCommand.stay_on_crate`** — always pass `stay_on_crate=self._current_crate_path` from `_add_tracks_to_crate`. Omitting it navigates to the target crate on drop, disrupting the user's drag workflow.
+- **`_flash_row_text()` must restore captured colors** — captures `item.foreground(c)` before flashing, restores from captured brushes. Never hardcode cream as the restore color — track rows are muted, Unclassified artist rows are red.
+- **Rinse screen uses radio buttons** — `QRadioButton` with `radio-checked.svg` / `radio-unchecked.svg` in `assets/icons/`. Orange fill + black center dot for checked state. Never revert to `QCheckBox`.
+- **`_can_revert()` for `crate_removed`** — always True regardless of `prev_tracks` content. Empty list recreates an empty crate; that is valid and revertable.
+- **Duplicate detection in `refresh()`** — `_run_duplicate_detection()` called from `refresh()` so banners clear immediately when metadata is fixed mid-session.
+- **`_count_unclassified_artists()` checks edits** — only counts artists with no `genre` in `self._edits`. Acknowledged-as-Unclassified artists (edits entry present) must not keep the Classify button active.
+- **Tier 2 Rinse groups** — orange callout surfaces duration/size divergence. Users encouraged to fix metadata (which removes the flag on next scan) — no permanent dismiss mechanism exists by design.
+- **Classify flow — Unclassified acknowledge** — `_exit_classify_mode_accept` writes `genre: 'Unclassified'` to edits for any remaining Unclassified artist with no existing entry. This is what allows the Classify button to disable after accept.

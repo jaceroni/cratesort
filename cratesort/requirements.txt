@@ -10,5 +10,8 @@ pyacoustid>=1.3.0
 # Serato crate reading/writing
 serato-crate>=0.1.0
 
+# YouTube downloader (used by the YouTube Import feature)
+yt-dlp>=2024.1.0
+
 # Optional: higher-level Serato metadata API (reference/fallback)
 # serato-tools>=0.1.0

@@ -17,7 +17,7 @@ try:
 except ImportError:
     pass
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox,
+    QApplication, QDialog, QDialogButtonBox,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem,
     QMenu, QProgressBar, QPushButton, QSplitter, QStackedWidget,
@@ -529,7 +529,6 @@ class LibraryBrowserView(QWidget):
     # Emitted when a track is selected (for album art panel)
     track_selected       = pyqtSignal(str)   # file path
     album_art_requested  = pyqtSignal(str)
-    add_tracks_requested = pyqtSignal()      # open library folder for adding files
     # Emitted after an inline edit is committed (file_path, field, new_value)
     track_field_changed  = pyqtSignal(str, str, str)
 
@@ -551,6 +550,7 @@ class LibraryBrowserView(QWidget):
         self._classify_session = None
         self._classify_results: dict[str, tuple[str, str]] = {}  # artist → (genre, conf)
         self._classify_worker = None
+        self._new_track_paths: set[str] = set()  # paths added via Add Tracks this session
         # Tracks the last genre edit for post-sidebar-rebuild navigation
         self._last_edited_artist:  Optional[str] = None
         self._last_assigned_genre: Optional[str] = None
@@ -596,6 +596,7 @@ class LibraryBrowserView(QWidget):
         self._library_path  = library_path
         self._loaded_inv_id = id(inventory)
         self._inventory     = list(inventory)
+        self._new_track_paths.clear()
 
         # Load classification session
         self._session_genre = {}
@@ -623,7 +624,6 @@ class LibraryBrowserView(QWidget):
                 import traceback
                 print(f'[LibraryBrowser] Session load error: {exc}\n{traceback.format_exc()}')
 
-        self._populate_filters()
         self._edits = {}
         self._load_edits()
         self._rebuild_tree()
@@ -774,7 +774,14 @@ class LibraryBrowserView(QWidget):
             icon_lbl.setStyleSheet('background: transparent; border: none;')
             row.addWidget(icon_lbl)
 
-        msg = QLabel("This is your library how we see it — review the artists and their nested files. Right-click/double-click an artist or their tracks to correct anything that looks off. Not sure about something? Change its genre to 'Unclassified' and move on. Your files are not touched until you reorganize.")
+        msg = QLabel()
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(
+            '<div style="line-height: 16.5px;">This is your library how we see it — review the '
+            'artists and their nested files. Right-click/double-click an artist or their tracks '
+            'to correct anything that looks off. Not sure about something? Change its genre to '
+            "'Unclassified' and move on. Your files are not touched until you reorganize.</div>"
+        )
         msg.setWordWrap(True)
         msg.setStyleSheet(
             'color: #7bbdad; font-size: 12px; background: transparent; border: none;'
@@ -782,18 +789,20 @@ class LibraryBrowserView(QWidget):
         row.addWidget(msg, stretch=1)
 
         cancel_btn = QPushButton('Cancel')
+        cancel_btn.setFixedHeight(36)
         cancel_btn.setStyleSheet(
             'QPushButton { background: transparent; color: #7bbdad; '
-            'border: 1px solid #2d4a44; border-radius: 4px; padding: 4px 12px; font-size: 11px; }'
+            'border: 1px solid #2d4a44; border-radius: 6px; padding: 0 16px; font-size: 13px; }'
             'QPushButton:hover { background: rgba(45,74,68,0.4); }'
         )
         cancel_btn.clicked.connect(self._exit_classify_mode_cancel)
         row.addWidget(cancel_btn)
 
         accept_btn = QPushButton('Accept Reclassifications')
+        accept_btn.setFixedHeight(36)
         accept_btn.setStyleSheet(
             'QPushButton { background: #428175; color: #f1e3c8; border: none; '
-            'border-radius: 4px; padding: 4px 14px; font-size: 11px; font-weight: 500; }'
+            'border-radius: 6px; padding: 0 16px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background: #38706a; }'
             'QPushButton:pressed { background: #2d6358; }'
         )
@@ -806,48 +815,34 @@ class LibraryBrowserView(QWidget):
         tb = QFrame()
         tb.setStyleSheet('QFrame { background: #252525; border-bottom: 1px solid #444; }')
         row = QHBoxLayout(tb)
-        row.setContentsMargins(12, 8, 12, 8)
+        row.setContentsMargins(12, 16, 12, 16)
         row.setSpacing(8)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText('Search artist, title, album…')
         self._search.setMaximumWidth(260)
+        self._search.setFixedHeight(36)
         self._search.textChanged.connect(self._apply_filter)
         row.addWidget(self._search)
 
-        self._format_cb = QComboBox()
-        self._format_cb.setMinimumWidth(110)
-        self._format_cb.currentTextChanged.connect(self._apply_filter)
-        row.addWidget(self._format_cb)
-
-        row.addStretch()
-
-        add_tracks_btn = QPushButton('Add Tracks to Library')
-        add_tracks_btn.setStyleSheet(
-            'QPushButton { background-color: transparent; color: #a89b85; '
-            'font-size: 11px; font-weight: 500; border: 1px solid #444444; border-radius: 4px; '
-            'padding: 6px 12px; }'
-            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
-            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
-        )
-        add_tracks_btn.setFixedHeight(30)
-        add_tracks_btn.clicked.connect(self.add_tracks_requested.emit)
-        row.addWidget(add_tracks_btn)
-
         clear = QPushButton('Clear Filters')
         clear.setProperty('flat', 'true')
+        clear.setFixedHeight(36)
         clear.clicked.connect(self._clear_filters)
         row.addWidget(clear)
+
+        row.addStretch()
 
         self._classify_btn = QPushButton('Classify Library')
         self._classify_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #f1e3c8; '
-            'font-size: 11px; font-weight: 500; border: none; border-radius: 4px; '
-            'padding: 6px 12px; }'
+            'font-size: 13px; font-weight: 600; border: none; border-radius: 6px; '
+            'padding: 0 16px; }'
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
             'QPushButton:disabled { background-color: #2a3a37; color: #5a8a80; }'
         )
+        self._classify_btn.setFixedHeight(36)
         self._classify_btn.clicked.connect(self._on_classify_clicked)
         row.addWidget(self._classify_btn)
 
@@ -1223,8 +1218,9 @@ class LibraryBrowserView(QWidget):
         year    = edits.get('year',    rec.year    or '—')
         comment = edits.get('comment', rec.comment or '')
 
+        is_new = str(rec.path) in self._new_track_paths
         child.setIcon(LC_ARTIST, _get_track_icon())
-        child.setText(LC_ARTIST,   f'  {title}')
+        child.setText(LC_ARTIST, f'  {"◆ " if is_new else ""}{title}')
         child.setText(LC_TRACKS,   '')
         child.setText(LC_ALBUM,    album)
         child.setText(LC_GENRE,    genre)
@@ -1260,9 +1256,15 @@ class LibraryBrowserView(QWidget):
                     child.setForeground(col, _red)
                 child.setForeground(LC_GENRE, _red)
         else:
-            muted = QBrush(QColor(_MUTED))
-            for col in range(len(HEADERS)):
-                child.setForeground(col, muted)
+            if is_new:
+                _new_brush = QBrush(QColor('#5c9d94'))
+                for col in range(len(HEADERS)):
+                    child.setForeground(col, _new_brush)
+                child.setToolTip(LC_ARTIST, 'Newly added — classify when ready')
+            else:
+                muted = QBrush(QColor(_MUTED))
+                for col in range(len(HEADERS)):
+                    child.setForeground(col, muted)
         return child
 
     def _classify_lookup(self, artist: str) -> tuple[str, str]:
@@ -1477,23 +1479,9 @@ class LibraryBrowserView(QWidget):
 
     # ── Filtering ─────────────────────────────────────────────────────
 
-    def _populate_filters(self) -> None:
-        formats: set[str] = set()
-        for rec in self._inventory:
-            if rec.extension:
-                formats.add(rec.extension.lstrip('.').upper())
-        self._format_cb.blockSignals(True)
-        self._format_cb.clear()
-        self._format_cb.addItem('All Formats')
-        self._format_cb.addItems(sorted(formats))
-        self._format_cb.blockSignals(False)
-
     def _apply_filter(self) -> None:
         search   = self._search.text().lower().strip()
         genre_f  = self._sidebar_genre if self._sidebar_genre != 'All' else ''
-        format_f = self._format_cb.currentText()
-        if format_f in ('All Formats', ''):
-            format_f = ''
 
         _UC_GENRES = {'', '—', 'Unclassified', 'Untagged'}
 
@@ -1515,16 +1503,6 @@ class LibraryBrowserView(QWidget):
                     item.setHidden(True)
                     continue
 
-            # Format filter — show artist if any track matches
-            if format_f:
-                has_fmt = any(
-                    rec.extension.lstrip('.').upper() == format_f
-                    for rec in tracks
-                )
-                if not has_fmt:
-                    item.setHidden(True)
-                    continue
-
             # Search filter
             if search:
                 artist_match = search in artist.lower()
@@ -1542,7 +1520,7 @@ class LibraryBrowserView(QWidget):
             visible_count += 1
 
         total = self._tree.topLevelItemCount()
-        if search or genre_f or format_f:
+        if search or genre_f:
             self._count_label.setText(f'{visible_count:,} of {total:,} artists visible')
         else:
             t = len(self._inventory)
@@ -1550,7 +1528,6 @@ class LibraryBrowserView(QWidget):
 
     def _clear_filters(self) -> None:
         self._search.clear()
-        self._format_cb.setCurrentIndex(0)
         self._sidebar_genre = 'All'
         if self._genre_sidebar_list.count() > 0:
             self._genre_sidebar_list.setCurrentRow(0)

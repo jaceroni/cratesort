@@ -322,10 +322,10 @@ class SettingsView(QWidget):
         text_color: str = '#ffffff',
     ) -> QPushButton:
         btn = QPushButton(text)
-        btn.setFixedHeight(34)
+        btn.setFixedHeight(36)
         btn.setStyleSheet(
-            f'QPushButton {{ background: {bg}; color: {text_color}; font-size: 12px; '
-            f'font-weight: 600; border: none; border-radius: 5px; padding: 0 14px; }}'
+            f'QPushButton {{ background: {bg}; color: {text_color}; font-size: 13px; '
+            f'font-weight: 600; border: none; border-radius: 6px; padding: 0 16px; }}'
             f'QPushButton:hover {{ background: {hover}; }}'
             f'QPushButton:pressed {{ background: {pressed}; }}'
         )
