@@ -53,6 +53,16 @@ When reviewing duplicates, clicking a track row that has `ARTWORK: Yes` should d
 
 ---
 
+## Packaging & Distribution
+
+### Code signing + notarization
+Beta DMG is unsigned — testers hit a Gatekeeper "unidentified developer" warning on first launch. Requires an Apple Developer ID certificate ($99/yr) plus notarization via `notarytool`. Worth doing before a public (non-beta) release.
+
+### Windows (.exe) and Linux (AppImage) packaging
+Only macOS is built so far (PyInstaller, see `CLAUDE-CS.md` → Cody → "Packaging & Distribution"). Windows/Linux builds need their own PyInstaller spec pass on those platforms — can't be cross-compiled from macOS.
+
+---
+
 ## CrateCleaner — Sister Tool (Separate Product)
 
 A lightweight standalone companion app positioned as a free lead-gen piece for CrateSort. Lets users drop in any audio/video file, see all human-facing metadata fields, get AI-suggested corrections via audio fingerprinting + MusicBrainz/Discogs lookup, and write the cleaned metadata back to the file.
@@ -79,4 +89,4 @@ A lightweight standalone companion app positioned as a free lead-gen piece for C
 
 ---
 
-*Last updated: June 23, 2026*
+*Last updated: July 12, 2026*

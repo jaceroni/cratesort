@@ -538,7 +538,7 @@ class MainWindow(QMainWindow):
             f'CrateSort v{VERSION}\n\n'
             f'Get your shit together.\n\n'
             f'A DJ library organizer and Serato crate manager.\n'
-            f'© JWBC',
+            f'© JWBC, LLC',
         )
 
     def _on_library_requested(self) -> None:

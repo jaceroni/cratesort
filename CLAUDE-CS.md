@@ -30,7 +30,7 @@ CrateSort is the single writer. Serato is the reader. CrateSort handles all orga
 - **ID3 tags**: `mutagen`
 - **Audio fingerprinting**: `chromaprint` / `pyacoustid` (duplicate detection, future)
 - **Serato file parsing**: `serato-crate` library for `.crate` read/write
-- **Packaging**: PyInstaller → `.app` (macOS), `.exe` (Windows), AppImage (Linux)
+- **Packaging**: PyInstaller → `.app` (macOS) — **shipped, beta, unsigned**. `.exe` (Windows) and AppImage (Linux) not yet built. See Cody's "Packaging & Distribution" section for the full macOS pipeline.
 - **No external APIs required.** No internet, no API keys, no server.
 
 ---
@@ -1058,6 +1058,27 @@ Write only what is necessary to accomplish the stated goal. Do not refactor adja
 **Fix principle**: When building or validating any file path during reorganization, check total path length before attempting the operation. On Windows, warn the user if a proposed path exceeds 240 characters (leaving a 20-char safety buffer). Crate names are OS filenames — subject to the standard 255-character filename limit on all platforms.
 
 **Check when touching**: `FileOrganizer.build_plan()`, `sanitize_filename()`, any path construction logic, any Windows-specific path handling.
+
+---
+
+## Packaging & Distribution
+
+**Status (July 2026): macOS beta packaging shipped. Unsigned, no notarization.** Windows/Linux not yet built.
+
+**Pipeline**: `packaging/CrateSort.spec` (PyInstaller) builds `dist/CrateSort.app` from `packaging/run_app.py`, an entry point that just calls `cratesort.src.gui.main_window:main`. Bundles `cratesort/assets/` in full. Build from a dedicated venv (`.build-venv/`, gitignored) — never the system Python.
+
+**Two real bugs fixed in `cratesort/pyproject.toml` during first packaging pass** (pre-existing, unrelated to packaging itself, but blocked `pip install -e .` entirely):
+- `build-backend = "setuptools.backends.legacy:build"` doesn't exist → must be `"setuptools.build_meta"`.
+- `serato-crate>=0.1.0` — PyPI only ever published `0.0.1` → constraint must be `>=0.0.1`.
+- `yt-dlp` was used by `yt_import_dialog.py` but missing from `dependencies` entirely (only lived in `requirements.txt`) → added.
+
+**App icon — locked decision**: The mascot's native SVG bounding box is 0.842:1 (taller than wide), never 1:1. macOS (Big Sur onward) automatically synthesizes a light background "card" behind any Dock/Finder icon whose artwork doesn't fill the square canvas — a transparent-background icon that leaves visible margins gets an OS-injected backdrop, which reads as an ugly, uncontrolled gray/white box. **Fix, locked**: bake the mascot onto a solid `#1a1a1a` opaque background (matches the app's own primary dark background color), contain-fit, centered, full canvas, **no crop of the mascot and no distortion of its aspect ratio**. Icon source lives at `cratesort/assets/icons/app/CrateSort.icns`, regenerated via `QSvgRenderer` (PyQt6) rasterizing `cs-logo-mascot-only.svg` at each required size, then `iconutil -c icns`. Never re-attempt a transparent/silhouette-only app icon on macOS — it will not render the way it looks in an image viewer.
+
+**Uninstaller**: `packaging/uninstall.applescript`, compiled via `osacompile -o "Uninstall CrateSort.app" uninstall.applescript` into a real double-clickable `.app` (native dialogs, no Terminal window). Ships inside the DMG alongside `CrateSort.app`. Removes the app bundle (`/Applications` or `~/Applications`) and `~/Library/Preferences/com.jwbc.CrateSort.plist` only. **Never touches `_CrateSort/` folders or any user library data** — those live inside whatever folder the user pointed CrateSort at, not in any OS-standard app-data location. The compiled `.app` itself is a build artifact (gitignored) — only the `.applescript` source is committed.
+
+**DMG**: `hdiutil create` → UDRW → mount → drop `.VolumeIcon.icns` + `SetFile -a C` on the volume for a custom volume icon → convert to UDZO. The DMG file itself also carries a custom Finder icon, attached via `sips -i` (self-icon) → `DeRez -only icns` → `Rez -append` → `SetFile -a C` on the `.dmg` file. Both use the same `CrateSort.icns`.
+
+**Beta distribution caveat**: unsigned, not notarized. Testers must right-click → Open the first time (Gatekeeper "unidentified developer" warning), or run `xattr -cr` on the app.
 
 ---
 

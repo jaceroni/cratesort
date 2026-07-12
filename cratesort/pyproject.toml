@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "cratesort"
@@ -11,7 +11,8 @@ dependencies = [
     "PyQt6>=6.6.0",
     "mutagen>=1.47.0",
     "pyacoustid>=1.3.0",
-    "serato-crate>=0.1.0",
+    "serato-crate>=0.0.1",
+    "yt-dlp>=2024.1.0",
 ]
 
 [project.optional-dependencies]
