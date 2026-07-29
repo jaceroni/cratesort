@@ -44,3 +44,36 @@ def is_serato_running() -> bool:
     except Exception as exc:
         logger.debug("Serato running check failed (non-blocking): %s", exc)
         return False
+
+
+def launch_serato() -> bool:
+    """
+    Launch (or foreground, if already running) Serato DJ Pro.
+
+    Returns True if the launch command appears to have succeeded, False
+    otherwise. Never raises — a failure here should surface as a friendly
+    in-app message, not a crash.
+    """
+    try:
+        if sys.platform == 'darwin':
+            result = subprocess.run(
+                ['open', '-a', 'Serato DJ Pro'],
+                capture_output=True,
+                timeout=8,
+            )
+            return result.returncode == 0
+
+        elif sys.platform == 'win32':
+            result = subprocess.run(
+                ['cmd', '/c', 'start', '', 'Serato DJ Pro'],
+                capture_output=True,
+                timeout=8,
+            )
+            return result.returncode == 0
+
+        else:
+            return False
+
+    except Exception as exc:
+        logger.debug("Serato launch failed (non-blocking): %s", exc)
+        return False

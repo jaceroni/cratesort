@@ -1,10 +1,22 @@
 from __future__ import annotations
 
-from typing import Optional
-from PyQt6.QtCore import Qt, QEvent, QPoint, QRect, QPropertyAnimation, QEasingCurve
+from pathlib import Path
+from typing import Callable, Optional
+from PyQt6.QtCore import Qt, QEvent, QPoint, QRect, QPropertyAnimation, QEasingCurve, QTimer
+from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QDialog, QLayout, QVBoxLayout, QFrame, QLabel, QPushButton, QHBoxLayout
+    QApplication, QWidget, QDialog, QLayout, QVBoxLayout, QFrame, QLabel, QPushButton, QHBoxLayout,
+    QGraphicsScene, QGraphicsView,
 )
+
+try:
+    from PyQt6.QtSvgWidgets import QGraphicsSvgItem
+    _SVG_AVAILABLE = True
+except ImportError:
+    _SVG_AVAILABLE = False
+
+_ASSETS = Path(__file__).parent.parent.parent / 'assets'
+_MASCOT_SVG = _ASSETS / 'logo' / 'cs-logo-mascot-only.svg'
 
 
 class _ModalOverlay(QWidget):
@@ -329,4 +341,117 @@ def _ov_confirm(
     btn_row.addWidget(yes_btn)
     layout.addLayout(btn_row)
 
+    return dlg.exec() == QDialog.DialogCode.Accepted
+
+
+class _LaunchingSeratoDialog(_CrateSortDialog):
+    """Transient, non-interactive modal shown while CrateSort saves crate
+    state and hands off to Serato, right before quitting. No buttons, can't
+    be dismissed early — `do_work` (checkpoint save + the actual Serato
+    launch) runs partway through a short choreographed beat, and the dialog
+    reports back via `exec()`'s result whether the handoff actually worked."""
+
+    def __init__(self, parent: QWidget, do_work: Callable[[], bool]):
+        super().__init__(parent)
+        self.setMinimumWidth(360)
+        self._do_work = do_work
+
+        layout = _create_dialog_layout(self)
+        layout.setSpacing(0)
+
+        mascot_row = QHBoxLayout()
+        mascot_row.addStretch()
+
+        self._mascot_item = None
+        self._scale_anim: Optional[QPropertyAnimation] = None
+        self._wiggle_anim: Optional[QPropertyAnimation] = None
+        if _SVG_AVAILABLE and _MASCOT_SVG.exists():
+            scene = QGraphicsScene()
+            scene.setBackgroundBrush(QColor('#2F2F2F'))  # matches _create_dialog_layout's container bg
+
+            item = QGraphicsSvgItem(str(_MASCOT_SVG))
+            native_rect = item.boundingRect()
+            item.setTransformOriginPoint(native_rect.center())
+            scene.addItem(item)
+
+            view = QGraphicsView(scene)
+            view.setFixedSize(96, 96)
+            view.setFrameShape(QFrame.Shape.NoFrame)
+            view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            view.setStyleSheet('background: transparent; border: none;')
+            view.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Leaves headroom around the mascot's natural size so the scale
+            # pulse below (up to 1.18x) never clips against the view edge.
+            padded = native_rect.adjusted(
+                -native_rect.width() * 0.14, -native_rect.height() * 0.14,
+                native_rect.width() * 0.14, native_rect.height() * 0.14,
+            )
+            view.fitInView(padded, Qt.AspectRatioMode.KeepAspectRatio)
+            mascot_row.addWidget(view)
+            self._mascot_view = view
+            self._mascot_item = item
+
+            scale_anim = QPropertyAnimation(item, b'scale', self)
+            scale_anim.setDuration(900)
+            scale_anim.setKeyValueAt(0.0, 0.92)
+            scale_anim.setKeyValueAt(0.5, 1.18)
+            scale_anim.setKeyValueAt(1.0, 0.92)
+            scale_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+            scale_anim.setLoopCount(-1)
+
+            wiggle_anim = QPropertyAnimation(item, b'rotation', self)
+            wiggle_anim.setDuration(700)
+            wiggle_anim.setKeyValueAt(0.0, -8)
+            wiggle_anim.setKeyValueAt(0.5, 8)
+            wiggle_anim.setKeyValueAt(1.0, -8)
+            wiggle_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+            wiggle_anim.setLoopCount(-1)
+
+            self._scale_anim = scale_anim
+            self._wiggle_anim = wiggle_anim
+
+        mascot_row.addStretch()
+        layout.addLayout(mascot_row)
+        layout.addSpacing(16)
+
+        self._status_lbl = QLabel('Saving your crates…')
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_lbl.setStyleSheet(
+            'color: #f1e3c8; font-size: 15px; font-weight: 600; '
+            'background: transparent; border: none;'
+        )
+        layout.addWidget(self._status_lbl)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._scale_anim is not None:
+            self._scale_anim.start()
+            self._wiggle_anim.start()
+        QTimer.singleShot(700, self._run_work)
+
+    def _run_work(self) -> None:
+        self._status_lbl.setText('Launching Serato…')
+        success = self._do_work()
+        if self._scale_anim is not None:
+            self._scale_anim.stop()
+            self._wiggle_anim.stop()
+        if success:
+            QTimer.singleShot(550, self.accept)
+        else:
+            self._status_lbl.setText("Couldn't find Serato")
+            QTimer.singleShot(650, self.reject)
+
+    def keyPressEvent(self, event) -> None:
+        event.ignore()  # can't be cancelled mid-sequence — Escape does nothing here
+
+    def closeEvent(self, event) -> None:
+        event.ignore()  # same — no title bar/close box exists, but block just in case
+
+
+def show_launching_serato_dialog(parent: QWidget, do_work: Callable[[], bool]) -> bool:
+    """Shows the animated "Saving your crates… Launching Serato…" modal and
+    runs `do_work` (checkpoint save + the actual Serato launch attempt)
+    partway through. Returns True if `do_work` reported success."""
+    dlg = _LaunchingSeratoDialog(parent, do_work)
     return dlg.exec() == QDialog.DialogCode.Accepted

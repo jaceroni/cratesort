@@ -958,6 +958,7 @@ class CrateManagerView(QWidget):
     track_selected      = pyqtSignal(str)
     album_art_requested = pyqtSignal(str)
     navigate_to_settings = pyqtSignal()   # emitted by "Load Library" on empty-state screen
+    launch_serato_requested = pyqtSignal()
 
     def __init__(self, undo_manager: Optional['UndoManager'] = None, parent=None):
         super().__init__(parent)
@@ -1249,6 +1250,21 @@ class CrateManagerView(QWidget):
         )
         smart_crate_btn.clicked.connect(self._on_new_smart_crate)
         row.addWidget(smart_crate_btn)
+
+        row.addSpacing(24)
+
+        launch_serato_btn = QPushButton('▶ Launch Serato')
+        launch_serato_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        launch_serato_btn.setFixedHeight(36)
+        launch_serato_btn.setToolTip('Save your crates and open Serato')
+        launch_serato_btn.setStyleSheet(
+            f'QPushButton {{ background: {_TEAL}; color: #ffffff; font-size: 13px; '
+            f'font-weight: 600; border: none; border-radius: 6px; padding: 0 12px; }}'
+            f'QPushButton:hover {{ background: #38706a; }}'
+            f'QPushButton:pressed {{ background: #2d6358; }}'
+        )
+        launch_serato_btn.clicked.connect(self.launch_serato_requested.emit)
+        row.addWidget(launch_serato_btn)
 
         return tb
 

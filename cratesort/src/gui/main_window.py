@@ -25,7 +25,7 @@ except ImportError:
     _SVG_AVAILABLE = False
 
 from cratesort.src.gui.theme import apply_theme, C, empty_artwork_pixmap, RoundedCornerOverlay
-from cratesort.src.gui.overlays import _ov_alert
+from cratesort.src.gui.overlays import _ov_alert, show_launching_serato_dialog
 from cratesort.src.gui.dashboard import DashboardWidget
 from cratesort.src.gui.library_browser import LibraryBrowserView
 from cratesort.src.gui.crate_manager import CrateManagerView
@@ -36,6 +36,7 @@ from cratesort.src.gui.playback_controller import PlaybackController
 from cratesort.src.gui.playback_bar import PlaybackBar
 from cratesort.src.gui.video_window import FloatingVideoWindow
 from cratesort.src.utils.undo_manager import UndoManager
+from cratesort.src.utils.serato_guard import launch_serato
 
 _ASSETS = Path(__file__).parent.parent.parent / 'assets'
 _LOGO_WORDMARK = _ASSETS / 'logo' / 'cs-logo-lockup-horiz.svg'
@@ -159,6 +160,7 @@ class MainWindow(QMainWindow):
         self._crate_manager.track_selected.connect(self._update_album_art)
         self._crate_manager.album_art_requested.connect(self._update_album_art)
         self._crate_manager.navigate_to_settings.connect(lambda: self._on_nav_by_id('settings'))
+        self._crate_manager.launch_serato_requested.connect(self._on_launch_serato_requested)
         self._content.addWidget(self._crate_manager)
 
         # Organize view — index 3
@@ -904,6 +906,29 @@ class MainWindow(QMainWindow):
             self._dashboard._worker.cancel()
             self._dashboard._worker.wait(1000)
         super().closeEvent(event)
+
+    def _on_launch_serato_requested(self) -> None:
+        def _do_work() -> bool:
+            # Re-snapshot current crate state as the new checkpoint baseline —
+            # the same re-scan-and-save _check_serato_sync() already does at
+            # session start, run here so the next launch's Carfax-style diff
+            # is measured from "the moment you handed off to Serato."
+            if hasattr(self, '_dashboard'):
+                try:
+                    self._dashboard._check_serato_sync()
+                except Exception:
+                    pass
+            return launch_serato()
+
+        if show_launching_serato_dialog(self, _do_work):
+            self.close()
+        else:
+            _ov_alert(
+                self,
+                "Couldn't Launch Serato",
+                "CrateSort couldn't find Serato DJ Pro on this computer. "
+                "Your crates are saved — go ahead and open Serato manually.",
+            )
 
 
 # ---------------------------------------------------------------------------
