@@ -343,12 +343,12 @@ class _WarningsDetailDialog(_CrateSortDialog):
         self.setMinimumHeight(480)
 
         # Use standard Red accent layout (warnings/conflicts)
-        layout = _create_dialog_layout(self, '#C75B5B')
+        layout = _create_dialog_layout(self)
 
         title_lbl = QLabel('Plan Warnings & Conflicts')
         title_lbl.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(title_lbl)
 
@@ -387,7 +387,7 @@ class _WarningsDetailDialog(_CrateSortDialog):
         text_edit.setStyleSheet(
             f'QTextEdit {{ background-color: {_BG}; color: {_CREAM}; '
             f'border: 1px solid #444; border-radius: 4px; '
-            f'font-size: 12px; font-family: monospace; padding: 8px; }}'
+            f'font-size: 12px; font-family: Menlo, Monaco, "Courier New", monospace; padding: 8px; }}'
         )
         layout.addWidget(text_edit, stretch=1)
 
@@ -412,12 +412,12 @@ class _UnclassifiedWarningDialog(_CrateSortDialog):
         self.setMinimumWidth(480)
 
         # Satsuma Orange accent for warning selection/confirm
-        layout = _create_dialog_layout(self, '#D17D34')
+        layout = _create_dialog_layout(self)
 
         title_lbl = QLabel('Unclassified Tracks Detected')
         title_lbl.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(title_lbl)
         layout.addSpacing(6)

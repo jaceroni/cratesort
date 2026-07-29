@@ -528,12 +528,12 @@ class _ChangeGenreDialog(_CrateSortDialog):
         self.setMinimumWidth(480)
 
         # Use standard Teal accent layout (safe action/selection)
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         headline = QLabel('Change Genre')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(headline)
         layout.addSpacing(6)
@@ -599,12 +599,12 @@ class _ReassignArtistDialog(_CrateSortDialog):
         self.setMinimumWidth(480)
 
         # Use standard Teal accent layout (safe action/selection)
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         headline = QLabel('Reassign Artist')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(headline)
         layout.addSpacing(6)
@@ -678,12 +678,12 @@ class _EditTagsDialog(_CrateSortDialog):
         self.setMinimumWidth(480)
 
         # Use standard Teal accent layout (safe action/tagging)
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         headline = QLabel('Edit Style Tags')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(headline)
         layout.addSpacing(6)

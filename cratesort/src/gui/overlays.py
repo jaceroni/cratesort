@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 from PyQt6.QtCore import Qt, QEvent, QPoint, QRect, QPropertyAnimation, QEasingCurve
 from PyQt6.QtWidgets import (
-    QWidget, QDialog, QVBoxLayout, QFrame, QLabel, QPushButton, QHBoxLayout
+    QApplication, QWidget, QDialog, QLayout, QVBoxLayout, QFrame, QLabel, QPushButton, QHBoxLayout
 )
 
 
@@ -116,6 +116,54 @@ class _CrateSortDialog(QDialog):
         self._anim.setEasingCurve(curve)
         self._anim.start()
 
+    def done(self, result: int) -> None:
+        # Mirror the entrance bounce on the way out — same duration/overshoot,
+        # just the reverse curve — so accept/cancel/Escape never feel like a
+        # sharp cut. Real QDialog.done() (which hides the window, sets the
+        # result, and unblocks exec()) is deferred until the shrink finishes.
+        if getattr(self, '_closing', False):
+            return
+        self._closing = True
+        self._pending_result = result
+
+        # Lift the dialog's own minimum-size floor (setMinimumWidth, etc.) and its
+        # layout's size constraint — both actively clamp any attempt to shrink an
+        # already-laid-out widget below its natural size, which would otherwise
+        # stop the exit animation from reaching its shrink target.
+        self.setMinimumSize(0, 0)
+        if self.layout() is not None:
+            self.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+
+        current_rect = self.geometry()
+        w, h = current_rect.width(), current_rect.height()
+        cx = current_rect.x() + w // 2
+        cy = current_rect.y() + h // 2
+
+        # Exit runs 20% slower than the entrance — same shape, more room to feel the spring.
+        if getattr(self, '_elastic', True):
+            duration = 384  # 320 * 1.2
+            curve = QEasingCurve(QEasingCurve.Type.InBack)
+            curve.setOvershoot(3.0)
+            sw, sh = int(w * 0.7), int(h * 0.7)
+        else:
+            duration = 240  # 200 * 1.2
+            curve = QEasingCurve(QEasingCurve.Type.InBack)
+            curve.setOvershoot(1.0)
+            sw, sh = int(w * 0.9), int(h * 0.9)
+
+        end_rect = QRect(cx - sw // 2, cy - sh // 2, sw, sh)
+
+        self._exit_anim = QPropertyAnimation(self, b"geometry")
+        self._exit_anim.setDuration(duration)
+        self._exit_anim.setStartValue(current_rect)
+        self._exit_anim.setEndValue(end_rect)
+        self._exit_anim.setEasingCurve(curve)
+        self._exit_anim.finished.connect(self._finish_close)
+        self._exit_anim.start()
+
+    def _finish_close(self) -> None:
+        super().done(self._pending_result)
+
     def _cleanup_overlay(self) -> None:
         if self._overlay is not None:
             self._overlay.removeFromParent()
@@ -124,7 +172,7 @@ class _CrateSortDialog(QDialog):
             self._overlay = None
 
 
-def _create_dialog_layout(dialog: QDialog, accent_color: str) -> QVBoxLayout:
+def _create_dialog_layout(dialog: QDialog) -> QVBoxLayout:
     """Helper to create a standardized premium dialog layout inside a rounded QFrame container.
     Returns the QVBoxLayout inside the container where widgets should be added."""
     root = QVBoxLayout(dialog)
@@ -138,16 +186,26 @@ def _create_dialog_layout(dialog: QDialog, accent_color: str) -> QVBoxLayout:
     )
     root.addWidget(container)
 
+    # Clear space around the content, computed from the real screen DPI rather
+    # than a guessed pixel count — symmetric on all four sides (top included).
+    screen = QApplication.primaryScreen()
+    # physicalDotsPerInch (not logical) — macOS reports a fixed legacy 72 for
+    # logical DPI regardless of the real screen, which would undershoot a true
+    # physical inch on any actual display.
+    dpi = screen.physicalDotsPerInch() if screen else 96.0
+    pad = int(round(dpi * 0.7 * 0.8))  # ~1 inch, dialed back 30% then another 20%
+
     inner = QVBoxLayout(container)
-    inner.setContentsMargins(28, 0, 28, 24)
+    inner.setContentsMargins(pad, pad, pad, pad)
     inner.setSpacing(16)
 
-    # Accent bar at the top of the dialog card
-    accent = QFrame()
-    accent.setFixedHeight(4)
-    accent.setStyleSheet(f'background-color: {accent_color}; border: none; border-radius: 2px;')
-    inner.addWidget(accent)
-    inner.addSpacing(6)
+    # An inch of padding on each side would crush content on dialogs whose
+    # minimum width was tuned around the old, much smaller margin — grow the
+    # floor so there's still real room left for lists/fields/buttons.
+    _MIN_CONTENT_WIDTH = 320
+    needed_width = pad * 2 + _MIN_CONTENT_WIDTH
+    if dialog.minimumWidth() < needed_width:
+        dialog.setMinimumWidth(needed_width)
 
     return inner
 
@@ -164,12 +222,12 @@ def _ov_alert(parent: QWidget, title: str, body: str) -> None:
     if accent_color == '#C75B5B':
         dlg._elastic = False
 
-    layout = _create_dialog_layout(dlg, accent_color)
+    layout = _create_dialog_layout(dlg)
 
     title_lbl = QLabel(title)
     title_lbl.setStyleSheet(
-        'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-        'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+        'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+        'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
     )
     layout.addWidget(title_lbl)
     layout.addSpacing(6)
@@ -220,12 +278,12 @@ def _ov_confirm(
     if confirm_danger:
         dlg._elastic = False
 
-    layout = _create_dialog_layout(dlg, accent_color)
+    layout = _create_dialog_layout(dlg)
 
     title_lbl = QLabel(title)
     title_lbl.setStyleSheet(
-        'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-        'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+        'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+        'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
     )
     layout.addWidget(title_lbl)
     layout.addSpacing(6)

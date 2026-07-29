@@ -1,6 +1,91 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QApplication
+from pathlib import Path
+from typing import Optional
+
+from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtWidgets import QApplication, QWidget
+
+_ASSETS = Path(__file__).parent.parent.parent / 'assets'
+_EMPTY_ARTWORK_PATH = _ASSETS / 'icons' / 'cs-empty-artwork-thumbnail.png'
+_EMPTY_ARTWORK_SOURCE: Optional[QPixmap] = None
+
+
+def empty_artwork_pixmap(size: int) -> QPixmap:
+    """Branded 'no artwork' placeholder — shared by the sidebar art panel,
+    the inline video panel, and the playback bar's mini thumbnail, so every
+    empty-artwork slot in the app looks the same."""
+    global _EMPTY_ARTWORK_SOURCE
+    if _EMPTY_ARTWORK_SOURCE is None:
+        _EMPTY_ARTWORK_SOURCE = QPixmap(str(_EMPTY_ARTWORK_PATH))
+    if _EMPTY_ARTWORK_SOURCE.isNull():
+        return QPixmap()
+    return _EMPTY_ARTWORK_SOURCE.scaled(
+        size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+    )
+
+
+class RoundedCornerOverlay(QWidget):
+    """Paints opaque corner covers (matching `bg_color`) over whatever content
+    sits beneath it in the same rect, faking a rounded-corner clip for
+    content that doesn't reliably respect clipping directly — a QLabel's
+    pixmap isn't clipped by its own QSS border-radius (that only rounds the
+    background), and a QVideoWidget's native rendering surface doesn't
+    reliably honor QWidget.setMask() either.
+
+    Also draws the border stroke itself, in the same paintEvent as the
+    corner-cover fill, using the identical QPainterPath for both — if the
+    border were left to the underlying widget's own separately-rendered QSS
+    border-radius, its curve and this overlay's corner-cutout curve don't
+    perfectly coincide pixel-for-pixel (different anti-aliasing passes), and
+    the seam between them reads as a muddy "bad clipping" halo right at the
+    curve. Drawing both from one path guarantees they align exactly.
+
+    Must be the topmost sibling, sized to match the content it's covering,
+    and non-interactive (clicks pass through to the real widget below). The
+    underlying widget should NOT also declare its own `border` in QSS —
+    only `background-color` — since this overlay owns the border now."""
+
+    def __init__(self, bg_color: str, radius: int, border_color: Optional[str] = None,
+                 border_width: float = 1.0, parent=None):
+        super().__init__(parent)
+        self._bg_color = QColor(bg_color)
+        self._radius = radius
+        self._border_color = QColor(border_color) if border_color else None
+        self._border_width = border_width
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def set_radius(self, radius: int) -> None:
+        self._radius = radius
+        self.update()
+
+    def set_border(self, color: Optional[str], width: float = 1.0) -> None:
+        self._border_color = QColor(color) if color else None
+        self._border_width = width
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect())
+        # Inset by half the border width so a centered stroke never gets
+        # clipped by the widget's own edge.
+        inset = self._border_width / 2
+        inner = QPainterPath()
+        inner.addRoundedRect(rect.adjusted(inset, inset, -inset, -inset), self._radius, self._radius)
+
+        outer = QPainterPath()
+        outer.addRect(rect)
+        painter.fillPath(outer.subtracted(inner), self._bg_color)
+
+        if self._border_color is not None:
+            pen = QPen(self._border_color)
+            pen.setWidthF(self._border_width)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(inner)
 
 # ---------------------------------------------------------------------------
 # Color palette
@@ -46,7 +131,7 @@ STYLESHEET = f"""
 QMainWindow, QWidget, QDialog {{
     background-color: {C['bg']};
     color: {C['text']};
-    font-family: "Helvetica Neue", Arial, Helvetica, sans-serif;
+    font-family: "Helvetica Neue", Arial, Helvetica;
     font-size: 14px;
 }}
 
@@ -268,10 +353,9 @@ QLabel {{
     color: {C['text']};
 }}
 QLabel[role="heading"] {{
-    font-size: 20px;
+    font-size: 22px;
     font-weight: 700;
     color: {C['text']};
-    font-family: "Charter", "Georgia", serif;
 }}
 QLabel[role="subheading"] {{
     font-size: 14px;
@@ -286,7 +370,7 @@ QLabel[role="tagline"] {{
     color: {C['text_muted']};
     font-size: 15px;
     font-style: italic;
-    font-family: "Charter", "Georgia", serif;
+    font-family: "Charter", "Georgia";
 }}
 QLabel[role="stat"] {{
     color: {C['orange']};

@@ -49,7 +49,14 @@ When reviewing duplicates, clicking a track row that has `ARTWORK: Yes` should d
 
 ## General / UX
 
-*(nothing tabled yet)*
+### Animated right-click context menus (Library, Crates, Tracks)
+Right-click menus throughout the app ("Approve", "Change Genre", "Mark for Review", etc. in Library; equivalent menus in Crates/Tracks) are plain `QMenu` instances — confirmed and requested to get the same elastic/spring motion signature as dialogs and page transitions ("more fun," "more brand essence").
+
+**Why it's tabled, not built:** `QMenu` renders as a native macOS menu with zero programmatic animation hook — Qt cannot attach a `QPropertyAnimation` to it, same category of constraint as native file pickers. Matching the dialog bounce requires building a fully custom frameless popup widget from scratch (own rows, hover states, keyboard nav, positioning, dismiss-on-outside-click) to replace `QMenu` in all three call sites (`library_browser.py`, `classifier_view.py`, `crate_manager.py`) — a real component build, not a tweak.
+
+**Implementation note:** Model it on `_CrateSortDialog` (`overlays.py`) — frameless `QWidget`, `OutBack`/`InBack` overshoot 3.0 (size-based, matches dialogs) for entrance/exit. No existing non-native popup/dropdown precedent exists elsewhere in the codebase to reuse.
+
+---
 
 ---
 
@@ -89,4 +96,4 @@ A lightweight standalone companion app positioned as a free lead-gen piece for C
 
 ---
 
-*Last updated: July 12, 2026*
+*Last updated: July 27, 2026*

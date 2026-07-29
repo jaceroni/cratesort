@@ -28,6 +28,8 @@ from cratesort.src.utils.undo_manager import (
     UndoManager, AddTracksCommand, RemoveTracksCommand, ReorderTracksCommand,
     CreateCrateCommand, DeleteCrateCommand, RenameCrateCommand,
     ReorderCratesCommand, ReparentCrateCommand, EditTrackMetadataCommand,
+    CrateGenreChangeCommand, CrateTagsEditCommand, CrateReassignArtistCommand,
+    PromoteCrateCommand,
 )
 from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm, _create_dialog_layout
 
@@ -437,7 +439,7 @@ class _AddTracksDialog(_CrateSortDialog):
         self.setMinimumSize(560, 480)
 
         # Use standard Teal accent layout (safe action/selection)
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         # Since QListWidget and QLineEdit styling is on the dialog or layout, we can set it on parent/self
         self.setStyleSheet(
@@ -449,8 +451,8 @@ class _AddTracksDialog(_CrateSortDialog):
 
         headline = QLabel('Add Tracks to Crate')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(headline)
 
@@ -547,12 +549,12 @@ class _NameInputDialog(_CrateSortDialog):
         self.setMinimumWidth(480)
 
         # Use standard Teal accent layout (safe action/input)
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         headline = QLabel(title)
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(headline)
         layout.addSpacing(6)
@@ -893,12 +895,12 @@ class _ExportProgressDialog(_CrateSortDialog):
         self.setMinimumWidth(480)
 
         # Use standard Teal accent layout (safe action/progress)
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         title = QLabel('Exporting Crate')
         title.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
@@ -1485,7 +1487,9 @@ class CrateManagerView(QWidget):
 
     def _set_status(self, text: str, teal: bool = False) -> None:
         color = _TEAL if teal else _MUTED
-        self._status_label.setStyleSheet(f'color: {color}; font-size: 12px;')
+        weight = '600' if teal else '400'
+        size = '13px' if teal else '12px'
+        self._status_label.setStyleSheet(f'color: {color}; font-size: {size}; font-weight: {weight};')
         self._status_label.setText(text)
 
     # ── Tree state save/restore ────────────────────────────────────────
@@ -1883,6 +1887,7 @@ class CrateManagerView(QWidget):
         if not self._settings.value(_SETTINGS_KEY):
             self._size_pos_column(len(rows))
             QTimer.singleShot(100, self._enforce_min_col_widths)
+            QTimer.singleShot(100, self._size_artist_column)
 
     def _populate_resolved_row_from_data(self, row: int, d: dict) -> None:
         tp       = d['track_path']
@@ -1939,6 +1944,7 @@ class CrateManagerView(QWidget):
         if not self._settings.value(_SETTINGS_KEY):
             self._size_pos_column(len(track_paths))
             QTimer.singleShot(100, self._enforce_min_col_widths)
+            QTimer.singleShot(100, self._size_artist_column)
 
     def _populate_resolved_row(self, row: int, track_path: str, rec) -> None:
         edits = self._edits.get(str(rec.path), {})
@@ -2130,6 +2136,7 @@ class CrateManagerView(QWidget):
         if self._undo_manager:
             cmd = EditTrackMetadataCommand(
                 self, str(rec.path), field_name, col, original, new_val,
+                crate_path=self._current_crate_path,
             )
             self._undo_manager.push(cmd)  # execute() updates cell + saves
         else:
@@ -2166,6 +2173,101 @@ class CrateManagerView(QWidget):
                 if it:
                     it.setForeground(cream)
         QTimer.singleShot(1500, _restore)
+
+    # ── Undo/redo command support (genre / tags / reassign) ─────────────
+
+    def _find_row_by_path(self, file_path: str) -> Optional[int]:
+        for r in range(self._track_table.rowCount()):
+            cell = self._track_table.item(r, TC_PATH)
+            if cell and cell.text() == file_path:
+                return r
+        return None
+
+    def _apply_crate_genre(self, crate_path: Optional[str], values: dict) -> None:
+        """values: file_path -> genre to set, or None to clear the override.
+        Shared by execute()/undo() of CrateGenreChangeCommand."""
+        for path, genre in values.items():
+            if genre is None:
+                self._edits.get(path, {}).pop('genre', None)
+                if path in self._edits and not self._edits[path]:
+                    del self._edits[path]
+            else:
+                self._edits.setdefault(path, {})['genre'] = genre
+        self._save_edits()
+
+        track_changes = {k: v for k, v in values.items() if v is not None}
+        self._sync_genres_to_session({}, track_changes)
+
+        if crate_path and self._current_crate_path != crate_path:
+            self._refresh(select=crate_path)
+            return
+
+        for path in values:
+            row = self._find_row_by_path(path)
+            rec = self._resolve_track(path)
+            if row is None or rec is None:
+                continue
+            artist_key = f'__artist__{rec.artist}' if rec.artist else ''
+            display = (
+                self._edits.get(path, {}).get('genre')
+                or (self._edits.get(artist_key, {}).get('genre') if artist_key else None)
+                or self._track_genre_overrides.get(path)
+                or self._session_genre.get(rec.artist or '')
+                or rec.genre
+                or '—'
+            )
+            cell = self._track_table.item(row, TC_GENRE)
+            if cell:
+                cell.setText(display)
+            self._flash_row(row)
+
+    def _apply_crate_tags(self, crate_path: Optional[str], file_path: str, tags_str: str) -> None:
+        """Shared by execute()/undo() of CrateTagsEditCommand."""
+        if tags_str:
+            self._edits.setdefault(file_path, {})['tags'] = tags_str
+        else:
+            self._edits.get(file_path, {}).pop('tags', None)
+            if file_path in self._edits and not self._edits[file_path]:
+                del self._edits[file_path]
+        self._save_edits()
+
+        if crate_path and self._current_crate_path != crate_path:
+            self._refresh(select=crate_path)
+            return
+
+        row = self._find_row_by_path(file_path)
+        if row is not None:
+            cell = self._track_table.item(row, TC_TAGS)
+            if cell:
+                cell.setText(tags_str)
+            self._flash_row(row)
+
+    def _apply_crate_reassign(self, crate_path: Optional[str], values: dict) -> None:
+        """values: file_path -> artist to set, or None to clear the override.
+        Shared by execute()/undo() of CrateReassignArtistCommand."""
+        for path, artist in values.items():
+            if artist is None:
+                self._edits.get(path, {}).pop('reassign_artist', None)
+                if path in self._edits and not self._edits[path]:
+                    del self._edits[path]
+            else:
+                self._edits.setdefault(path, {})['reassign_artist'] = artist
+        self._save_edits()
+
+        if crate_path and self._current_crate_path != crate_path:
+            self._refresh(select=crate_path)
+            return
+
+        for path in values:
+            row = self._find_row_by_path(path)
+            rec = self._resolve_track(path)
+            if row is None or rec is None:
+                continue
+            display = self._edits.get(path, {}).get('reassign_artist', rec.artist or '')
+            cell = self._track_table.item(row, TC_ARTIST)
+            if cell:
+                cell.setText(display)
+            self._flash_row(row)
 
     def eventFilter(self, obj, event) -> bool:
         # Guard: _track_table is pre-initialized to None and assigned in _build_track_panel.
@@ -2478,22 +2580,9 @@ class CrateManagerView(QWidget):
 
         crate_name = drag_path.split('/')[-1]
 
-        # Promote: sub-crate dragged to top level — rename file first
         if promote_to_top and '/' in drag_path:
-            writer = self._writer()
-            if not writer:
-                return
-            result = writer.rename_crate(drag_path, crate_name)
-            if not result.success:
-                _ov_alert(self, 'Promote Crate', f'Failed: {result.error}')
-                return
-            # Update _crate_order to remove from old parent
-            old_parent = '/'.join(drag_path.split('/')[:-1])
-            if old_parent in self._crate_order:
-                self._crate_order[old_parent] = [
-                    p for p in self._crate_order[old_parent] if p != drag_path
-                ]
-            drag_path = crate_name
+            self._promote_crate_to_top(drag_path, crate_name, insert_before_path)
+            return
 
         # Determine the order key (parent path or "" for top-level)
         if '/' in drag_path:
@@ -2527,19 +2616,65 @@ class CrateManagerView(QWidget):
         if self._undo_manager:
             cmd = ReorderCratesCommand(self, order_key, captured_current, list(order))
             self._undo_manager.push(cmd)
-            if promote_to_top:
-                self._set_status(f'Moved "{crate_name}" to top level', teal=True)
-            else:
-                self._set_status(f'Moved "{crate_name}"', teal=True)
+            self._set_status(f'Moved "{crate_name}"', teal=True)
             return
         # fallback: existing direct code
         self._crate_order[order_key] = order
         self._save_crate_order()
         self._refresh(select=drag_path)
-        if promote_to_top:
-            self._set_status(f'Moved "{crate_name}" to top level', teal=True)
+        self._set_status(f'Moved "{crate_name}"', teal=True)
+
+    def _promote_crate_to_top(
+        self, drag_path: str, crate_name: str, insert_before_path: Optional[str],
+    ) -> None:
+        """Promote a nested crate to the top level: rename the crate file and
+        move it from its old parent's sibling order into the top-level order,
+        as a single undoable action."""
+        old_parent_key = '/'.join(drag_path.split('/')[:-1])
+        old_parent_current = list(self._crate_order.get(
+            old_parent_key,
+            list(self._crate_library.crates[old_parent_key].children)
+            if old_parent_key in self._crate_library.crates else [],
+        ))
+
+        # Compute the resulting top-level order, treating crate_name as the
+        # newly promoted entry (the physical rename hasn't happened yet).
+        top_current   = self._crate_order.get('', list(self._crate_library.top_level))
+        new_top_order = [p for p in top_current if p != crate_name]
+        existing = set(new_top_order)
+        for p in self._crate_library.top_level:
+            if p not in existing and p != crate_name:
+                new_top_order.append(p)
+        if insert_before_path is None:
+            new_top_order.append(crate_name)
         else:
-            self._set_status(f'Moved "{crate_name}"', teal=True)
+            try:
+                new_top_order.insert(new_top_order.index(insert_before_path), crate_name)
+            except ValueError:
+                new_top_order.append(crate_name)
+
+        if self._undo_manager:
+            cmd = PromoteCrateCommand(self, drag_path, crate_name, old_parent_key, old_parent_current, new_top_order)
+            self._undo_manager.push(cmd)
+            self._set_status(f'Moved "{crate_name}" to top level', teal=True)
+            return
+
+        # fallback: existing direct code (no undo manager)
+        writer = self._writer()
+        if not writer:
+            return
+        result = writer.rename_crate(drag_path, crate_name)
+        if not result.success:
+            _ov_alert(self, 'Promote Crate', f'Failed: {result.error}')
+            return
+        if old_parent_key in self._crate_order:
+            self._crate_order[old_parent_key] = [
+                p for p in self._crate_order[old_parent_key] if p != drag_path
+            ]
+        self._crate_order[''] = new_top_order
+        self._save_crate_order()
+        self._refresh(select=crate_name)
+        self._set_status(f'Moved "{crate_name}" to top level', teal=True)
 
     def _crate_reparent(self, drag_path: str, new_parent_path: str) -> None:
         """Move crate under a new parent via CrateWriter.rename_crate."""
@@ -3011,7 +3146,8 @@ class CrateManagerView(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_genre = dlg.selected_genre
-        track_changes: dict[str, str] = {}
+
+        old_genres: dict[str, Optional[str]] = {}
         for row in rows:
             path_item = self._track_table.item(row, TC_PATH)
             if not path_item:
@@ -3019,13 +3155,15 @@ class CrateManagerView(QWidget):
             rec = self._resolve_track(path_item.text())
             if rec is None:
                 continue
-            cell = self._track_table.item(row, TC_GENRE)
-            if cell:
-                cell.setText(new_genre)
-            self._edits.setdefault(str(rec.path), {})['genre'] = new_genre
-            track_changes[str(rec.path)] = new_genre
-        self._save_edits()
-        self._sync_genres_to_session({}, track_changes)
+            old_genres[str(rec.path)] = self._edits.get(str(rec.path), {}).get('genre')
+        if not old_genres:
+            return
+
+        if self._undo_manager:
+            cmd = CrateGenreChangeCommand(self, self._current_crate_path, old_genres, new_genre, label)
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_crate_genre(self._current_crate_path, {k: new_genre for k in old_genres})
 
     def _edit_tags_for_rows(self, rows: list[int]) -> None:
         from cratesort.src.gui.classifier_view import _EditTagsDialog
@@ -3038,8 +3176,8 @@ class CrateManagerView(QWidget):
         rec = self._resolve_track(path_item.text())
         if rec is None:
             return
-        current_tags_str = self._edits.get(str(rec.path), {}).get('tags', '')
-        current_tags     = [t.strip() for t in current_tags_str.split(',') if t.strip()]
+        old_tags_str = self._edits.get(str(rec.path), {}).get('tags', '')
+        current_tags = [t.strip() for t in old_tags_str.split(',') if t.strip()]
         proxy = type('T', (), {
             'filename':  rec.filename,
             'title':     rec.title,
@@ -3049,13 +3187,16 @@ class CrateManagerView(QWidget):
         })()
         dlg = _EditTagsDialog(proxy, self)
         dlg.setWindowTitle(f'Edit Style Tags — {rec.filename}')
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            tags_str = ', '.join(proxy.tags)
-            self._edits.setdefault(str(rec.path), {})['tags'] = tags_str
-            self._save_edits()
-            tags_cell = self._track_table.item(row, TC_TAGS)
-            if tags_cell:
-                tags_cell.setText(tags_str)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        tags_str = ', '.join(proxy.tags)
+        if self._undo_manager:
+            cmd = CrateTagsEditCommand(
+                self, self._current_crate_path, str(rec.path), rec.filename, old_tags_str, tags_str,
+            )
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_crate_tags(self._current_crate_path, str(rec.path), tags_str)
 
     def _reassign_artist_for_row(self, row: int) -> None:
         from cratesort.src.gui.classifier_view import _ReassignArtistDialog
@@ -3072,11 +3213,14 @@ class CrateManagerView(QWidget):
         new_artist = dlg.artist_name.strip()
         if not new_artist:
             return
-        self._edits.setdefault(str(rec.path), {})['reassign_artist'] = new_artist
-        self._save_edits()
-        artist_cell = self._track_table.item(row, TC_ARTIST)
-        if artist_cell:
-            artist_cell.setText(new_artist)
+        old_artist = self._edits.get(str(rec.path), {}).get('reassign_artist')
+        if self._undo_manager:
+            cmd = CrateReassignArtistCommand(
+                self, self._current_crate_path, str(rec.path), rec.filename, old_artist, new_artist,
+            )
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_crate_reassign(self._current_crate_path, {str(rec.path): new_artist})
 
     def _remove_from_crate(self, rows: list[int]) -> None:
         if not self._current_crate_path or self._current_crate_path == _ALL_TRACKS_KEY:
@@ -3418,6 +3562,21 @@ class CrateManagerView(QWidget):
             min_w = fm.horizontalAdvance(text) + 40
             if self._track_table.columnWidth(col) < min_w:
                 self._track_table.setColumnWidth(col, min_w)
+
+    def _size_artist_column(self) -> None:
+        """First-load only: fit the Artist column to the widest actual artist name
+        in this crate, rather than leaving it at header-label width."""
+        fm = self._track_table.horizontalHeader().fontMetrics()
+        widest = 0
+        for row in range(self._track_table.rowCount()):
+            item = self._track_table.item(row, TC_ARTIST)
+            if item is not None:
+                w = fm.horizontalAdvance(item.text())
+                if w > widest:
+                    widest = w
+        artist_w = widest + 40
+        if artist_w > self._track_table.columnWidth(TC_ARTIST):
+            self._track_table.setColumnWidth(TC_ARTIST, artist_w)
 
     def save_state(self) -> None:
         self._settings.setValue(

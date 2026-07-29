@@ -117,6 +117,8 @@ SVG icons live in `cratesort/assets/icons/` as `icon-{nav_id}.svg`. All are fill
 
 Nav buttons load SVGs via `QIcon(str(icon_path))` at `16×16`. The `_on_nav(index)` handler calls `.load()` on the appropriate view. `_on_nav()` guards against disabled nav items in "No library loaded" state — clicks on Library, Crates, and Organize are silent no-ops. When no-library is detected mid-session, redirects to Settings (index 4) as the recovery path.
 
+**Scanning-in-progress gate (added July 2026):** `MainWindow._is_scanning_in_progress()` returns `dash._library_path is not None and dash._summary is None` — true from the moment a library is picked until the background scan populates `_summary`. While true, `_apply_nav_state()` disables **every** nav item except Dashboard (index 0), including Settings — this is a distinct condition from the disk-based `_get_app_state()` check (which only looks at whether a `_Serato_` folder exists on disk and cannot tell "already scanned" apart from "scan in flight"). `_apply_nav_state(self._get_app_state())` must be re-invoked immediately after any call to `dashboard.set_library_path()`/`start_scan()` that doesn't go through the dashboard's own `library_path_changed` signal (see `_on_library_changed_from_settings`), or the nav bar will show stale enabled state while a new scan is running.
+
 After reorg or rollback completes, `OrganizeView.reorg_completed` fires → `MainWindow._on_reorg_completed()` → `_dashboard.start_scan(lib)` to rebuild inventory with new file paths.
 
 **Nav order is locked.** Organize stays at the end — it is a destination, not a routine step.
@@ -141,10 +143,11 @@ The launch screen is a context-aware single screen — no popup dialog. It lives
 - `_LaunchDialog` has been deleted — do not recreate it
 - No popup modal on launch under any circumstances
 - `always_load_last` preference stored in QSettings key `always_load_last` (bool)
+- The dedicated full-page "Scanning library…" screen (former stack index 1, `_build_scanning()`) has been **removed entirely** (July 2026). `DashboardWidget._stack` is now only 2 states: `0 = welcome`, `1 = dashboard` (shown both while a scan is pending and once it's ready — see Dashboard Architecture below).
 
 ### Nav state rules
 
-**Two states only:**
+**Three effective states:**
 
 **No library loaded:**
 - Dashboard: Active
@@ -153,7 +156,12 @@ The launch screen is a context-aware single screen — no popup dialog. It lives
 - Organize: Disabled (same tooltip)
 - Settings: Active
 
-**Library loaded:**
+**Library loaded, scan in progress** (added July 2026 — picking a library no longer blocks the app on a blank scanning screen):
+- Dashboard: Active — shows immediately with the YouTube-import and local-conversion cards fully usable, since neither depends on the library scan
+- Library, Crates, Organize, **and Settings**: all disabled, tooltip: "Scanning your library — this tab will be available once the scan finishes." (Settings has nothing useful to offer at this point either — see `MainWindow._is_scanning_in_progress()`.)
+- The "Manage Library / Manage Crates / Organize Media" cards on the dashboard itself are also grayed out (`_WorkflowCard.set_disabled(True)`) for the same reason, even though the tab click would be a no-op anyway.
+
+**Library loaded, scan complete:**
 - All nav items: Active
 - No classification gate on any nav item
 - Organize shows warning dialog if unclassified tracks exist — does NOT hard block
@@ -358,26 +366,38 @@ Thin public wrapper around the internal mutagen tag helpers. Loads the file with
 
 ## Dashboard Architecture
 
-`src/gui/dashboard.py` — session-aware command center. Stack index 2 in `DashboardWidget`.
+`src/gui/dashboard.py` — session-aware command center. Stack index 1 in `DashboardWidget` (index 2 no longer exists — see Launch Screen Architecture above).
 
-### Sections (in order):
+`_populate_dashboard(scanning: bool = False)` is the single entry point that rebuilds `_dashboard_layout` from scratch (clears all children via `deleteLater()`, then rebuilds). It branches into one of two completely different renders depending on `scanning`:
+
+### Pending render (`scanning=True`) — shown the instant a library is picked
+
+Rendered immediately by `_start_scan_now()`, before the background `_ScanWorker` has produced any data (`self._summary`/`self._inventory` are reset to `None`/`[]` first).
+
+1. **Scanning banner** (`_build_scanning_banner()`) — replaces the stat-cards section entirely (no zero-value stat cards — that reads as broken, not "in progress"). A single panel: eyebrow "SCANNING YOUR LIBRARY", the pulsing mascot (`cs-logo-mascot-only.svg`, `QGraphicsOpacityEffect` + `QPropertyAnimation` looping 0.3→1.0→0.3 opacity, `InOutSine`, 1100ms, `setLoopCount(-1)` — this is the app's standard "busy but not a spinner" indicator, see Motion system below), a live "N files found" label (`self._scan_count`, updated by `_on_scan_progress`), and a Cancel button (`self._scan_cancel` → `_on_cancel_scan`, which resets `_library_path`/`_summary` to `None` and returns to the welcome screen, index 0).
+2. **Action Cards**, rendered via `_build_action_cards_section(scanning=True)` — same section as the ready state (see below), except the 3 "Go To" cards are passed `card.set_disabled(True)` (see `_WorkflowCard.set_disabled()`) since they depend on scan data. The YouTube-import and local-conversion cards are **not** disabled — neither needs the library scan to function.
+3. No activity feed, no footer — both depend on scan/sync data that isn't ready yet.
+
+### Ready render (`scanning=False`) — shown once `_on_scan_finished` → `_show_dashboard()` fires
 
 1. **Stat Cards** (`_build_stat_cards_section()`) — four cards: Total Tracks, Total Crates, Unique Artists, Hours of Music. Count-up animation on load. No icon labels — numbers and labels only. `_AnimatedStatCard(target, suffix, label)` — note: no icon parameter.
 
-2. **Action Cards** (`_build_action_cards_section()`) — two groups:
+2. **Action Cards** (`_build_action_cards_section(scanning=False)`) — three groups, separated by dividers (16px clear space each side, matching the divider above this whole section — `vbox.addSpacing(6)` on top of the inner layout's uniform 10px spacing):
    - **Go To** (3 cards):
      - `Manage Library` — navigates to Library (index 1). Primary label in orange `#D17D34`, 16px, weight 500. No step number.
      - `Manage Crates` — navigates to Crates (index 2). Same label treatment.
      - `Organize Media` — navigates to Organize (index 3). Same label treatment.
-     - **First-load highlight**: When `_is_classification_complete()` returns False, the Manage Library card renders with:
+     - **First-load highlight**: When `_is_classification_complete()` returns False (and the dashboard isn't in the pending/scanning render), the Manage Library card renders with:
        - Border: `2px solid #428175`
        - Background: `#1a2e2b`
        - Icon at full teal opacity
        - Returns to standard appearance once classification is complete.
-   - **YouTube import** (2 cards): `YouTube to MP4`, `YouTube to MP3` — built via `_IconActionCard`, matching the Go To cards' gray background / orange headline / muted-icon-lights-up-on-hover treatment (teal is reserved for the Manage Library highlight only; nothing else on the dashboard uses it). Icons are `assets/icons/icon-mp4.svg` (clapperboard) and `icon-mp3.svg` (eighth note) — dimmed `#2a2a2a` at rest, `#D17D34` on hover, same as the Go To cards' SVG recolor technique. There is no longer a "New Crate"/"New Smart Crate" card group on the dashboard — that functionality lives only in the Crates tab toolbar (see Crate Manager Architecture below).
+   - **YouTube import** (2 cards, left-to-right): `YouTube to MP3` (icon `icon-mp3-2.svg`, "Convert URL to audio file · VBR"), `YouTube to MP4` (icon `icon-mp4-2.svg`, "Convert URL to video file · VBR"). Opens `_YTImportDialog(fmt, ...)` — see YouTube Import & Local Conversion Tools below.
+   - **Local conversion** (2 cards, left-to-right, directly below the YouTube row so MP3-output cards line up over MP3-output cards and MP4-output over MP4-output): `Audio to MP3` (icon `icon-convert.svg`, "Convert existing audio file · 320kbps") and `Video to MP4` (same icon, "Convert existing video file · H.264"). Opens `_ConvertDialog(mode, ...)`.
+   - All `_IconActionCard`s share the Go To cards' gray background / orange headline / muted-icon-lights-up-on-hover treatment (teal is reserved for the Manage Library highlight only). Icons use the same dim `#2a2a2a`-at-rest / `#D17D34`-on-hover SVG recolor technique — **except** each icon is now sized by its own aspect ratio (`_svg_aspect_ratio()`, parses the SVG's `viewBox`), locked to a fixed height with proportional width, never forced into a square — the two newer icon sets (`icon-mp3-2.svg`/`icon-mp4-2.svg` are portrait, `icon-convert.svg` is landscape) would visibly stretch/squish under the old fixed-square sizing. There is no longer a "New Crate"/"New Smart Crate" card group on the dashboard — that functionality lives only in the Crates tab toolbar (see Crate Manager Architecture below).
    - **Organize Media footer**: an extra line below the description — `CrateSort's Organization Logic:` / `Your Library Folder > Media > Genre > Artist > Files` — rendered via `_WorkflowCard(footer=...)`, full-card-width (not confined to the text column), 12px font, 16.5px line-height set via rich-text `<div style="line-height:...">` since Qt's QSS `line-height` property is a silent no-op on plain `QLabel` text.
 
-Dashboard has a `refresh()` method called when navigating to index 0 — re-runs duplicate detection and repopulates dashboard state. **Serato sync check (`_check_serato_sync()`) runs only in `_show_dashboard()` at session start — it is NOT called from `refresh()`.** This prevents CrateSort's own crate writes during a session from being flagged as external Serato changes.
+Dashboard has a `refresh()` method called when navigating to index 0 — re-runs duplicate detection and repopulates dashboard state (always `scanning=False`; `refresh()` no-ops if `_summary is None`). **Serato sync check (`_check_serato_sync()`) runs only in `_show_dashboard()` at session start — it is NOT called from `refresh()`.** This prevents CrateSort's own crate writes during a session from being flagged as external Serato changes.
 
 3. **Recent Activity** (`_build_activity_section()`) — combined feed: crate changes, recently added tracks, and reorganization events (teal dot = reorg/addition, orange dot = rollback/removal). Last 30 days, capped at 10 items.
 
@@ -397,6 +417,36 @@ When changes are detected on launch, an amber banner appears with a "Review && S
 ### Dashboard layout rule:
 
 `_dashboard_layout` uses `addStretch()` at the end — do NOT add `setAlignment(AlignTop)` to it. The stretch absorbs extra space. Adding AlignTop conflicts with addStretch and causes gaps at large window sizes. Section widgets must use `setMinimumHeight`, not `setFixedHeight`, so they don't over-constrain the layout.
+
+---
+
+## YouTube Import & Local Conversion Tools (added July 2026)
+
+Four dashboard cards, two dialogs, all built on ffmpeg (bundled, not system-installed — see Packaging below).
+
+### `src/gui/yt_import_dialog.py` — `_YTImportDialog(fmt, library_path, genres, artists, parent)`
+
+Downloads a YouTube URL and converts it to `mp3` (VBR best, via yt-dlp's `FFmpegExtractAudio` postprocessor) or `mp4` (1080p max, H.264/AAC 192k, manual ffmpeg re-encode with a `scale=w='min(1920,iw)'...` filter). Has a full metadata form (Artist/Title/Album/Year/Genre with autocomplete) and a MusicBrainz lookup that offers to fill in canonical tags after download. **Artwork picker lives here** (`ARTWORK (OPTIONAL)` section, right after the metadata form, before the destination picker) — a "Choose Image…" button + 48×48 thumbnail preview + Clear button, wired to `embed_artwork()` in `_finish()`. This is the *only* converter with an artwork picker: YouTube downloads never carry embedded art, whereas local WAV/MOV files already have whatever artwork the source file had, carried over automatically (see `_ConvertDialog` below) — **do not add an artwork picker to `_ConvertDialog`**, that was tried and explicitly reverted per user direction.
+
+### `src/gui/convert_dialog.py` — `_ConvertDialog(mode, parent)`
+
+Batch-capable local file converter, `mode` is `'wav_mp3'` or `'video_mp4'`:
+- `wav_mp3`: WAV/AIFF → MP3, 320kbps CBR (libmp3lame). Dialog title "Convert Audio to MP3".
+- `video_mp4`: MOV/MKV/AVI/WMV/WEBM/FLV/M4V/MPG/MPEG → MP4, H.264/AAC 192k, CRF 18, `-preset fast`, even-dimension scale filter only (no resolution cap — unlike the YouTube path, this is the user's own master footage, so original resolution is preserved).
+
+Output always saves next to the source file (same folder, same stem, new extension) — never a destination picker. Collision-safe naming via `_unique_output_path()` (`song.mp3` → `song (1).mp3` → …). Originals are **never** modified or deleted.
+
+**Metadata & artwork carryover** (`src/utils/metadata_copy.py`):
+- `copy_audio_tags(src, dst)` / `copy_video_tags(src, dst)` — copy every ID3 frame / MP4 atom from source to the freshly-converted file, including embedded artwork, **except** Serato's own GEOB analysis caches ("Serato Analysis", "Serato Markers2", "Serato BeatGrid", etc.) — these encode exact sample positions in the *original* audio, which shift once re-encoded, so carrying them over verbatim would show Serato stale/incorrect cue points until it re-analyzes anyway. This exclusion is deliberate, confirmed with the user — never "fix" it by including them.
+- `embed_artwork(dst, fmt, artwork_path)` — used only by `_YTImportDialog` (see above). `fmt` is `'mp3'`/`'mp4'` (not the convert-dialog mode strings).
+
+**Progress**: worker emits real percentages parsed from ffmpeg's `-progress pipe:1` + `-stats_period 0.1` output (increased from ffmpeg's default ~0.5s tick to ~0.1s specifically so short conversions don't feel like a stuck-then-jump — see Motion system below). Duration is read from the *same* ffmpeg process's own stderr banner (merged into stdout, parsed for `Duration: HH:MM:SS`), not a separate probe call — one less subprocess, one less place to fail. **ffmpeg's own log output is decoded with `errors='replace'`, never strict** — real-world files carry non-UTF-8 metadata (camera/encoder strings) that would otherwise crash the read loop mid-conversion while ffmpeg itself keeps running in the background, producing a fully valid output file alongside a false "failed" error. This was a real shipped bug — don't reintroduce strict decoding on this stream.
+
+Failure messages are translated via `friendly_ffmpeg_error()` (`ffmpeg_tools.py`) — recognizes "already exists", "permission denied", "no such file or directory", "no space left on device", "read-only file system" and rewrites them in plain language; falls back to the raw ffmpeg detail for anything unrecognized. Never show a bare exit code to the user.
+
+### ffmpeg subprocess hygiene (applies to both dialogs)
+
+Every ffmpeg `Popen` call must include `stdin=subprocess.DEVNULL` and `-nostdin` — without this, ffmpeg can block forever waiting for stdin input that will never come (a well-known class of "ffmpeg just hangs" bug, especially likely when launched from a terminal that has a real stdin). This was the root cause of an early "app froze" report.
 
 ---
 
@@ -1072,6 +1122,8 @@ Write only what is necessary to accomplish the stated goal. Do not refactor adja
 - `serato-crate>=0.1.0` — PyPI only ever published `0.0.1` → constraint must be `>=0.0.1`.
 - `yt-dlp` was used by `yt_import_dialog.py` but missing from `dependencies` entirely (only lived in `requirements.txt`) → added.
 
+**ffmpeg bundling (added July 2026)**: `imageio-ffmpeg` ships a real ffmpeg binary inside its wheel — no system Homebrew install, no network fetch at runtime, no separate download step. `cratesort/src/utils/ffmpeg_tools.py:get_ffmpeg_path()` resolves it via `imageio_ffmpeg.get_ffmpeg_exe()`, falling back to bare `'ffmpeg'` on `$PATH` only if the package is somehow unavailable. `packaging/CrateSort.spec` must include `*collect_data_files('imageio_ffmpeg')` in `datas=[...]` (via `PyInstaller.utils.hooks.collect_data_files`) or the packaged `.app` silently falls back to a system ffmpeg that won't exist on a clean install — this was the actual bug behind the pre-existing YouTube-import feature depending on Homebrew ffmpeg with nobody noticing. Only `ffmpeg` is bundled this way, not `ffprobe` — `ffmpeg_tools.py:get_media_duration()` parses duration from ffmpeg's own stderr banner instead of shelling out to ffprobe.
+
 **App icon — locked decision**: The mascot's native SVG bounding box is 0.842:1 (taller than wide), never 1:1. macOS (Big Sur onward) automatically synthesizes a light background "card" behind any Dock/Finder icon whose artwork doesn't fill the square canvas — a transparent-background icon that leaves visible margins gets an OS-injected backdrop, which reads as an ugly, uncontrolled gray/white box. **Fix, locked**: bake the mascot onto a solid `#1a1a1a` opaque background (matches the app's own primary dark background color), contain-fit, centered, full canvas, **no crop of the mascot and no distortion of its aspect ratio**. Icon source lives at `cratesort/assets/icons/app/CrateSort.icns`, regenerated via `QSvgRenderer` (PyQt6) rasterizing `cs-logo-mascot-only.svg` at each required size, then `iconutil -c icns`. Never re-attempt a transparent/silhouette-only app icon on macOS — it will not render the way it looks in an image viewer.
 
 **Uninstaller**: `packaging/uninstall.applescript`, compiled via `osacompile -o "Uninstall CrateSort.app" uninstall.applescript` into a real double-clickable `.app` (native dialogs, no Terminal window). Ships inside the DMG alongside `CrateSort.app`. Removes the app bundle (`/Applications` or `~/Applications`) and `~/Library/Preferences/com.jwbc.CrateSort.plist` only. **Never touches `_CrateSort/` folders or any user library data** — those live inside whatever folder the user pointed CrateSort at, not in any OS-standard app-data location. The compiled `.app` itself is a build artifact (gitignored) — only the `.applescript` source is committed.
@@ -1208,12 +1260,18 @@ CrateSort's personality is distinct from CrateView's while still being family.
 
 All CrateSuite products share the same motion and interaction language. These are not CrateSort-specific — they are suite-level standards that must remain consistent across products.
 
-- **Easing**: Cubic ease-out for all transitions and animations. Count-up animations on stat cards use QTimer with cubic ease-out curve.
+**The locked "elastic/spongy" signature (July 2026 — supersedes the old generic "cubic ease-out" language below for anything that reveals or dismisses).** The user validated this extensively across dialogs, context-adjacent transitions, and page navigation, and was explicit that every "something appears, then later leaves" moment in the app must share the *exact same* spring quality, not just a similar vibe:
+- **Entrance**: `QEasingCurve.Type.OutBack`, overshoot `3.0`, animating the element in from ~55–70% of its final size/position, duration ~320ms. Grows past 100%, settles back — the "pop."
+- **Exit**: `QEasingCurve.Type.InBack` (the mirror curve), same overshoot, duration 20% *slower* than the entrance (e.g. 320ms entrance → 384ms exit) — it should feel like the same spring running in reverse, not a different, cheaper animation. Never a plain opacity fade for something that bounced in.
+- **Reference implementation**: `_CrateSortDialog` in `overlays.py` — `run_bounce_animation()` (entrance, `showEvent`) and `done()` (exit, overrides `QDialog.done()` to defer the real close until the shrink finishes, so `exec()` doesn't return until the animation completes). Every custom dialog in the app inherits this for free.
+- **Danger/warning dialogs** (red accent — errors, destructive confirms, unsaved-changes warnings) deliberately use a *subtler* variant: overshoot `1.0` instead of `3.0`, i.e. barely any spring. This is intentional, not an oversight — confirmed with the user that bouncy/playful motion feels tonally wrong on a delete-confirmation or error. Controlled by `_CrateSortDialog._elastic` (default `True`; set `False` for the subtle variant).
+- **Position-based motion needs a much smaller overshoot than size-based motion.** The same `3.0` overshoot that feels great shrinking/growing a dialog's *size* reads as a jarring, too-strong "lean the wrong way before committing" when applied to *position* (e.g. a page sliding left/right). For any horizontal/vertical slide, use overshoot `0.8`, not `3.0` — this was corrected live after the first attempt at the sidebar tab transition felt wrong.
+- **Native OS elements cannot be animated.** Native file/folder pickers (`QFileDialog.getOpenFileName` etc.) and native `QMenu` context menus render outside Qt's control on macOS — there is no programmatic hook to attach a `QPropertyAnimation` to either. Don't promise motion on these; the fix (if ever built) is a fully custom replacement widget, not a tweak. (A custom animated context-menu replacement for Library/Crates/Tracks right-click menus was requested and confirmed but **not yet built** as of this writing — see `docs/future-features.md`.)
 - **Hover states**: All interactive elements respond to hover. Teal buttons get darker on hover — never lighter. Orange elements warm slightly on hover. Never use a hover state that conflicts with the color role rules.
 - **Modals and confirmations**: Every destructive action requires a modal confirmation before executing. Modal style is consistent — dark background, cream text, teal confirm, red cancel. No exceptions.
 - **Status feedback**: Every significant operation produces a status message. Teal text for success/completion. Amber for in-progress or warnings. Red for failures. Status clears on next operation.
-- **Transitions**: Smooth, not instant. Fast enough to feel responsive, slow enough to feel intentional. Nothing should flash or snap without a transition.
-- **Mascot animation** (when integrated): Must honor rubber hose principles — bouncy easing, squash and stretch, fluid elastic movement. Never linear, never mechanical, never stiff.
+- **Loading/busy states that have no calculable percentage** (e.g. file-discovery scanning, where the total isn't known up front) must **never** use `QProgressBar.setRange(0, 0)` (indeterminate/spinner) — this is a hard rule, not a preference. Use the pulsing-mascot pattern instead: `cs-logo-mascot-only.svg` behind a `QGraphicsOpacityEffect`, `QPropertyAnimation` on `opacity` looping 0.3→1.0→0.3 via `setKeyValueAt`, `InOutSine` easing, ~1100ms, `setLoopCount(-1)`, paired with a live count/status label. Reference implementations: `convert_dialog.py`'s conversion progress and `dashboard.py`'s `_build_scanning_banner()`.
+- **Mascot animation**: Must honor rubber hose principles — bouncy easing, squash and stretch, fluid elastic movement. Never linear, never mechanical, never stiff.
 
 ---
 
@@ -1347,40 +1405,45 @@ Right-click OR double-click to edit. Both must work. This is not redundant — d
 
 ## Motion system — CrateSort specific
 
-The motion system is shared across CrateSuite products, but CrateSort has specific motion needs based on its interactions.
+The motion system is shared across CrateSuite products, but CrateSort has specific motion needs based on its interactions. **See "Motion and interaction — CrateSuite system" above (Brandy section) for the exact locked curve/overshoot/duration numbers — this section covers where and how those get applied inside CrateSort specifically.**
 
-**Core easing**: Cubic ease-out for all transitions. Things arrive with energy and settle smoothly. Nothing bounces endlessly. Nothing snaps.
+**Rubber hose principle for UI**: The rubber hose drawing style (flexible, bouncy, organic) informs how CrateSort's UI moves — not how it looks. A modal that bounces in feels alive. A page that springs into place feels physical. A stat card that counts up feels like it's working. These are small moments that add up to a premium feel — and per direct user validation, they must all read as *the same* spring, not a family of similar-but-different ones.
 
-**Rubber hose principle for UI**: The rubber hose drawing style (flexible, bouncy, organic) informs how CrateSort's UI moves — not how it looks. A modal that bounces in slightly feels alive. A crate that gives a little when you drag it feels physical. A stat card that counts up feels like it's working. These are small moments that add up to a premium feel.
+**Every reveal/dismiss moment in the app uses the locked OutBack(in)/InBack(out) recipe**, not just modals:
+- **Dialogs** — `_CrateSortDialog` (see Brandy section). Size-based, overshoot 3.0 (or 1.0 for danger/warning dialogs).
+- **Sidebar tab navigation** (`MainWindow._switch_content()`, `main_window.py`) — a coordinated push, not a plain crossfade (a flat fade was tried first and explicitly rejected as feeling "cheap"/"off-brand" — don't reintroduce it). Direction is derived from sidebar position: Dashboard is conceptually "the top of the totem pole," so moving to a tab further down the sidebar (e.g. Dashboard → Library → Crates → Organize) pushes the outgoing page out to the **right** while the incoming page enters from the **left**; moving back up the list reverses both. Both sides animate together (`QParallelAnimationGroup`) using snapshot overlays (`grab()`'d pixmaps, not the live widgets — avoids fighting `QStackedLayout`'s own geometry management). Position-based, overshoot **0.8** (not 3.0 — see the Brandy section's note on why position needs a much smaller value than size), 384ms.
+- **Scan → dashboard reveal** (`DashboardWidget._populate_dashboard`, transition from the pending render to the ready render) — same coordinated-push technique as tab navigation, rotated to the vertical axis: outgoing content drops away downward, incoming content rises up from above. Same 0.8 overshoot, 384ms.
+- **Welcome-screen logo** (`_build_welcome()`) — grows in from 55% on launch (OutBack, overshoot 3.0, 320ms) and shrinks away to near-zero when the user picks a library, before the scan-pending dashboard appears (InBack, overshoot 3.0, 384ms) — this one *is* size-based (a logo growing/shrinking), so it correctly uses the larger overshoot, unlike the page-transition slides above.
 
 Apply rubber hose energy to:
-- Modal entry (small overshoot, ~200ms)
+- Modal/page entrance and exit (see above)
 - Drag initiation (slight scale-up on the ghost pixmap as it lifts)
 - Drop confirmation (brief scale pulse on the receiving element)
-- Stat card count-up animations (cubic ease-out, not linear)
+- Stat card count-up animations (cubic ease-out, not linear — this is the one place a plain non-bouncy ease-out is still correct, a count-up shouldn't overshoot past its target number)
 
 Never apply rubber hose energy to:
-- Destructive confirmations — these should feel deliberate, not playful
+- Destructive confirmations — these should feel deliberate, not playful (subtle-overshoot dialog variant, not a different animation family)
 - Error states — these should feel immediate and clear
-- Any operation the user is waiting on — don't animate loading states with bounce
+- The actual *value* of a loading indicator — a busy/scanning state should never fake progress or bounce its percentage. It's fine (and now standard, see the mascot-pulse pattern above) for a *decorative* "still alive" indicator next to a real, honest progress readout to have bounce/spring energy — the rule is about not faking the data, not about banning all motion during a wait.
 
-**Duration guidelines:**
+**Duration guidelines (updated July 2026 — these are the actual shipped, validated numbers, not aspirational targets):**
 - Micro-interactions (flash, highlight, hover): 100–150ms
-- Entry animations (modal, panel): 180–220ms
+- Entrance animations (dialogs, logo, mascot loop cycle): 320ms (or 1100ms for the continuous mascot pulse loop, which is intentionally slower since it's ambient, not a one-shot reveal)
+- Exit animations (dialogs, page transitions, logo shrink): 384ms — always ~20% slower than the matching entrance, not the same number
 - Data transitions (count-up, progress): 300–600ms
-- Nothing exceeds 600ms unless it's a deliberate progress indicator
+- Nothing exceeds 600ms for a one-shot reveal/dismiss unless it's a deliberate progress indicator or the ambient mascot loop
 
 ---
 
 ## Layout architecture — future-aware rules
 
-**The media player is coming.** A persistent media player will eventually occupy the lower third of the app — audio playback and music video support. Every view must be designed with this in mind.
+**The media player shipped (July 2026).** `PlaybackBar` occupies the lower third of the app — global `MainWindow` chrome (added below `content_row` in `central`'s own `QVBoxLayout`), survives tab switches, audio + music video support. See "Locked decisions — July 2026 (playback bar...)" below for the full architecture.
 
-**Rules:**
+**Rules (still apply — this is why the rollout was painless):**
 - Never use `setFixedHeight` on the main window or any top-level container in a way that would prevent the player bar from being added.
-- Leave a minimum of 80–100px of architectural headroom at the bottom of every view for the future player bar.
+- Leave a minimum of 80–100px of architectural headroom at the bottom of every view for the player bar.
 - No critical UI elements in the bottom 80px of any current view — that space belongs to the player.
-- When the player is eventually built, it must not feel bolted on. It should feel like it was always there.
+- The player does not feel bolted on. It feels like it was always there.
 
 ---
 
@@ -1547,3 +1610,25 @@ These are the drift patterns that don't belong to any single specialist — the 
 - **`_count_unclassified_artists()` checks edits** — only counts artists with no `genre` in `self._edits`. Acknowledged-as-Unclassified artists (edits entry present) must not keep the Classify button active.
 - **Tier 2 Rinse groups** — orange callout surfaces duration/size divergence. Users encouraged to fix metadata (which removes the flag on next scan) — no permanent dismiss mechanism exists by design.
 - **Classify flow — Unclassified acknowledge** — `_exit_classify_mode_accept` writes `genre: 'Unclassified'` to edits for any remaining Unclassified artist with no existing entry. This is what allows the Classify button to disable after accept.
+
+## Locked decisions — July 2026 (converters, dashboard-during-scan, motion system)
+
+- **No accent bar on dialogs** — `_create_dialog_layout()` used to draw a 4px colored bar at the top of every dialog card; removed entirely per direct user feedback ("distracting, doesn't add anything"). Do not re-add it.
+- **Dialog padding is DPI-derived, not a fixed pixel guess** — `_create_dialog_layout()` computes margins from `QApplication.primaryScreen().physicalDotsPerInch()` (not `logicalDotsPerInch()` — macOS reports a fixed legacy 72 there regardless of the real screen, which would undershoot a true physical inch). Current multiplier is `dpi * 0.7 * 0.8` (an inch, then dialed back 30%, then another 20%, each step a direct user request) — symmetric on all four sides. Dialogs auto-grow their minimum width (`pad*2 + 320` content floor) so this padding never crushes content on dialogs tuned around the old, smaller margins.
+- **WAV→MP3/MOV→MP4 conversion never gets an artwork picker; YouTube import does** — confirmed explicitly after building it in the wrong place first. Local conversions inherit whatever artwork the source file already has (`copy_audio_tags`/`copy_video_tags`); YouTube downloads have none to inherit, so that's the one place a manual picker makes sense.
+- **Video-conversion input formats are broad on purpose** — MOV, MKV, AVI, WMV, WEBM, FLV, M4V, MPG/MPEG all convert to MP4. Don't narrow this back to MOV-only.
+- **Serato's own GEOB analysis tags are deliberately excluded from metadata carryover** — see YouTube Import & Local Conversion Tools section above. This is a considered exclusion, not a bug.
+- **ffmpeg subprocess must always pass `stdin=subprocess.DEVNULL` + `-nostdin`** — prevents an ffmpeg-hangs-forever class of bug. Applies to every ffmpeg `Popen` call in the codebase (both `yt_import_dialog.py` and `convert_dialog.py`).
+- **ffmpeg log output must be decoded with `errors='replace'`, never strict** — non-UTF-8 metadata in real-world files will otherwise crash the progress-read loop mid-conversion while ffmpeg keeps running, producing a valid file alongside a false failure report.
+- **`imageio-ffmpeg` must be in `packaging/CrateSort.spec`'s `datas` via `collect_data_files`** — omitting it means the packaged `.app` silently depends on a system ffmpeg that won't exist on a clean install.
+- **Dashboard is never fully blocked by the library scan again** — `_populate_dashboard(scanning=True)` renders immediately with YouTube/conversion cards live and only the Go-To cards + Library/Crates/Organize/Settings nav disabled. Do not reintroduce a blocking full-page "Scanning…" state — it was deliberately removed because a ~20k-file library scan could otherwise lock users out of unrelated tools for a long time.
+- **`_WorkflowCard.set_disabled(True)` is the only card type with a disabled state** — `_IconActionCard` (YouTube/conversion) never gets disabled; it has no dependency on scan data.
+- **See the Motion sections (Brandy + Dez) above for the full locked animation spec** — OutBack/InBack overshoot values, which contexts get 3.0 vs 0.8 vs 1.0, and the pulsing-mascot pattern that replaces indeterminate progress bars. This was extensively iterated and validated live with the user this session — treat the numbers there as final, not a starting point to re-tune from scratch.
+
+## Locked decisions — July 2026 (playback bar, video window, rounded-corner containers)
+
+- **`PlaybackController` (`playback_controller.py`) owns the single `QMediaPlayer`/`QAudioOutput` pair.** `PlaybackBar` and `FloatingVideoWindow` both subscribe to it rather than touching `QMediaPlayer` directly — state is never duplicated between the two. It has no concept of "next/previous"; that's tree-traversal logic in `library_browser.py`/`main_window.py`.
+- **`QVideoWidget` cannot be masked, clipped, or reliably z-ordered against sibling Qt widgets.** It renders through a native child window that composites above ordinary Qt widgets regardless of `raise_()`. The inline video panel (`_InlineVideoPanel` in `main_window.py`) is built on `QGraphicsView`/`QGraphicsScene`/`QGraphicsVideoItem` instead — this paints through Qt's normal scene-graph compositor and can be layered/clipped like any other item. Do not reintroduce a bare `QVideoWidget` anywhere corners/overlays/z-order matter.
+- **`RoundedCornerOverlay` (`theme.py`) is the standard technique for rounding a `QLabel`/pixmap/video panel.** QSS `border-radius` only rounds a widget's own background — a pixmap or video frame drawn on top of it is unaffected. The overlay paints the four corner-covers AND the border stroke from one identical `QPainterPath` in a single `paintEvent` — drawing them from two separately-computed curves creates a halo/fade seam at the boundary. Used by the sidebar art panel (`_ArtPanel`), the inline video panel (`_RoundedFrameItem`, the `QGraphicsItem` equivalent for scene-based content), and the playback bar's mini thumbnail.
+- **The playback bar's mini thumbnail (56px) additionally needs `label.setMask(QRegion(...))`, not just the overlay.** The overlay-only technique worked for the 170px art panel and the video panel but would not clip the 56px mini thumbnail in the real running app despite passing every offscreen pixel test — see `project_pyqt_gotchas` gotcha #5 in memory for the full debugging trail. `setMask()` clips the widget's actual shape at the window level and is the more robust mechanism; use it (paired with the overlay for the border stroke) for any new small clipped thumbnail, not the overlay alone.
+- **Locked radius values**: large sidebar art panel + inline video panel = 5px. Playback bar mini thumbnail = 4px. These went through two rounds of correction (initially 24px, halved to 12px, cut another 25% to 9px, then another 50% to 5px) — the brief settled on "slightly rounded," not a pronounced curve. Treat these as final, not a starting point.

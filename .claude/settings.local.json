@@ -16,7 +16,21 @@
       "Read(//opt/homebrew/lib/python3.14/site-packages/serato_crate/**)",
       "Bash(echo \"App launched \\(PID $!\\)\")",
       "Bash(PYTHONPATH=/Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev python3 src/gui/main_window.py)",
-      "Bash(pkill -f \"main_window.py\")"
+      "Bash(pkill -f \"main_window.py\")",
+      "Bash(pip show *)",
+      "Bash(cat /tmp/cratesort_run.log)",
+      "Read(//private/tmp/**)",
+      "Bash(osascript -e 'tell application \"System Events\" to set frontmost of first process whose unix id is 8106 to true')",
+      "Bash(screencapture -x /private/tmp/claude-502/-Users-jacebrown-Dropbox-Design-Career-JWBC-Clients-CrateSort--dev/f0eba917-4dde-48c7-9f1f-e02ddf715e01/scratchpad/dashboard1.png)",
+      "Bash(cliclick c:2698,747)",
+      "Bash(screencapture -x /private/tmp/claude-502/-Users-jacebrown-Dropbox-Design-Career-JWBC-Clients-CrateSort--dev/f0eba917-4dde-48c7-9f1f-e02ddf715e01/scratchpad/dashboard2.png)",
+      "Bash(osascript -e 'tell application \"System Events\" to get name of every process whose background only is false')",
+      "Bash(osascript -e 'tell application \"System Events\" to set frontmost of process \"Python\" to true')",
+      "Bash(screencapture -x /private/tmp/claude-502/-Users-jacebrown-Dropbox-Design-Career-JWBC-Clients-CrateSort--dev/f0eba917-4dde-48c7-9f1f-e02ddf715e01/scratchpad/dashboard3.png)",
+      "Bash(system_profiler SPDisplaysDataType)",
+      "Bash(osascript -e 'tell application \"Finder\" to get bounds of window of desktop')",
+      "Bash(sips -g pixelWidth -g pixelHeight /private/tmp/claude-502/-Users-jacebrown-Dropbox-Design-Career-JWBC-Clients-CrateSort--dev/f0eba917-4dde-48c7-9f1f-e02ddf715e01/scratchpad/dashboard3.png)",
+      "Bash(grep -n \"_enforce_min_col_widths\\(\\)\\\\s*$\\\\|self\\\\._enforce_min_col_widths\\(\\)\\\\|self\\\\._size_pos_column\\(\" /Users/jacebrown/Dropbox/Design/Career/JWBC/Clients/CrateSort/_dev/cratesort/src/gui/crate_manager.py)"
     ]
   }
 }

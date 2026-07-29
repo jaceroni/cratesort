@@ -10,7 +10,11 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QByteArray, QEvent, QRect, QSettings, QSize, QTimer, pyqtSignal
 
 from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _create_dialog_layout
-from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
+from cratesort.src.utils.undo_manager import (
+    UndoManager, LibraryFieldEditCommand, LibraryTagsEditCommand,
+    LibraryGenreChangeCommand, LibraryReassignArtistCommand,
+)
+from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 
 try:
     from PyQt6.QtSvgWidgets import QSvgWidget as _QSvgWidget  # noqa: F401 (defensive import)
@@ -106,8 +110,31 @@ def _make_note_icon():
     return icon
 
 
+def _make_play_glyph_icon():
+    """Hover-only play triangle shown in place of the note icon on track
+    rows, signaling the row can be clicked (in this icon's hit zone) to
+    start playback. 9×14 to match _make_note_icon()'s footprint."""
+    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPolygonF
+    from PyQt6.QtCore import QPointF
+    def _pm(color: str) -> QPixmap:
+        pm = QPixmap(9, 14)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(color)))
+        p.drawPolygon(QPolygonF([QPointF(1.5, 2), QPointF(1.5, 12), QPointF(8, 7)]))
+        p.end()
+        return pm
+    icon = QIcon()
+    icon.addPixmap(_pm('#D17D34'), QIcon.Mode.Normal)
+    icon.addPixmap(_pm('#2F2F2F'), QIcon.Mode.Selected)
+    return icon
+
+
 _ARTIST_ICON = None
 _TRACK_ICON  = None
+_PLAY_GLYPH_ICON = None
 
 
 def _get_artist_icon():
@@ -123,6 +150,13 @@ def _get_track_icon():
         _TRACK_ICON = _make_note_icon()
     return _TRACK_ICON
 
+
+def _get_play_glyph_icon():
+    global _PLAY_GLYPH_ICON
+    if _PLAY_GLYPH_ICON is None:
+        _PLAY_GLYPH_ICON = _make_play_glyph_icon()
+    return _PLAY_GLYPH_ICON
+
 # Editable track columns (field name for storage).
 # LC_GENRE and LC_ARTIST (as artist) are NOT here — use right-click menus only.
 # LC_ARTIST on a track row shows the title, which IS editable.
@@ -135,6 +169,7 @@ _EDITABLE = {
     LC_YEAR:    'year',
     LC_COMMENT: 'comment',
 }
+_FIELD_TO_COL = {field: col for col, field in _EDITABLE.items()}
 
 
 # SVG icon path for the classify-mode banner
@@ -300,12 +335,12 @@ class _UnsavedChangesDialog(_CrateSortDialog):
         self.setMinimumWidth(480)
 
         # Use standard Red accent layout (warning/danger/discard)
-        layout = _create_dialog_layout(self, '#C75B5B')
+        layout = _create_dialog_layout(self)
 
         headline = QLabel('Unsaved Classification Changes')
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(headline)
         layout.addSpacing(6)
@@ -425,13 +460,13 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
         self.setFixedSize(520, 320)
 
         # Use standard Teal accent layout (safe action/progress)
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         headline = QLabel('Analyzing Library')
         headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         headline.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(headline)
         layout.addSpacing(6)
@@ -531,9 +566,12 @@ class LibraryBrowserView(QWidget):
     album_art_requested  = pyqtSignal(str)
     # Emitted after an inline edit is committed (file_path, field, new_value)
     track_field_changed  = pyqtSignal(str, str, str)
+    # Emitted when the hover play-icon on a track row is clicked
+    play_requested       = pyqtSignal(object)  # TrackRecord
 
-    def __init__(self, parent=None):
+    def __init__(self, undo_manager: Optional['UndoManager'] = None, parent=None):
         super().__init__(parent)
+        self._undo_manager = undo_manager
         self._session_genre: dict[str, tuple[str, str]] = {}  # artist → (genre, conf)
         self._session_artists: dict[str, str] = {}            # track_path → artist
         self._track_overrides: dict[str, str] = {}            # file_path → overridden genre
@@ -568,6 +606,9 @@ class LibraryBrowserView(QWidget):
         self._edit_col:      int = -1
         self._edit_widget:   Optional[QLineEdit] = None
         self._edit_original: str = ''
+
+        # Hover-play-icon state (mirrors CrateManagerView._crate_hover_item)
+        self._hover_track_item: Optional[QTreeWidgetItem] = None
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -713,6 +754,8 @@ class LibraryBrowserView(QWidget):
         self._tree.itemExpanded.connect(self._on_item_expanded)
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._tree.setMouseTracking(True)
+        self._tree.viewport().setMouseTracking(True)
         self._tree.viewport().installEventFilter(self)
 
         # Hide classify mode columns until classify mode is active
@@ -744,7 +787,7 @@ class LibraryBrowserView(QWidget):
         outer.addWidget(self._sidebar_splitter, stretch=1)
 
         footer = QFrame()
-        footer.setStyleSheet('QFrame { background: #2F2F2F; border-top: 1px solid #444; }')
+        footer.setStyleSheet('QFrame { background: #2F2F2F; border: none; }')
         fl = QHBoxLayout(footer)
         fl.setContentsMargins(16, 6, 16, 6)
         self._count_label = QLabel()
@@ -1158,6 +1201,19 @@ class LibraryBrowserView(QWidget):
                 for i in range(self._tree.columnCount()):
                     if self._tree.columnWidth(i) < _min:
                         self._tree.setColumnWidth(i, _min)
+                # ResizeToContents only measures currently-rendered rows — in a large
+                # library most artist rows are virtualized and never painted, so it
+                # badly undersizes the column. Measure the real widest artist name
+                # directly against the underlying data instead.
+                fm = QFontMetrics(self._tree.font())
+                widest = max(
+                    (fm.horizontalAdvance(self._tree.topLevelItem(i).text(LC_ARTIST))
+                     for i in range(self._tree.topLevelItemCount())),
+                    default=0,
+                )
+                artist_w = widest + 50  # padding for tree expand-arrow/indent
+                if artist_w > self._tree.columnWidth(LC_ARTIST):
+                    self._tree.setColumnWidth(LC_ARTIST, artist_w)
             QTimer.singleShot(100, _resize_to_content)
 
         n = self._tree.topLevelItemCount()
@@ -1327,7 +1383,132 @@ class LibraryBrowserView(QWidget):
             if not self._edit_widget.geometry().contains(click_pos):
                 self._commit_active_editor()
                 return False
+
+        if obj is self._tree.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if self._handle_play_icon_click(event.position().toPoint()):
+                    return True
+            elif event.type() == QEvent.Type.MouseMove:
+                self._update_hover_play_icon(event.position().toPoint())
+            elif event.type() == QEvent.Type.Leave:
+                self._clear_hover_play_icon()
+
         return super().eventFilter(obj, event)
+
+    # ── Hover-play-icon (click to start playback) ───────────────────────
+
+    _ICON_HIT_WIDTH = 28  # generous click target — indentation + icon + slop
+
+    def _pos_in_icon_hit_zone(self, item: QTreeWidgetItem, pos) -> bool:
+        index = self._tree.indexFromItem(item, LC_ARTIST)
+        rect = self._tree.visualRect(index)
+        hit = QRect(rect.left(), rect.top(), self._ICON_HIT_WIDTH, rect.height())
+        return hit.contains(pos)
+
+    def _handle_play_icon_click(self, pos) -> bool:
+        item = self._tree.itemAt(pos)
+        if item is None or item.parent() is None:
+            return False  # not a track row
+        if not self._pos_in_icon_hit_zone(item, pos):
+            return False
+        rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
+        if not rec or not hasattr(rec, 'path'):
+            return False
+        self.play_requested.emit(rec)
+        self.track_selected.emit(str(rec.path))
+        self.album_art_requested.emit(str(rec.path))
+        return True
+
+    def _update_hover_play_icon(self, pos) -> None:
+        item = self._tree.itemAt(pos)
+        target = item if (item is not None and item.parent() is not None) else None
+        if target is self._hover_track_item:
+            return
+        if self._hover_track_item is not None:
+            self._hover_track_item.setIcon(LC_ARTIST, _get_track_icon())
+        if target is not None:
+            target.setIcon(LC_ARTIST, _get_play_glyph_icon())
+        self._hover_track_item = target
+
+    def _clear_hover_play_icon(self) -> None:
+        if self._hover_track_item is not None:
+            self._hover_track_item.setIcon(LC_ARTIST, _get_track_icon())
+            self._hover_track_item = None
+
+    # ── Skip next/previous (playback bar) ────────────────────────────────
+    # "Next/previous track across the whole currently-filtered library" —
+    # walks the full per-artist track lists (stored on each top-level item's
+    # data regardless of whether that artist has ever been expanded), so
+    # skip continues through the entire visible/filtered library, not just
+    # whatever rows happen to already be expanded. Respects the current
+    # genre-sidebar/search filter (skips hidden top-level artist rows) but
+    # not per-row expand state — the destination artist gets auto-expanded
+    # and scrolled into view as a side effect of skipping to it.
+
+    def next_track_after(self, current_path: str):
+        return self._adjacent_track(current_path, forward=True)
+
+    def previous_track_before(self, current_path: str):
+        return self._adjacent_track(current_path, forward=False)
+
+    def _full_filtered_tracks(self) -> list:
+        """Tracks in the order actually shown in the tree — NOT the raw
+        scan-order list stored on each artist's data. Those only happen to
+        match when sorted A-Z by artist; under any other active column sort
+        (genre, BPM, duration, whatever the user clicked) they diverge, which
+        is exactly what made skip look random. Reading the real tree order is
+        the only way to match what's on screen regardless of sort column.
+        Artists never opened are transiently expanded just long enough to
+        read their real (sorted) child order, then restored to how they were —
+        this happens synchronously with no repaint in between, so it's not
+        visible as a flicker."""
+        tracks = []
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            if top.isHidden():
+                continue
+            was_expanded = top.isExpanded()
+            if not was_expanded:
+                top.setExpanded(True)
+            for ci in range(top.childCount()):
+                rec = top.child(ci).data(LC_PATH, Qt.ItemDataRole.UserRole)
+                if rec is not None:
+                    tracks.append(rec)
+            if not was_expanded:
+                top.setExpanded(False)
+        return tracks
+
+    def _adjacent_track(self, current_path: str, forward: bool):
+        tracks = self._full_filtered_tracks()
+        if not forward:
+            tracks.reverse()
+        found_current = False
+        for rec in tracks:
+            if found_current:
+                self._reveal_track(rec)
+                return rec
+            if str(rec.path) == current_path:
+                found_current = True
+        self._set_status('No more tracks to skip to.')
+        return None
+
+    def _reveal_track(self, rec) -> None:
+        """Expand the artist group containing rec (if needed) and scroll to
+        it, so skip always shows you where playback moved to — even into a
+        row you'd never opened."""
+        path_str = str(rec.path)
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            if any(str(r.path) == path_str for r in data.get('tracks', [])):
+                if not top.isExpanded():
+                    top.setExpanded(True)
+                item = self._find_track_item(path_str)
+                if item:
+                    self._tree.clearSelection()
+                    item.setSelected(True)
+                    self._tree.scrollToItem(item)
+                break
 
     # ── Inline editing ────────────────────────────────────────────────
 
@@ -1360,52 +1541,16 @@ class LibraryBrowserView(QWidget):
         if new_val == original:
             return  # no change — close quietly, no flash, no save
 
-        display = f'  {new_val}' if col == LC_ARTIST else new_val
-        item.setText(col, display)
-
         rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
         field = _EDITABLE.get(col)
-        if rec and field:
-            self._edits.setdefault(str(rec.path), {})[field] = new_val
-            self.track_field_changed.emit(str(rec.path), field, new_val)
-        self._save_edits()
-
-        # Write field to disk immediately (free-tier metadata write-through).
-        # 'tags' is virtual-only — skip disk write. _save_edits() staging always stands.
-        disk_ok = True
-        if rec and field and field != 'tags':
-            from cratesort.src.core.file_organizer import write_file_metadata
-            disk_ok = write_file_metadata(rec.path, field, new_val)
-            if disk_ok:
-                if field == 'title':
-                    rec.title = new_val
-                elif field == 'album':
-                    rec.album = new_val
-                elif field == 'bpm':
-                    try:
-                        rec.bpm = float(new_val)
-                    except (ValueError, TypeError):
-                        pass
-                elif field == 'year':
-                    rec.year = new_val
-                elif field == 'comment':
-                    rec.comment = new_val
-
-        if not disk_ok:
-            item.setText(col, f'  {original}' if col == LC_ARTIST else original)
-            saved_label = self._count_label.text()
-            self._count_label.setText(
-                '⚠ Could not write to file — check that the drive is connected '
-                'and the file is not locked.'
-            )
-            QTimer.singleShot(5000, lambda t=saved_label: self._count_label.setText(t))
+        if not (rec and field):
             return
 
-        # Deselect the row before flashing: selected state applies dark text on
-        # orange background, hiding the teal text flash entirely.
-        item.setSelected(False)
-        self._tree.clearSelection()
-        self._flash_row_text(item)
+        if self._undo_manager:
+            cmd = LibraryFieldEditCommand(self, str(rec.path), field, original, new_val)
+            self._undo_manager.push(cmd)  # execute() updates cell + saves + writes disk
+        else:
+            self._apply_library_field(str(rec.path), field, new_val)
 
     def _flash_row_text(self, item: QTreeWidgetItem) -> None:
         """Flash all cells in the row to teal for 1.5s, then restore original colors."""
@@ -1420,6 +1565,224 @@ class LibraryBrowserView(QWidget):
                 it.setForeground(c, brush)
 
         QTimer.singleShot(1500, _restore)
+
+    # ── Undo/redo command support ────────────────────────────────────────
+
+    def _resolve_track(self, path_str: str):
+        for rec in self._inventory:
+            if str(rec.path) == path_str:
+                return rec
+        return None
+
+    def _find_track_item(self, path_str: str) -> Optional[QTreeWidgetItem]:
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            for ci in range(top.childCount()):
+                child = top.child(ci)
+                rec = child.data(LC_PATH, Qt.ItemDataRole.UserRole)
+                if rec and str(rec.path) == path_str:
+                    return child
+        return None
+
+    def _find_item_by_key(self, key: str) -> Optional[QTreeWidgetItem]:
+        if key.startswith('__artist__'):
+            artist = key[len('__artist__'):]
+            for i in range(self._tree.topLevelItemCount()):
+                top = self._tree.topLevelItem(i)
+                data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+                if data.get('artist', '') == artist:
+                    return top
+            return None
+        return self._find_track_item(key)
+
+    def _flash_disk_failure(self, message: Optional[str] = None) -> None:
+        message = message or (
+            '⚠ Could not write to file — check that the drive is connected '
+            'and the file is not locked.'
+        )
+        saved_text = self._count_label.text()
+        self._count_label.setText(message)
+        QTimer.singleShot(5000, lambda t=saved_text: self._count_label.setText(t))
+
+    def _set_status(self, text: str, teal: bool = False) -> None:
+        """Transient status message reusing the count label — mirrors CrateManagerView._set_status."""
+        if not text:
+            return
+        saved_text  = self._count_label.text()
+        saved_style = self._count_label.styleSheet()
+        if teal:
+            self._count_label.setStyleSheet('color: #428175; font-size: 13px; font-weight: 600;')
+        self._count_label.setText(text)
+
+        def _restore(t=saved_text, s=saved_style) -> None:
+            self._count_label.setStyleSheet(s)
+            self._count_label.setText(t)
+
+        QTimer.singleShot(4000, _restore)
+
+    def _write_disk_field(self, rec, field: str, value: str) -> bool:
+        from cratesort.src.core.file_organizer import write_file_metadata
+        ok = write_file_metadata(rec.path, field, value)
+        if ok:
+            if field == 'title':
+                rec.title = value
+            elif field == 'album':
+                rec.album = value
+            elif field == 'bpm':
+                try:
+                    rec.bpm = float(value)
+                except (ValueError, TypeError):
+                    pass
+            elif field == 'year':
+                rec.year = value
+            elif field == 'comment':
+                rec.comment = value
+            elif field == 'genre':
+                rec.genre = value
+            elif field == 'artist':
+                rec.artist = value
+        return ok
+
+    def _apply_library_field(self, file_path: str, field: str, value: str) -> None:
+        """Set a single track field to `value` — shared by execute() and undo()."""
+        self._edits.setdefault(file_path, {})[field] = value
+        self._save_edits()
+        self.track_field_changed.emit(file_path, field, value)
+
+        item = self._find_track_item(file_path)
+        col = _FIELD_TO_COL.get(field)
+        if item and col is not None:
+            item.setText(col, f'  {value}' if col == LC_ARTIST else value)
+
+        if field != 'tags':
+            rec = self._resolve_track(file_path)
+            if rec and not self._write_disk_field(rec, field, value):
+                self._flash_disk_failure()
+                return
+
+        if item:
+            parent = item.parent()
+            if parent:
+                parent.setExpanded(True)
+            item.setSelected(False)
+            self._tree.clearSelection()
+            self._flash_row_text(item)
+            self._tree.scrollToItem(item)
+
+    def _apply_library_tags(self, key: str, tags_str: str) -> None:
+        """Set the tags string on a track or artist key — shared by execute() and undo()."""
+        if tags_str:
+            self._edits.setdefault(key, {})['tags'] = tags_str
+        else:
+            self._edits.get(key, {}).pop('tags', None)
+            if key in self._edits and not self._edits[key]:
+                del self._edits[key]
+        self._save_edits()
+        item = self._find_item_by_key(key)
+        if item:
+            item.setText(LC_TAGS, tags_str)
+            parent = item.parent()
+            if parent:
+                parent.setExpanded(True)
+            item.setSelected(False)
+            self._flash_row_text(item)
+            self._tree.scrollToItem(item)
+
+    def _apply_library_genre(self, edits_map: dict, disk_map: dict) -> None:
+        """Set genre for one or more keys (track path or __artist__X) and write
+        the affected files to disk — shared by execute() and undo()."""
+        for key, genre in edits_map.items():
+            if genre is None:
+                self._edits.get(key, {}).pop('genre', None)
+                if key in self._edits and not self._edits[key]:
+                    del self._edits[key]
+            else:
+                self._edits.setdefault(key, {})['genre'] = genre
+        self._save_edits()
+
+        disk_failures = 0
+        for path, genre in disk_map.items():
+            rec = self._resolve_track(path)
+            if rec and not self._write_disk_field(rec, 'genre', genre):
+                disk_failures += 1
+        if disk_failures:
+            self._flash_disk_failure(
+                f'⚠ {disk_failures} track(s) could not be updated on disk — '
+                f'check that the drive is connected and files are not locked.'
+            )
+
+        artist_changes = {
+            k[len('__artist__'):]: v for k, v in edits_map.items()
+            if k.startswith('__artist__') and v is not None
+        }
+        track_changes = {
+            k: v for k, v in edits_map.items()
+            if not k.startswith('__artist__') and v is not None
+        }
+        self._sync_genres_to_session(artist_changes, track_changes)
+
+        self._rebuild_tree()
+
+        # Follow the last-touched artist to wherever its genre bucket now lives
+        # (execute AND undo both land here) so the sidebar filter + selection
+        # return to it instead of falling back to "All".
+        artist_keys = [k for k in edits_map if k.startswith('__artist__')]
+        if artist_keys:
+            artist = artist_keys[-1][len('__artist__'):]
+            artist_item = self._find_item_by_key(f'__artist__{artist}')
+            if artist_item:
+                self._last_edited_artist  = artist
+                self._last_assigned_genre = artist_item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+
+        self._populate_genre_sidebar()
+        self._update_empty_state()
+        self._flash_keys(edits_map.keys())
+
+    def _apply_library_reassign(self, edits_map: dict, disk_map: dict) -> None:
+        """Replace each track's edit dict wholesale and write its artist tag to
+        disk — shared by execute() and undo() of a reassignment."""
+        for path, edit_dict in edits_map.items():
+            if edit_dict:
+                self._edits[path] = edit_dict
+            else:
+                self._edits.pop(path, None)
+        self._save_edits()
+
+        disk_failures = 0
+        for path, artist in disk_map.items():
+            rec = self._resolve_track(path)
+            if rec and not self._write_disk_field(rec, 'artist', artist):
+                disk_failures += 1
+        if disk_failures:
+            self._flash_disk_failure(
+                f'⚠ {disk_failures} track(s) could not be updated on disk — '
+                f'check that the drive is connected and files are not locked.'
+            )
+
+        self._rebuild_tree()
+        self._populate_genre_sidebar()
+        self._update_empty_state()
+
+        for path in edits_map:
+            item = self._find_track_item(path)
+            if item:
+                parent = item.parent()
+                if parent:
+                    parent.setExpanded(True)
+                item.setSelected(False)
+                self._flash_row_text(item)
+                self._tree.scrollToItem(item)
+        self._tree.clearSelection()
+
+    def _flash_keys(self, keys) -> None:
+        """After a full tree rebuild, re-find, scroll to, and flash each affected row."""
+        found = [self._find_item_by_key(k) for k in keys]
+        for item in found:
+            if item:
+                item.setSelected(False)
+                self._flash_row_text(item)
+                self._tree.scrollToItem(item)
+        self._tree.clearSelection()
 
     def _cancel_active_editor(self) -> None:
         """Cancel the open editor: close without saving, no flash (Escape key)."""
@@ -1573,90 +1936,34 @@ class LibraryBrowserView(QWidget):
         """Apply a single genre change to every currently selected item (artist or track)."""
         from cratesort.src.gui.classifier_view import _ChangeGenreDialog
         selected = getattr(self, '_context_selection', None) or list(self._tree.selectedItems())
-        print(f'[DEBUG LibraryBrowser] _change_genre_for_selection: {len(selected)} items')
-        for dbg in selected:
-            print(f'  {"ARTIST" if dbg.parent() is None else "TRACK"}: {dbg.text(0)!r}')
         if not selected:
             return
         dlg = _ChangeGenreDialog(hint_label or f'{len(selected)} items', hint_genre, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_genre = dlg.selected_genre
-        artist_changes: dict[str, str] = {}
-        track_changes:  dict[str, str] = {}
-        _UC_GENRES = {'', '—', 'Unclassified', 'Untagged'}
+
+        old_edits: dict[str, Optional[str]] = {}
         for item in selected:
             if item.parent() is None:
                 data   = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
                 artist = data.get('artist', '')
-                display_genre = 'Unclassified' if new_genre in _UC_GENRES else new_genre
-                item.setText(LC_GENRE, display_genre)
-                item.setData(LC_GENRE, Qt.ItemDataRole.UserRole + 1, new_genre)
-                f = item.font(LC_GENRE)
-                f.setItalic(False)
-                item.setFont(LC_GENRE, f)
-                if new_genre in _UC_GENRES:
-                    _red = QBrush(QColor('#C75B5B'))
-                    item.setForeground(LC_ARTIST, _red)
-                    item.setForeground(LC_GENRE, _red)
-                    item.setToolTip(LC_ARTIST, 'Classify this artist to move all tracks out of Unclassified.')
-                else:
-                    _cream = QBrush(QColor('#f1e3c8'))
-                    item.setForeground(LC_ARTIST, _cream)
-                    item.setForeground(LC_GENRE, _cream)
-                    item.setToolTip(LC_ARTIST, '')
-                # Propagate color to any already-expanded child track items
-                for ci in range(item.childCount()):
-                    ch = item.child(ci)
-                    if ch.text(0) == _DUMMY:
-                        continue
-                    rec = ch.data(LC_PATH, Qt.ItemDataRole.UserRole)
-                    if not rec:
-                        continue
-                    t_edits = self._edits.get(str(rec.path), {})
-                    t_genre = (
-                        t_edits.get('genre')
-                        or self._track_overrides.get(str(rec.path))
-                        or rec.genre
-                        or ''
-                    )
-                    if new_genre in _UC_GENRES:
-                        if t_genre and t_genre not in _UC_GENRES:
-                            _amber = QBrush(QColor('#c9a87a'))
-                            for col in range(self._tree.columnCount()):
-                                ch.setForeground(col, _amber)
-                            ch.setText(LC_GENRE, f'{t_genre} ⚠ Artist unclassified')
-                            ch.setForeground(LC_GENRE, _amber)
-                            ch.setToolTip(LC_ARTIST, 'This track has a genre tag but will remain in Unclassified until its artist is classified.')
-                        else:
-                            _red = QBrush(QColor('#C75B5B'))
-                            for col in range(self._tree.columnCount()):
-                                ch.setForeground(col, _red)
-                            ch.setForeground(LC_GENRE, _red)
-                            ch.setToolTip(LC_ARTIST, '')
-                    else:
-                        _muted = QBrush(QColor(_MUTED))
-                        for col in range(self._tree.columnCount()):
-                            ch.setForeground(col, _muted)
-                        ch.setText(LC_GENRE, t_genre or '—')
-                        ch.setToolTip(LC_ARTIST, '')
-                self._edits.setdefault(f'__artist__{artist}', {})['genre'] = new_genre
-                artist_changes[artist] = new_genre
-                item.setSelected(False)
-                self._flash_row_text(item)
+                key = f'__artist__{artist}'
             else:
                 rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
-                if rec:
-                    item.setText(LC_GENRE, new_genre)
-                    self._edits.setdefault(str(rec.path), {})['genre'] = new_genre
-                    track_changes[str(rec.path)] = new_genre
-        self._save_edits()
-        self._sync_genres_to_session(artist_changes, track_changes)
-        if artist_changes:
-            self._last_edited_artist  = next(reversed(artist_changes))
-            self._last_assigned_genre = new_genre
-        self._populate_genre_sidebar()
-        self._update_empty_state()
+                if not rec:
+                    continue
+                key = str(rec.path)
+            old_edits[key] = self._edits.get(key, {}).get('genre')
+        if not old_edits:
+            return
+
+        label = hint_label or f'{len(selected)} items'
+        if self._undo_manager:
+            cmd = LibraryGenreChangeCommand(self, old_edits, new_genre, {}, label)
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_library_genre({k: new_genre for k in old_edits}, {})
 
     def _artist_menu(self, item: QTreeWidgetItem, pos) -> None:
         data  = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
@@ -1715,14 +2022,20 @@ class LibraryBrowserView(QWidget):
         selected = [item for item in self._tree.selectedItems() if item.parent()]
         if child not in selected:
             selected = [child]
+
+        old_edits: dict[str, Optional[str]] = {}
         for sel in selected:
             sel_rec = sel.data(LC_PATH, Qt.ItemDataRole.UserRole)
             if sel_rec:
-                sel.setText(LC_GENRE, new_genre)
-                self._edits.setdefault(str(sel_rec.path), {})['genre'] = new_genre
-        self._save_edits()
-        child.setSelected(False)
-        self._flash_row_text(child)
+                old_edits[str(sel_rec.path)] = self._edits.get(str(sel_rec.path), {}).get('genre')
+        if not old_edits:
+            return
+
+        if self._undo_manager:
+            cmd = LibraryGenreChangeCommand(self, old_edits, new_genre, {}, rec.filename)
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_library_genre({k: new_genre for k in old_edits}, {})
 
     def _reassign_track(self, child: QTreeWidgetItem) -> None:
         """Move one or more selected tracks to a different (existing or new) artist group."""
@@ -1756,133 +2069,47 @@ class LibraryBrowserView(QWidget):
         if not new_artist:
             return
 
-        # 4. Find or create destination artist group
-        dest_item = None
-        dest_tracks: list = []
-        for i in range(self._tree.topLevelItemCount()):
-            top = self._tree.topLevelItem(i)
-            top_data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            if top_data.get('artist', '') == new_artist:
-                dest_item = top
-                dest_tracks = top_data.get('tracks', [])
-                break
-
-        # 5. Move each track: tree removal + path-based list removal + edit persistence
-        modified_parents: list[QTreeWidgetItem] = []
-        for child_item, track_rec, parent_item in tracks_to_move:
+        # 4. Snapshot prior per-track state (for undo) before applying the move
+        moves: dict[str, dict] = {}
+        for _, track_rec, parent_item in tracks_to_move:
             parent_data = parent_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            parent_tracks = parent_data.get('tracks', [])
-            original_artist = parent_data.get('artist', '')
+            path = str(track_rec.path)
+            moves[path] = {
+                'prior_edit':        dict(self._edits.get(path, {})),
+                'prior_disk_artist': track_rec.artist or '',
+                'group_artist':      parent_data.get('artist', ''),
+            }
 
-            # Remove child from tree
-            parent_item.takeChild(parent_item.indexOfChild(child_item))
-
-            # Path-based removal — avoids ValueError when dataclass fields have changed
-            for r in list(parent_tracks):
-                if str(r.path) == str(track_rec.path):
-                    parent_tracks.remove(r)
-                    break
-
-            parent_item.setText(LC_TRACKS, str(len(parent_tracks)))
-            parent_data['tracks'] = parent_tracks
-            parent_item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, parent_data)
-
-            if parent_item not in modified_parents:
-                modified_parents.append(parent_item)
-
-            # Persist edit
-            self._edits.setdefault(str(track_rec.path), {})['reassign_artist'] = new_artist
-            self._edits.setdefault(str(track_rec.path), {})['original_artist'] = original_artist
-
-            dest_tracks.append(track_rec)
-
-        # 6. Update or create the destination group
-        if dest_item is None:
-            genre, _ = self._classify_lookup(new_artist)
-            dest_item = self._make_artist_item(new_artist, dest_tracks, genre)
-            self._tree.addTopLevelItem(dest_item)
+        label = tracks_to_move[0][1].filename if len(moves) == 1 else ''
+        if self._undo_manager:
+            cmd = LibraryReassignArtistCommand(self, moves, new_artist, label)
+            self._undo_manager.push(cmd)
         else:
-            dest_item.setText(LC_TRACKS, str(len(dest_tracks)))
-            dest_data = dest_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            dest_data['tracks'] = dest_tracks
-            dest_item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, dest_data)
-
-            if dest_item.childCount() == 1 and dest_item.child(0).text(0) == _DUMMY:
-                dest_item.takeChild(0)
-                for t in dest_tracks:
-                    self._make_track_child(dest_item, t)
-            else:
-                for _, track_rec, _ in tracks_to_move:
-                    self._make_track_child(dest_item, track_rec)
-
-        # 7. Remove any parent groups that are now empty
-        for parent_item in modified_parents:
-            parent_data = parent_item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            if not parent_data.get('tracks', []):
-                top_idx = self._tree.indexOfTopLevelItem(parent_item)
-                if top_idx >= 0:
-                    self._tree.takeTopLevelItem(top_idx)
-
-        dest_item.setExpanded(True)
-        dest_item.setSelected(False)
-        self._flash_row_text(dest_item)
-        self._save_edits()
-        self._populate_genre_sidebar()
-        self._update_empty_state()
-
-        # Write artist tag to disk for each reassigned track (free-tier write-through)
-        from cratesort.src.core.file_organizer import write_file_metadata
-        disk_failures = 0
-        for _, track_rec, _ in tracks_to_move:
-            if write_file_metadata(track_rec.path, 'artist', new_artist):
-                track_rec.artist = new_artist
-            else:
-                disk_failures += 1
-        if disk_failures:
-            n = self._tree.topLevelItemCount()
-            t = len(self._inventory)
-            norm = f'{n:,} artists · {t:,} tracks'
-            self._count_label.setText(
-                f'⚠ {disk_failures} track(s) could not be updated on disk — '
-                f'check that the drive is connected and files are not locked.'
-            )
-            QTimer.singleShot(6000, lambda s=norm: self._count_label.setText(s))
+            edits_map = {
+                path: {**info['prior_edit'], 'reassign_artist': new_artist, 'original_artist': info['group_artist']}
+                for path, info in moves.items()
+            }
+            disk_map = {path: new_artist for path in moves}
+            self._apply_library_reassign(edits_map, disk_map)
 
     def _change_artist_genre(self, item: QTreeWidgetItem, artist: str) -> None:
         from cratesort.src.gui.classifier_view import _ChangeGenreDialog
         current = item.text(LC_GENRE)
         dlg = _ChangeGenreDialog(artist, current, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_genre = dlg.selected_genre
-            item.setText(LC_GENRE, new_genre)
-            item.setData(LC_GENRE, Qt.ItemDataRole.UserRole + 1, new_genre)
-            item.setForeground(LC_GENRE, QBrush(QColor('#f1e3c8')))
-            f = item.font(LC_GENRE)
-            f.setItalic(False)
-            item.setFont(LC_GENRE, f)
-            self._edits.setdefault(f'__artist__{artist}', {})['genre'] = new_genre
-            self._save_edits()
-            item.setSelected(False)
-            self._flash_row_text(item)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_genre = dlg.selected_genre
+        key = f'__artist__{artist}'
+        old_genre = self._edits.get(key, {}).get('genre')
 
-            # Write genre to all tracks for this artist (free-tier write-through)
-            from cratesort.src.core.file_organizer import write_file_metadata
-            artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            disk_failures = 0
-            for rec in artist_data.get('tracks', []):
-                if write_file_metadata(rec.path, 'genre', new_genre):
-                    rec.genre = new_genre
-                else:
-                    disk_failures += 1
-            if disk_failures:
-                n = self._tree.topLevelItemCount()
-                t = len(self._inventory)
-                norm = f'{n:,} artists · {t:,} tracks'
-                self._count_label.setText(
-                    f'⚠ {disk_failures} track(s) could not be updated on disk — '
-                    f'check that the drive is connected and files are not locked.'
-                )
-                QTimer.singleShot(6000, lambda s=norm: self._count_label.setText(s))
+        artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+        disk_old = {str(rec.path): (rec.genre or '') for rec in artist_data.get('tracks', [])}
+
+        if self._undo_manager:
+            cmd = LibraryGenreChangeCommand(self, {key: old_genre}, new_genre, disk_old, artist)
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_library_genre({key: new_genre}, {p: new_genre for p in disk_old})
 
     def _edit_artist_tags(self, item: QTreeWidgetItem, artist: str) -> None:
         from cratesort.src.gui.classifier_view import _EditTagsDialog
@@ -1900,31 +2127,38 @@ class LibraryBrowserView(QWidget):
             self
         )
         dlg.setWindowTitle(f'Edit Style Tags — {artist}')
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            tags_str = ', '.join(dlg._track.tags)
-            self._edits.setdefault(key, {})['tags'] = tags_str
-            self._save_edits()
-            item.setText(LC_TAGS, tags_str)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        tags_str = ', '.join(dlg._track.tags)
+        if self._undo_manager:
+            cmd = LibraryTagsEditCommand(self, key, artist, current_tags_str, tags_str)
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_library_tags(key, tags_str)
 
     def _edit_style_tags(self, item: QTreeWidgetItem, rec) -> None:
         from cratesort.src.gui.classifier_view import _EditTagsDialog
+        old_tags_str = self._edits.get(str(rec.path), {}).get('tags', '')
         dlg = _EditTagsDialog(
             # Build a minimal TrackInfo proxy
             type('T', (), {
                 'filename': rec.filename,
                 'title': rec.title,
                 'genre_tag': rec.genre,
-                'tags': self._edits.get(str(rec.path), {}).get('tags', '').split(','),
+                'tags': old_tags_str.split(','),
                 'comment': rec.comment,
             })(),
             self
         )
         dlg.setWindowTitle(f'Edit Style Tags — {rec.filename}')
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            tags_str = ', '.join(dlg._track.tags)
-            self._edits.setdefault(str(rec.path), {})['tags'] = tags_str
-            self._save_edits()
-            item.setText(LC_TAGS, tags_str)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        tags_str = ', '.join(dlg._track.tags)
+        if self._undo_manager:
+            cmd = LibraryTagsEditCommand(self, str(rec.path), rec.filename, old_tags_str, tags_str)
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_library_tags(str(rec.path), tags_str)
 
     # ── Persistence ───────────────────────────────────────────────────
 

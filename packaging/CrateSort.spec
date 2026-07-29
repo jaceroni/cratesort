@@ -4,6 +4,8 @@
 
 import os
 
+from PyInstaller.utils.hooks import collect_data_files
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), '..'))
 
 block_cipher = None
@@ -14,10 +16,13 @@ a = Analysis(
     binaries=[],
     datas=[
         (os.path.join(ROOT, 'cratesort', 'assets'), 'cratesort/assets'),
+        *collect_data_files('imageio_ffmpeg'),
     ],
     hiddenimports=[
         'PyQt6.QtSvgWidgets',
         'PyQt6.QtSvg',
+        'PyQt6.QtMultimedia',
+        'PyQt6.QtMultimediaWidgets',
     ],
     hookspath=[],
     hooksconfig={},

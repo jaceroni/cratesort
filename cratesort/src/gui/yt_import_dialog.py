@@ -12,12 +12,15 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QStringListModel, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QCompleter, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QProgressBar, QPushButton, QVBoxLayout,
 )
 
 from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
+from cratesort.src.utils.ffmpeg_tools import get_ffmpeg_path, get_media_duration
+from cratesort.src.utils.metadata_copy import embed_artwork
 
 
 # ---------------------------------------------------------------------------
@@ -228,20 +231,21 @@ class _YTWorker(QThread):
             ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
         )
         proc = subprocess.Popen(
-            ['ffmpeg', '-y', '-i', input_path, '-vf', vf,
+            [get_ffmpeg_path(), '-y', '-nostdin', '-i', input_path, '-vf', vf,
              '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
              '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart',
-             '-progress', 'pipe:1', '-loglevel', 'quiet', output_path],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+             '-progress', 'pipe:1', '-stats_period', '0.1', '-loglevel', 'quiet', output_path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         assert proc.stdout is not None
-        for line in proc.stdout:
+        for raw_line in proc.stdout:
             if self._cancelled:
                 proc.terminate()
                 raise _Cancelled()
-            if line.strip().startswith('out_time_us=') and duration > 0:
+            line = raw_line.decode('utf-8', errors='replace').strip()
+            if line.startswith('out_time_us=') and duration > 0:
                 try:
-                    us = int(line.strip().split('=')[1])
+                    us = int(line.split('=')[1])
                     pct = int(70 + min(us / (duration * 1_000_000), 1.0) * 29)
                     self.progress.emit(pct, 'Converting')
                 except (ValueError, IndexError):
@@ -298,14 +302,7 @@ class _YTWorker(QThread):
         self.finished.emit(str(final_path))
 
     def _get_duration(self, path: str) -> float:
-        try:
-            r = subprocess.run(
-                ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path],
-                capture_output=True, text=True, timeout=30,
-            )
-            return float(json.loads(r.stdout)['format']['duration'])
-        except Exception:
-            return 0.0
+        return get_media_duration(path)
 
 
 # ---------------------------------------------------------------------------
@@ -408,17 +405,18 @@ class _YTImportDialog(_CrateSortDialog):
         self._meta_worker:  Optional[_MetadataFetchWorker] = None
         self._dl_worker:    Optional[_YTWorker]            = None
         self._mb_worker:    Optional[_MusicBrainzWorker]   = None
+        self._artwork_path: Optional[Path] = None
 
         is_mp4 = fmt == 'mp4'
         self.setMinimumWidth(520)
 
-        layout = _create_dialog_layout(self, '#428175')
+        layout = _create_dialog_layout(self)
 
         # ── Header ──────────────────────────────────────────────────────────
         title_lbl = QLabel('Import from YouTube')
         title_lbl.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(title_lbl)
 
@@ -502,6 +500,52 @@ class _YTImportDialog(_CrateSortDialog):
         meta_grid.setColumnStretch(0, 1)
 
         layout.addWidget(meta_frame)
+        layout.addSpacing(12)
+
+        # ── Artwork ──────────────────────────────────────────────────────────
+        # YouTube downloads never carry embedded art — unlike local WAV/MOV
+        # conversions, which inherit it from the source file — so this is the
+        # only converter that needs a manual attach-artwork option.
+        layout.addWidget(self._eyebrow('ARTWORK (OPTIONAL)'))
+
+        artwork_row = QHBoxLayout()
+        artwork_row.setSpacing(10)
+
+        self._artwork_thumb = QLabel('—')
+        self._artwork_thumb.setFixedSize(48, 48)
+        self._artwork_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._artwork_thumb.setStyleSheet(
+            'background: #383838; border: 1px solid #444444; border-radius: 6px; '
+            'color: #5a5248; font-size: 18px;'
+        )
+        artwork_row.addWidget(self._artwork_thumb)
+
+        artwork_btn_col = QVBoxLayout()
+        artwork_btn_col.setSpacing(6)
+        choose_art_btn = QPushButton('Choose Image…')
+        choose_art_btn.setFixedHeight(30)
+        choose_art_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 0 14px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #a89b85; }'
+        )
+        choose_art_btn.clicked.connect(self._on_choose_artwork)
+        artwork_btn_col.addWidget(choose_art_btn)
+
+        self._clear_art_btn = QPushButton('Clear')
+        self._clear_art_btn.setFixedHeight(26)
+        self._clear_art_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 0 14px; font-size: 12px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #a89b85; }'
+        )
+        self._clear_art_btn.clicked.connect(self._on_clear_artwork)
+        self._clear_art_btn.hide()
+        artwork_btn_col.addWidget(self._clear_art_btn)
+
+        artwork_row.addLayout(artwork_btn_col)
+        artwork_row.addStretch()
+        layout.addLayout(artwork_row)
         layout.addSpacing(12)
 
         # ── Destination ──────────────────────────────────────────────────────
@@ -738,6 +782,30 @@ class _YTImportDialog(_CrateSortDialog):
         self._meta_status.hide()
         self._fields_enabled(True)
 
+    # ── Artwork ───────────────────────────────────────────────────────────────
+
+    def _on_choose_artwork(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Choose Artwork', str(Path.home()), 'Images (*.jpg *.jpeg *.png)',
+        )
+        if not path:
+            return
+        self._artwork_path = Path(path)
+        pixmap = QPixmap(path)
+        if not pixmap.isNull():
+            pixmap = pixmap.scaled(
+                48, 48, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._artwork_thumb.setPixmap(pixmap)
+        self._clear_art_btn.show()
+
+    def _on_clear_artwork(self) -> None:
+        self._artwork_path = None
+        self._artwork_thumb.setPixmap(QPixmap())
+        self._artwork_thumb.setText('—')
+        self._clear_art_btn.hide()
+
     # ── Browse ────────────────────────────────────────────────────────────────
 
     def _on_browse(self) -> None:
@@ -867,6 +935,12 @@ class _YTImportDialog(_CrateSortDialog):
             )
         except Exception as exc:
             self._set_result(f'Tags could not be written: {exc}', error=True)
+
+        if self._artwork_path is not None:
+            try:
+                embed_artwork(Path(self._output_path), self._fmt, self._artwork_path)
+            except Exception as exc:
+                self._set_result(f'Artwork could not be embedded: {exc}', error=True)
 
         self._set_result(f'Saved: {self._output_path}', error=False)
         self._import_btn.setText('Close')

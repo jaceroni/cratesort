@@ -4,11 +4,16 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QMimeData, QSettings, QSize, QTimer
-from PyQt6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QPalette, QPixmap
+from PyQt6.QtCore import (
+    Qt, QEasingCurve, QMimeData, QParallelAnimationGroup, QPropertyAnimation,
+    QRect, QRectF, QSettings, QSize, QSizeF, QTimer, pyqtSignal,
+)
+from PyQt6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup,
-    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QDialog, QFileDialog, QFrame, QGraphicsItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView,
+    QHBoxLayout, QLabel, QMainWindow, QMenu,
     QPushButton, QSizePolicy, QStackedWidget, QStatusBar,
     QVBoxLayout, QWidget,
 )
@@ -19,7 +24,7 @@ try:
 except ImportError:
     _SVG_AVAILABLE = False
 
-from cratesort.src.gui.theme import apply_theme, C
+from cratesort.src.gui.theme import apply_theme, C, empty_artwork_pixmap, RoundedCornerOverlay
 from cratesort.src.gui.overlays import _ov_alert
 from cratesort.src.gui.dashboard import DashboardWidget
 from cratesort.src.gui.library_browser import LibraryBrowserView
@@ -27,6 +32,9 @@ from cratesort.src.gui.crate_manager import CrateManagerView
 from cratesort.src.gui.organize_view import OrganizeView
 from cratesort.src.gui.settings_view import SettingsView
 from cratesort.src.gui.duplicate_review_view import DuplicateReviewView
+from cratesort.src.gui.playback_controller import PlaybackController
+from cratesort.src.gui.playback_bar import PlaybackBar
+from cratesort.src.gui.video_window import FloatingVideoWindow
 from cratesort.src.utils.undo_manager import UndoManager
 
 _ASSETS = Path(__file__).parent.parent.parent / 'assets'
@@ -105,7 +113,17 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
 
-        root = QHBoxLayout(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Created before the sidebar so the sidebar's inline video panel can
+        # be constructed with a live controller reference.
+        self._playback_controller = PlaybackController(self)
+        self._video_window: Optional[FloatingVideoWindow] = None
+
+        content_row = QWidget()
+        root = QHBoxLayout(content_row)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
@@ -131,8 +149,9 @@ class MainWindow(QMainWindow):
         self._content.addWidget(self._dashboard)
 
         # Library Browser — index 1
-        self._library_browser = LibraryBrowserView()
+        self._library_browser = LibraryBrowserView(undo_manager=self._undo_manager)
         self._library_browser.album_art_requested.connect(self._update_album_art)
+        self._library_browser.play_requested.connect(self._on_play_requested)
         self._content.addWidget(self._library_browser)
 
         # Crate Manager — index 2
@@ -164,6 +183,56 @@ class MainWindow(QMainWindow):
         self._content.addWidget(self._duplicate_review)
 
         root.addWidget(self._content)
+        outer.addWidget(content_row, stretch=1)
+
+        # Playback bar — global chrome, survives tab switches (CLAUDE-CS.md
+        # "media player will eventually occupy the lower third of the app").
+        self._playback_bar = PlaybackBar(self._playback_controller, self)
+        self._playback_bar.skip_previous_requested.connect(self._on_skip_previous)
+        self._playback_bar.skip_next_requested.connect(self._on_skip_next)
+        outer.addWidget(self._playback_bar)
+
+    def _on_play_requested(self, rec) -> None:
+        pixmap = _read_album_art(str(rec.path))
+        self._playback_controller.play(rec)
+        self._playback_bar.set_now_playing_art(pixmap)
+        # Any previously popped-out video window belongs to whatever was
+        # playing before — close it so it doesn't linger on the new track.
+        if self._video_window is not None and self._video_window.isVisible():
+            self._video_window.close()
+        if rec.is_video:
+            self._inline_video.show_video()
+        else:
+            self._inline_video.hide_video()
+
+    def _on_pop_out_requested(self) -> None:
+        self._inline_video.hide_video()
+        if self._video_window is None:
+            self._video_window = FloatingVideoWindow(self._playback_controller, self)
+            self._video_window.closed.connect(self._on_video_window_closed)
+        self._video_window.show_for_playback()
+
+    def _on_video_window_closed(self) -> None:
+        rec = self._playback_controller.current_track
+        if rec is not None and rec.is_video:
+            self._inline_video.show_video()
+
+    def _on_skip_previous(self) -> None:
+        self._skip(-1)
+
+    def _on_skip_next(self) -> None:
+        self._skip(1)
+
+    def _skip(self, direction: int) -> None:
+        current = self._playback_controller.current_track
+        if current is None:
+            return
+        rec = (
+            self._library_browser.next_track_after(str(current.path)) if direction > 0
+            else self._library_browser.previous_track_before(str(current.path))
+        )
+        if rec is not None:
+            self._on_play_requested(rec)
 
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
@@ -192,7 +261,7 @@ class MainWindow(QMainWindow):
             logo_text = QLabel('CrateSort')
             logo_text.setStyleSheet(
                 f'color: {C["text"]}; font-size: 16px; font-weight: 700;'
-                f'font-family: "Charter", "Georgia", serif;'
+                f'font-family: "Charter", "Georgia";'
             )
             logo_layout.addWidget(logo_text)
         layout.addWidget(logo_strip)
@@ -229,23 +298,11 @@ class MainWindow(QMainWindow):
             self._nav_btns[nav_id] = btn
             layout.addWidget(btn)
 
-        # Album art panel — ~50px space below nav buttons, no divider line (Fix 3)
-        layout.addSpacing(50)
-
-        self._art_panel = _ArtPanel()
-        art_wrapper = QWidget()
-        art_wrapper.setStyleSheet(f'background: {C["bg_panel"]};')
-        aw_layout = QVBoxLayout(art_wrapper)
-        aw_layout.setContentsMargins(13, 0, 13, 13)  # equal L/R, bottom padding
-        aw_layout.addWidget(self._art_panel, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(art_wrapper)
-
-        layout.addSpacing(16)
-
+        # Undo/redo — right below the nav menu.
         undo_redo_wrapper = QWidget()
         undo_redo_wrapper.setStyleSheet(f'background: {C["bg_panel"]};')
         ur_layout = QHBoxLayout(undo_redo_wrapper)
-        ur_layout.setContentsMargins(13, 0, 13, 8)
+        ur_layout.setContentsMargins(13, 37, 13, 8)  # +25px further from the nav menu above
         ur_layout.setSpacing(6)
 
         self._undo_btn = QPushButton('Undo')
@@ -263,6 +320,7 @@ class MainWindow(QMainWindow):
 
         self._redo_btn = QPushButton('Redo')
         self._redo_btn.setEnabled(False)
+        self._redo_btn.setFixedHeight(36)
         self._redo_btn.setStyleSheet(self._undo_btn.styleSheet())
         self._redo_btn.clicked.connect(self._do_redo)
         self._redo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -273,12 +331,47 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        # Version label at very bottom
-        ver = QLabel(f'v{VERSION}')
-        ver.setProperty('role', 'muted')
-        ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ver.setContentsMargins(0, 8, 0, 10)
-        layout.addWidget(ver)
+        # ── Bottom cluster: video monitor (only when a video is loaded),
+        # a divider (only alongside the video monitor), then album art. ──
+
+        self._inline_video = _InlineVideoPanel(self._playback_controller)
+        self._inline_video.pop_out_requested.connect(self._on_pop_out_requested)
+        video_wrapper = QWidget()
+        video_wrapper.setStyleSheet(f'background: {C["bg_panel"]};')
+        vw_layout = QVBoxLayout(video_wrapper)
+        vw_layout.setContentsMargins(13, 13, 13, 13)  # symmetric — same 13px gap on every side
+        vw_layout.addWidget(self._inline_video, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(video_wrapper)
+
+        # Divider: same color as the sidebar's own right-edge border, 75%
+        # width, centered — not a full-bleed line.
+        divider_wrapper = QWidget()
+        divider_wrapper.setStyleSheet(f'background: {C["bg_panel"]};')
+        dw_layout = QHBoxLayout(divider_wrapper)
+        dw_layout.setContentsMargins(0, 0, 0, 0)
+        divider_line = QFrame()
+        divider_line.setFrameShape(QFrame.Shape.HLine)
+        divider_line.setFixedHeight(1)
+        divider_line.setFixedWidth(round(_InlineVideoPanel._PANEL_WIDTH * 0.75))
+        divider_line.setStyleSheet(f'background: {C["border"]}; border: none;')
+        dw_layout.addStretch()
+        dw_layout.addWidget(divider_line)
+        dw_layout.addStretch()
+        layout.addWidget(divider_wrapper)
+        self._video_divider = divider_wrapper
+
+        video_wrapper.setVisible(False)
+        self._video_divider.setVisible(False)
+        self._inline_video.visibility_changed.connect(video_wrapper.setVisible)
+        self._inline_video.visibility_changed.connect(self._video_divider.setVisible)
+
+        self._art_panel = _ArtPanel()
+        art_wrapper = QWidget()
+        art_wrapper.setStyleSheet(f'background: {C["bg_panel"]};')
+        aw_layout = QVBoxLayout(art_wrapper)
+        aw_layout.setContentsMargins(13, 13, 13, 13)
+        aw_layout.addWidget(self._art_panel, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(art_wrapper)
 
         return sidebar
 
@@ -357,10 +450,87 @@ class MainWindow(QMainWindow):
             'Please review and sync the detected Serato changes on the Dashboard first.',
         )
 
+    def _switch_content(self, index: int) -> None:
+        """Coordinated directional push between top-level pages.
+
+        Dashboard sits at the top of the hierarchy (sidebar order = depth);
+        moving to a deeper tab (Library -> Crates -> Organize -> Settings)
+        pushes left-to-right: outgoing exits right, incoming enters from the
+        left. Moving back up the hierarchy reverses both. Both sides use the
+        same InBack/OutBack overshoot family as the dialog bounce, so it reads
+        as the same elastic motion signature as every popup in the app."""
+        current_idx = self._content.currentIndex()
+        if index == current_idx:
+            return
+        outgoing = self._content.currentWidget()
+        if outgoing is None or not outgoing.isVisible():
+            self._content.setCurrentIndex(index)
+            return
+
+        forward = index > current_idx
+        direction = 1 if forward else -1
+
+        outgoing_snapshot = outgoing.grab()
+        self._content.setCurrentIndex(index)
+        incoming = self._content.currentWidget()
+        incoming_snapshot = incoming.grab() if incoming is not None else None
+
+        full_rect = self._content.rect()  # local coords — overlays are children of _content
+        w = full_rect.width()
+
+        outgoing_overlay = QLabel(self._content)
+        outgoing_overlay.setPixmap(outgoing_snapshot)
+        outgoing_overlay.setScaledContents(True)
+        outgoing_overlay.setGeometry(full_rect)
+        outgoing_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        outgoing_overlay.show()
+
+        out_end_rect = QRect(full_rect.x() + direction * w, full_rect.y(), w, full_rect.height())
+        out_curve = QEasingCurve(QEasingCurve.Type.InBack)
+        # A position-based backward lean reads much stronger than the same
+        # overshoot value does on a size-based shrink (dialog exit) — keep it
+        # barely-there here instead of reusing the dialogs' 3.0.
+        out_curve.setOvershoot(0.8)
+        out_anim = QPropertyAnimation(outgoing_overlay, b'geometry', outgoing_overlay)
+        out_anim.setStartValue(full_rect)
+        out_anim.setEndValue(out_end_rect)
+        out_anim.setDuration(384)
+        out_anim.setEasingCurve(out_curve)
+
+        group = QParallelAnimationGroup(self._content)
+        group.addAnimation(out_anim)
+        cleanup = [outgoing_overlay.deleteLater]
+
+        if incoming_snapshot is not None:
+            in_start_rect = QRect(full_rect.x() - direction * w, full_rect.y(), w, full_rect.height())
+            incoming_overlay = QLabel(self._content)
+            incoming_overlay.setPixmap(incoming_snapshot)
+            incoming_overlay.setScaledContents(True)
+            incoming_overlay.setGeometry(in_start_rect)
+            incoming_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            incoming_overlay.show()
+            outgoing_overlay.raise_()  # outgoing stays on top; they never overlap anyway
+
+            in_curve = QEasingCurve(QEasingCurve.Type.OutBack)
+            in_curve.setOvershoot(0.8)  # matches the outgoing side's subtler lean
+            in_anim = QPropertyAnimation(incoming_overlay, b'geometry', incoming_overlay)
+            in_anim.setStartValue(in_start_rect)
+            in_anim.setEndValue(full_rect)
+            in_anim.setDuration(384)
+            in_anim.setEasingCurve(in_curve)
+            group.addAnimation(in_anim)
+            cleanup.append(incoming_overlay.deleteLater)
+
+        group.finished.connect(lambda: [fn() for fn in cleanup])
+        self._content_slide_anim = group
+        group.start()
+
     def _on_nav(self, index: int) -> None:
         # Silent no-op for nav items disabled by current app state
         _state = getattr(self, '_app_state', 3)
-        if _state <= 2 and index in (1, 2, 3):
+        if index != 0 and (
+            self._is_scanning_in_progress() or (_state <= 2 and index in (1, 2, 3))
+        ):
             return
 
         if index != 0 and hasattr(self, '_dashboard') and self._dashboard.is_sync_pending():
@@ -380,7 +550,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._library_browser._exit_classify_mode_cancel()
 
-        self._content.setCurrentIndex(index)
+        self._switch_content(index)
         if index == 0:
             self._dashboard.refresh()
         inv = self._dashboard._inventory
@@ -456,19 +626,37 @@ class MainWindow(QMainWindow):
             return 2
         return 3
 
+    def _is_scanning_in_progress(self) -> bool:
+        """True once a library has been picked but the background inventory
+        scan hasn't populated data yet — disk state alone (_get_app_state)
+        can't tell this apart from 'already scanned', since a _Serato_ folder
+        can exist on disk well before the in-memory scan finishes."""
+        dash = getattr(self, '_dashboard', None)
+        if dash is None:
+            return False
+        return dash._library_path is not None and dash._summary is None
+
     def _apply_nav_state(self, state: int) -> None:
         """
         Enable/disable nav buttons based on app state.
 
         State 1/2 — No library or no Serato: Library, Crates, Organize disabled.
         State 3   — Library + Serato present: all items enabled.
+        While a scan is actively running, every tab except Dashboard stays
+        disabled regardless of state — nothing else is ready to use yet.
         """
         self._app_state = state
+        scanning = self._is_scanning_in_progress()
         for i, (nav_id, _, _) in enumerate(_NAV_ITEMS):
             btn = self._nav_btns.get(nav_id)
             if btn is None:
                 continue
-            if state <= 2 and i in (1, 2, 3):
+            if i == 0:
+                continue  # Dashboard is always available
+            if scanning:
+                btn.setEnabled(False)
+                btn.setToolTip('Scanning your library — this tab will be available once the scan finishes.')
+            elif state <= 2 and i in (1, 2, 3):
                 btn.setEnabled(False)
                 btn.setToolTip(
                     'Load a library to get started.'
@@ -494,17 +682,27 @@ class MainWindow(QMainWindow):
     def _do_undo(self) -> None:
         if not self._undo_manager.can_undo():
             return
-        self._switch_to_command_tab(self._undo_manager._undo_stack[-1])
+        cmd = self._undo_manager._undo_stack[-1]
+        self._switch_to_command_tab(cmd)
         msg = self._undo_manager.undo()
-        if msg and hasattr(self, '_crate_manager'):
-            self._crate_manager._set_status(msg, teal=True)
+        self._show_undo_status(cmd, msg, '↺')
 
     def _do_redo(self) -> None:
         if not self._undo_manager.can_redo():
             return
-        self._switch_to_command_tab(self._undo_manager._redo_stack[-1])
+        cmd = self._undo_manager._redo_stack[-1]
+        self._switch_to_command_tab(cmd)
         msg = self._undo_manager.redo()
-        if msg and hasattr(self, '_crate_manager'):
+        self._show_undo_status(cmd, msg, '↻')
+
+    def _show_undo_status(self, cmd, msg: Optional[str], icon: str = '') -> None:
+        if not msg:
+            return
+        msg = f'{icon} {msg}' if icon else msg
+        source = getattr(cmd, 'source_tab', 'crates')
+        if source == 'library' and hasattr(self, '_library_browser'):
+            self._library_browser._set_status(msg, teal=True)
+        elif hasattr(self, '_crate_manager'):
             self._crate_manager._set_status(msg, teal=True)
 
     def _update_status(self, message: str, state: str) -> None:
@@ -598,6 +796,11 @@ class MainWindow(QMainWindow):
     def _on_library_changed_from_settings(self, path: Path) -> None:
         self._on_library_changed(path)
         self._dashboard.set_library_path(path)
+        # set_library_path() kicks off a new scan (resetting _summary to None)
+        # after _on_library_changed already applied nav state — reapply so the
+        # nav bar reflects "scanning in progress" for the new library, not
+        # whatever was left over from the previous one.
+        self._apply_nav_state(self._get_app_state())
         self._on_nav_by_id('dashboard')
 
     def _on_repair_crate_paths(self) -> None:
@@ -832,6 +1035,9 @@ def _remove_album_art(file_path: str) -> bool:
 # Album art panel widget — supports drag-and-drop + right-click (Fixes 5, 6)
 # ---------------------------------------------------------------------------
 
+_ART_PANEL_STYLE = 'QLabel { background-color: #222222; border: none; }'
+
+
 class _ArtPanel(QLabel):
     """
     170×170 sidebar panel for embedded album art.
@@ -839,10 +1045,10 @@ class _ArtPanel(QLabel):
     """
 
     def __init__(self, parent=None):
-        super().__init__('♪', parent)
+        super().__init__(parent)
         self.setFixedSize(170, 170)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet('QLabel { background-color: #222222; color: #444444; font-size: 36px; }')
+        self.setStyleSheet(_ART_PANEL_STYLE)
         self.setAcceptDrops(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_right_click)
@@ -850,6 +1056,18 @@ class _ArtPanel(QLabel):
         self._current_path:  str = ''
         self._current_title: str = ''
         self._current_pixmap: Optional[QPixmap] = None
+
+        # QSS border-radius only rounds this label's background — the
+        # pixmap drawn on top of it (real art or the empty-artwork
+        # placeholder) is a plain square and isn't clipped by that curve.
+        # This overlay covers the 4 corner artifacts AND draws the border
+        # stroke itself, both from the same path, so they align exactly
+        # (see RoundedCornerOverlay's docstring for why that matters).
+        self._corner_overlay = RoundedCornerOverlay(C['bg_panel'], 5, border_color=C['border'], parent=self)
+        self._corner_overlay.setGeometry(0, 0, 170, 170)
+        self._corner_overlay.raise_()
+
+        self._show_pixmap(None)
 
     def clear(self) -> None:
         self._current_path = ''
@@ -868,10 +1086,8 @@ class _ArtPanel(QLabel):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation)
             self.setPixmap(scaled)
-            self.setText('')
         else:
-            self.setPixmap(QPixmap())
-            self.setText('♪')
+            self.setPixmap(empty_artwork_pixmap(168))
 
     # ── Drag-and-drop (Fix 5) ──────────────────────────────────────────
 
@@ -930,13 +1146,8 @@ class _ArtPanel(QLabel):
 
     def _flash_success(self) -> None:
         """Flash the panel border teal for 800ms to confirm an art write."""
-        self.setStyleSheet(
-            'QLabel { background-color: #222222; color: #444444; font-size: 36px; '
-            'border: 3px solid #428175; border-radius: 3px; }'
-        )
-        QTimer.singleShot(800, lambda: self.setStyleSheet(
-            'QLabel { background-color: #222222; color: #444444; font-size: 36px; }'
-        ))
+        self._corner_overlay.set_border('#428175', 3)
+        QTimer.singleShot(800, lambda: self._corner_overlay.set_border(C['border'], 1))
 
     def _save_art(self) -> None:
         if not self._current_pixmap:
@@ -946,6 +1157,139 @@ class _ArtPanel(QLabel):
         )
         if path:
             self._current_pixmap.save(path)
+
+
+class _RoundedFrameItem(QGraphicsItem):
+    """Corner-cover + border stroke, drawn in the SAME QGraphicsScene as the
+    video item so it's guaranteed to composite above it via a real z-order —
+    QVideoWidget's native rendering surface ignores normal Qt widget z-order
+    (raise_()) entirely regardless of what's on top of it, which is why
+    every previous attempt at masking/overlaying it never actually showed.
+    A QGraphicsVideoItem paints through Qt's own scene-graph compositor
+    instead, so an ordinary QGraphicsItem on top of it (this one) works."""
+
+    def __init__(self, w: int, h: int, radius: int, bg_color: str, border_color: str, border_width: float = 1.0):
+        super().__init__()
+        self._w, self._h, self._radius = w, h, radius
+        self._bg = QColor(bg_color)
+        self._border = QColor(border_color)
+        self._border_width = border_width
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(0, 0, self._w, self._h)
+
+    def paint(self, painter, option, widget=None) -> None:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        inset = self._border_width / 2
+        inner = QPainterPath()
+        inner.addRoundedRect(QRectF(inset, inset, self._w - 2 * inset, self._h - 2 * inset),
+                              self._radius, self._radius)
+        outer = QPainterPath()
+        outer.addRect(QRectF(0, 0, self._w, self._h))
+        painter.fillPath(outer.subtracted(inner), self._bg)
+        pen = QPen(self._border)
+        pen.setWidthF(self._border_width)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(inner)
+
+
+class _InlineVideoPanel(QWidget):
+    """Sidebar video monitor — sits at the bottom of the sidebar column above
+    the album art panel, same 170px column width, height letterboxed by the
+    video item's own aspect-preserving rendering (never wider than the
+    column, scales down proportionally). Collapses to zero height whenever
+    nothing video is playing, so it never occupies space (or shows its
+    divider) during audio playback or before anything's loaded. Shows the
+    same empty-artwork placeholder as the album art panel until a real video
+    frame arrives.
+
+    Built on QGraphicsView/QGraphicsVideoItem rather than QVideoWidget —
+    QVideoWidget renders through a native child window on this system, which
+    always composites above ordinary Qt sibling widgets no matter what Qt-level
+    z-order says, so nothing (a mask, a corner overlay) could ever visibly
+    round its corners. QGraphicsVideoItem paints through the normal scene
+    compositor instead, so the corner-frame item drawn on top of it in the
+    same scene actually shows.
+
+    No separate pop-out icon — a dedicated corner button proved impossible
+    to make reliably visible against arbitrary video content, so the whole
+    thumbnail is the click target instead: click anywhere on it to pop the
+    video out into its own window."""
+
+    pop_out_requested       = pyqtSignal()
+    visibility_changed      = pyqtSignal(bool)  # so a sibling divider can match it
+
+    _PANEL_WIDTH  = 170
+    _PANEL_HEIGHT = 96  # ~16:9 within the 170px column
+
+    def __init__(self, controller: PlaybackController, parent=None):
+        super().__init__(parent)
+        self._controller = controller
+        self.setFixedSize(self._PANEL_WIDTH, self._PANEL_HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip('Click to pop out')
+
+        inner_x, inner_y = 1, 1
+        inner_w, inner_h = self._PANEL_WIDTH - 2, self._PANEL_HEIGHT - 2
+
+        self._scene = QGraphicsScene(self)
+        self._scene.setSceneRect(0, 0, self._PANEL_WIDTH, self._PANEL_HEIGHT)
+        self._scene.setBackgroundBrush(QColor('black'))
+
+        self._view = QGraphicsView(self._scene, self)
+        self._view.setGeometry(0, 0, self._PANEL_WIDTH, self._PANEL_HEIGHT)
+        self._view.setFrameShape(QFrame.Shape.NoFrame)
+        self._view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._view.setStyleSheet('background: transparent; border: none;')
+        self._view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._view.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Clicks pass through to this panel's own mousePressEvent — one
+        # click target regardless of where in the scene you click.
+        self._view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self._video_item = QGraphicsVideoItem()
+        self._video_item.setPos(inner_x, inner_y)
+        self._video_item.setSize(QSizeF(inner_w, inner_h))
+        self._video_item.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        self._video_item.setZValue(0)
+        self._video_item.videoSink().videoFrameChanged.connect(self._on_frame)
+        self._scene.addItem(self._video_item)
+
+        # Same empty-artwork placeholder as _ArtPanel, shown until a real
+        # frame arrives.
+        note_pixmap = empty_artwork_pixmap(min(inner_w, inner_h))
+        self._note_item = QGraphicsPixmapItem(note_pixmap)
+        self._note_item.setPos(
+            inner_x + (inner_w - note_pixmap.width()) / 2,
+            inner_y + (inner_h - note_pixmap.height()) / 2,
+        )
+        self._note_item.setZValue(1)
+        self._scene.addItem(self._note_item)
+
+        self._frame_item = _RoundedFrameItem(self._PANEL_WIDTH, self._PANEL_HEIGHT, 5, C['bg_panel'], C['border'])
+        self._frame_item.setZValue(2)
+        self._scene.addItem(self._frame_item)
+
+        self.setVisible(False)  # collapsed — no video loaded yet
+
+    def mousePressEvent(self, event) -> None:
+        self.pop_out_requested.emit()
+        super().mousePressEvent(event)
+
+    def _on_frame(self, frame) -> None:
+        self._note_item.setVisible(not frame.isValid())
+
+    def show_video(self) -> None:
+        self._note_item.setVisible(True)
+        self._controller.set_video_output(self._video_item)
+        self.setVisible(True)
+        self.visibility_changed.emit(True)
+
+    def hide_video(self) -> None:
+        self.setVisible(False)
+        self.visibility_changed.emit(False)
 
 
 # ---------------------------------------------------------------------------

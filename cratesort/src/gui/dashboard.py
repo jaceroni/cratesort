@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 
@@ -11,12 +12,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    Qt, QEasingCurve, QPropertyAnimation,
+    QSettings, QThread, QTimer, QVariantAnimation, pyqtSignal,
+)
 from PyQt6.QtGui import QBrush, QColor, QFontMetrics, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
+    QGridLayout, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QSplitterHandle, QStackedWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -33,9 +38,11 @@ from cratesort.src.utils.checkpoint import save_checkpoint, load_checkpoint, det
 from cratesort.src.serato.database_reader import read_track_add_dates
 from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _create_dialog_layout
 from cratesort.src.gui.yt_import_dialog import _YTImportDialog
+from cratesort.src.gui.convert_dialog import _ConvertDialog
 
 _ASSETS         = Path(__file__).parent.parent.parent / 'assets'
 _LOGO_SVG       = _ASSETS / 'logo' / 'cs-logo-mascot-stacked.svg'
+_MASCOT_SVG     = _ASSETS / 'logo' / 'cs-logo-mascot-only.svg'
 _ICON_CHECKED   = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
 _ICON_UNCHECKED = str(_ASSETS / 'icons' / 'checkbox-unchecked.svg')
 _ORG, _APP = 'JWBC', 'CrateSort'
@@ -139,6 +146,20 @@ class _ScanWorker(QThread):
             self.progress.emit(count, dir_name)
 
 
+_SVG_VIEWBOX_RE = re.compile(r'viewBox="[\d.\-]+\s+[\d.\-]+\s+([\d.]+)\s+([\d.]+)"')
+
+
+def _svg_aspect_ratio(svg_bytes: bytes) -> float:
+    """Width/height ratio from an SVG's viewBox, so icons can be scaled to a
+    fixed height without stretching/squishing non-square artwork. Falls back
+    to 1.0 (square) if no viewBox is found."""
+    match = _SVG_VIEWBOX_RE.search(svg_bytes.decode('utf-8', errors='ignore'))
+    if not match:
+        return 1.0
+    w, h = float(match.group(1)), float(match.group(2))
+    return w / h if h else 1.0
+
+
 # ---------------------------------------------------------------------------
 # Icon action card — text top-left, large muted icon top-right that lights up
 # on hover. Same treatment as _WorkflowCard, sized for a compact row.
@@ -191,8 +212,11 @@ class _IconActionCard(QFrame):
         if _SVG_AVAILABLE and icon_path and Path(icon_path).exists():
             try:
                 self._svg_bytes = Path(icon_path).read_bytes()
+                aspect = _svg_aspect_ratio(self._svg_bytes)
                 self._icon_svg = QSvgWidget()
-                self._icon_svg.setFixedSize(icon_size, icon_size)
+                # Lock height across all cards; derive width from each icon's own
+                # aspect ratio so nothing gets stretched/squished to fit a square.
+                self._icon_svg.setFixedSize(round(icon_size * aspect), icon_size)
                 self._icon_svg.setStyleSheet('background: transparent;')
                 self._icon_svg.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
                 self._load_icon_color(self._ICON_DIM)
@@ -291,10 +315,12 @@ class _AnimatedStatCard(QFrame):
 # ---------------------------------------------------------------------------
 
 class _WorkflowCard(QFrame):
-    _STYLE_REST  = 'QFrame { background-color: #2F2F2F; border: 1px solid #3a3a3a; border-radius: 10px; }'
-    _STYLE_HOVER = 'QFrame { background-color: #353028; border: 1px solid #D17D34; border-radius: 10px; }'
-    _ICON_DIM    = '#2a2a2a'
-    _ICON_ACTIVE = '#D17D34'
+    _STYLE_REST     = 'QFrame { background-color: #2F2F2F; border: 1px solid #3a3a3a; border-radius: 10px; }'
+    _STYLE_HOVER    = 'QFrame { background-color: #353028; border: 1px solid #D17D34; border-radius: 10px; }'
+    _STYLE_DISABLED = 'QFrame { background-color: #262626; border: 1px solid #333333; border-radius: 10px; }'
+    _ICON_DIM      = '#2a2a2a'
+    _ICON_ACTIVE   = '#D17D34'
+    _ICON_DISABLED = '#3a3a3a'
 
     def __init__(self, _step: str, title: str, desc: str, callback, icon_path=None, highlighted: bool = False, footer: str = None, parent=None):
         super().__init__(parent)
@@ -302,6 +328,7 @@ class _WorkflowCard(QFrame):
         self._icon_path = icon_path
         self._icon_svg: QSvgWidget | None = None
         self._svg_bytes: bytes | None = None
+        self._disabled  = False
 
         if highlighted:
             self.style_rest = 'QFrame { background-color: #1a2e2b; border: 2px solid #428175; border-radius: 10px; }'
@@ -379,17 +406,32 @@ class _WorkflowCard(QFrame):
             ).replace('#D17D34', color)
             self._icon_svg.load(QByteArray(colored.encode('utf-8')))
 
+    def set_disabled(self, disabled: bool) -> None:
+        self._disabled = disabled
+        if disabled:
+            self.setStyleSheet(self._STYLE_DISABLED)
+            self._load_icon_color(self._ICON_DISABLED)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            self.setStyleSheet(self.style_rest)
+            self._load_icon_color(self.icon_dim)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
     def enterEvent(self, event):
-        self.setStyleSheet(self._STYLE_HOVER)
-        self._load_icon_color(self._ICON_ACTIVE)
+        if not self._disabled:
+            self.setStyleSheet(self._STYLE_HOVER)
+            self._load_icon_color(self._ICON_ACTIVE)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.setStyleSheet(self.style_rest)
-        self._load_icon_color(self.icon_dim)
+        if not self._disabled:
+            self.setStyleSheet(self.style_rest)
+            self._load_icon_color(self.icon_dim)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
+        if self._disabled:
+            return
         if self._callback:
             self._callback()
 
@@ -430,12 +472,12 @@ class _ChangeReviewDialog(_CrateSortDialog):
         self._changes            = list(changes)
 
         # Use the standard dialog layout builder with Orange accent (selection/confirm)
-        layout = _create_dialog_layout(self, '#D17D34')
+        layout = _create_dialog_layout(self)
 
         title = QLabel('Serato Library Changes Detected')
         title.setStyleSheet(
-            'color: #f1e3c8; font-size: 17px; font-weight: 600; '
-            'font-family: "Charter", "Georgia", serif; background: transparent; border: none;'
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
         )
         layout.addWidget(title)
         layout.addSpacing(6)
@@ -772,8 +814,7 @@ class DashboardWidget(QWidget):
             _raw = self._settings.value('library_path')
             saved_path = Path(_raw) if _raw else None
         self._stack.addWidget(self._build_welcome(saved_path))  # 0
-        self._stack.addWidget(self._build_scanning())           # 1
-        self._stack.addWidget(self._build_dashboard())          # 2
+        self._stack.addWidget(self._build_dashboard())          # 1 — shown both while scanning and once ready
 
         self._stack.setCurrentIndex(0)
 
@@ -798,12 +839,39 @@ class DashboardWidget(QWidget):
         self.start_scan(path)
 
     def start_scan(self, library_path: Path) -> None:
+        logo = getattr(self, '_welcome_logo', None)
+        if logo is not None and self._stack.currentIndex() == 0:
+            self._play_logo_exit(lambda: self._start_scan_now(library_path))
+        else:
+            self._start_scan_now(library_path)
+
+    def _play_logo_exit(self, on_finished) -> None:
+        """Shrink the welcome logo away — mirrors its grow-in (same InBack/overshoot
+        recipe as the dialog exit bounce) — before switching to the scan screen."""
+        logo = self._welcome_logo
+        curve = QEasingCurve(QEasingCurve.Type.InBack)
+        curve.setOvershoot(3.0)
+        anim = QVariantAnimation(logo)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.setDuration(384)  # matches the 20%-slowed dialog exit duration
+        anim.setEasingCurve(curve)
+        anim.valueChanged.connect(
+            lambda factor: logo.setFixedSize(
+                max(1, int(self._LOGO_W * factor)), max(1, int(self._LOGO_H * factor))
+            )
+        )
+        anim.finished.connect(on_finished)
+        self._logo_exit_anim = anim
+        anim.start()
+
+    def _start_scan_now(self, library_path: Path) -> None:
         self._scan_cancelled = False
         self._library_path = library_path
-        self._scan_label.setText('Scanning library…')
-        self._scan_count.setText('Discovering files…')
-        self._scan_bar.setValue(0)
+        self._summary   = None
+        self._inventory = []
         self._scan_start_ms = int(time.time() * 1000)
+        self._populate_dashboard(scanning=True)
         self._stack.setCurrentIndex(1)
         self.scan_started.emit()
         self.status_message.emit('Scanning library…', 'amber')
@@ -820,9 +888,26 @@ class DashboardWidget(QWidget):
 
         if _SVG_AVAILABLE and _LOGO_SVG.exists():
             logo = QSvgWidget(str(_LOGO_SVG))
-            logo.setFixedSize(240, 254)
             logo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             layout.addWidget(logo, alignment=Qt.AlignmentFlag.AlignCenter)
+
+            # Fun elastic grow-in on first launch — same OutBack/overshoot recipe
+            # as the dialog bounce (_CrateSortDialog.run_bounce_animation), just
+            # applied to the logo's size instead of a window's geometry.
+            self._welcome_logo = logo
+            self._LOGO_W, self._LOGO_H = 240, 254
+            logo.setFixedSize(int(self._LOGO_W * 0.55), int(self._LOGO_H * 0.55))
+            grow_curve = QEasingCurve(QEasingCurve.Type.OutBack)
+            grow_curve.setOvershoot(3.0)
+            self._logo_grow_anim = QVariantAnimation(w)
+            self._logo_grow_anim.setStartValue(0.55)
+            self._logo_grow_anim.setEndValue(1.0)
+            self._logo_grow_anim.setDuration(320)
+            self._logo_grow_anim.setEasingCurve(grow_curve)
+            self._logo_grow_anim.valueChanged.connect(
+                lambda factor: logo.setFixedSize(int(self._LOGO_W * factor), int(self._LOGO_H * factor))
+            )
+            self._logo_grow_anim.start()
         else:
             lbl = QLabel('CrateSort')
             lbl.setProperty('role', 'heading')
@@ -891,7 +976,7 @@ class DashboardWidget(QWidget):
             path_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
             path_text.setStyleSheet(
                 'QLabel { background-color: #1a1a1a; border: 1px solid #383838; border-radius: 6px; '
-                'color: #7a6a55; font-family: monospace; font-size: 12px; padding: 10px; }'
+                'color: #7a6a55; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 12px; padding: 10px; }'
             )
             fm = QFontMetrics(path_text.font())
             elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 360)
@@ -920,7 +1005,7 @@ class DashboardWidget(QWidget):
             path_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
             path_text.setStyleSheet(
                 'QLabel { background-color: #1a1a1a; border: 1px solid #383838; border-radius: 6px; '
-                'color: #f1e3c8; font-family: monospace; font-size: 12px; padding: 10px; }'
+                'color: #f1e3c8; font-family: Menlo, Monaco, "Courier New", monospace; font-size: 12px; padding: 10px; }'
             )
             fm = QFontMetrics(path_text.font())
             elided_path = fm.elidedText(str(saved_path), Qt.TextElideMode.ElideMiddle, 360)
@@ -983,41 +1068,75 @@ class DashboardWidget(QWidget):
         layout.addWidget(welcome_card, alignment=Qt.AlignmentFlag.AlignCenter)
         return w
 
-    # ── Scanning screen (state 1) ─────────────────────────────────────
+    # ── Scanning banner (shown inline in the dashboard while a scan runs) ──
 
-    def _build_scanning(self) -> QWidget:
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(14)
-        layout.setContentsMargins(80, 80, 80, 80)
+    def _build_scanning_banner(self) -> QWidget:
+        outer = QWidget()
+        vbox = QVBoxLayout(outer)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(8)
 
+        eyebrow = QLabel('SCANNING YOUR LIBRARY')
+        eyebrow.setStyleSheet('font-size: 10px; color: #5a5a5a; letter-spacing: 0.12em;')
+        vbox.addWidget(eyebrow)
+
+        panel = QFrame()
+        panel.setStyleSheet(
+            f'QFrame {{ background-color: {self._PANEL}; border: 0.5px solid {self._SEP}; '
+            f'border-radius: 10px; }}'
+        )
+        panel_h = QHBoxLayout(panel)
+        panel_h.setContentsMargins(18, 16, 18, 16)
+        panel_h.setSpacing(14)
+
+        self._mascot: Optional[QSvgWidget] = None
+        self._mascot_anim: Optional[QPropertyAnimation] = None
+        if _SVG_AVAILABLE and _MASCOT_SVG.exists():
+            mascot = QSvgWidget(str(_MASCOT_SVG))
+            mascot.setFixedSize(40, 40)
+            mascot.setStyleSheet('background: transparent;')
+            mascot.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            effect = QGraphicsOpacityEffect(mascot)
+            mascot.setGraphicsEffect(effect)
+            curve = QEasingCurve(QEasingCurve.Type.InOutSine)
+            anim = QPropertyAnimation(effect, b'opacity', mascot)
+            anim.setDuration(1100)
+            anim.setKeyValueAt(0.0, 0.3)
+            anim.setKeyValueAt(0.5, 1.0)
+            anim.setKeyValueAt(1.0, 0.3)
+            anim.setEasingCurve(curve)
+            anim.setLoopCount(-1)
+            self._mascot = mascot
+            self._mascot_anim = anim
+            panel_h.addWidget(mascot)
+            anim.start()
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
         self._scan_label = QLabel('Scanning library…')
-        self._scan_label.setProperty('role', 'subheading')
-        self._scan_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        self._scan_label.setStyleSheet(
+            'font-size: 14px; font-weight: 500; color: #f1e3c8; background: transparent; border: none;'
+        )
         self._scan_count = QLabel('Discovering files…')
-        self._scan_count.setProperty('role', 'muted')
-        self._scan_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self._scan_bar = QProgressBar()
-        self._scan_bar.setRange(0, 0)   # indeterminate
-        self._scan_bar.setFixedWidth(360)
-        self._scan_bar.setFixedHeight(8)
+        self._scan_count.setStyleSheet(
+            'font-size: 12px; color: #a89b85; background: transparent; border: none;'
+        )
+        text_col.addWidget(self._scan_label)
+        text_col.addWidget(self._scan_count)
+        panel_h.addLayout(text_col, stretch=1)
 
         self._scan_cancel = QPushButton('Cancel')
-        self._scan_cancel.setProperty('flat', 'true')
-        self._scan_cancel.setFixedWidth(100)
-        self._scan_cancel.setStyleSheet('QPushButton { color: #C75B5B; } QPushButton:hover { color: #b24c4c; }')
+        self._scan_cancel.setFixedHeight(32)
+        self._scan_cancel.setStyleSheet(
+            'QPushButton { background: transparent; color: #C75B5B; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 0 16px; font-size: 12px; font-weight: 500; }'
+            'QPushButton:hover { color: #ff7a7a; border-color: #C75B5B; }'
+        )
         self._scan_cancel.clicked.connect(self._on_cancel_scan)
+        panel_h.addWidget(self._scan_cancel, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        layout.addWidget(self._scan_label)
-        layout.addWidget(self._scan_count)
-        layout.addWidget(self._scan_bar, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addSpacing(8)
-        layout.addWidget(self._scan_cancel, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        return w
+        vbox.addWidget(panel)
+        return outer
 
     # ── Dashboard container (state 2) ────────────────────────────────
 
@@ -1047,12 +1166,26 @@ class DashboardWidget(QWidget):
     _ROW_ALT  = '#222222'
     _ROW_BASE = '#242424'
 
-    def _populate_dashboard(self) -> None:
+    def _populate_dashboard(self, scanning: bool = False) -> None:
         layout = self._dashboard_layout
         while layout.count():
             child = layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
+        # The mascot/animation (if any) belonged to the widget just cleared above —
+        # drop the references so nothing holds onto a soon-to-be-deleted QObject.
+        self._mascot = None
+        self._mascot_anim = None
+
+        if scanning:
+            # Library data isn't ready yet — show scan status where the stat
+            # cards normally go, keep the YouTube/conversion tools live, and
+            # leave out the activity feed/footer (both depend on the scan).
+            layout.addWidget(self._build_scanning_banner())
+            layout.addWidget(self._make_divider())
+            layout.addWidget(self._build_action_cards_section(scanning=True))
+            layout.addStretch()
+            return
 
         summary    = self._summary
         inv        = self._inventory
@@ -1188,7 +1321,7 @@ class DashboardWidget(QWidget):
             self._dup_banner_widget.deleteLater()
             self._dup_banner_widget = None
 
-    def _build_action_cards_section(self) -> QWidget:
+    def _build_action_cards_section(self, scanning: bool = False) -> QWidget:
         outer = QWidget()
         vbox = QVBoxLayout(outer)
         vbox.setContentsMargins(0, 0, 0, 0)
@@ -1217,26 +1350,39 @@ class DashboardWidget(QWidget):
         for col_idx, (step, title, desc, action, icon_path, footer) in enumerate(goto_cards):
             card = _WorkflowCard(
                 step, title, desc, action, icon_path=icon_path,
-                highlighted=(highlight_manage_library and title == 'Manage Library'),
+                highlighted=(highlight_manage_library and title == 'Manage Library' and not scanning),
                 footer=footer,
             )
+            if scanning:
+                card.set_disabled(True)
             goto_grid.addWidget(card, 0, col_idx)
 
         vbox.addWidget(goto_widget)
 
+        # Extra 6px on each side on top of vbox's uniform 10px spacing, matching
+        # the 16px gap the outer dashboard layout uses around its own divider
+        # (between the stat cards and this section) — otherwise this divider
+        # reads noticeably more cramped than the one above it.
+        vbox.addSpacing(6)
+        divider = QFrame()
+        divider.setFixedHeight(1)
+        divider.setStyleSheet('background-color: #2a2a2a; border: none;')
+        vbox.addWidget(divider)
+        vbox.addSpacing(6)
+
         # ── YouTube import cards ──────────────────────────────────────────
         yt_defs = [
             {
-                'icon_path': _icons / 'icon-mp4.svg', 'title': 'YouTube to MP4',
-                'desc': 'Convert to video file  ·  1080p',
-                'action': lambda: self._open_yt_import('mp4'),
+                'icon_path': _icons / 'icon-mp3-2.svg', 'title': 'YouTube to MP3',
+                'desc': 'Convert URL to audio file  ·  VBR',
+                'action': lambda: self._open_yt_import('mp3'),
                 'base':  _WorkflowCard._STYLE_REST,
                 'hover': _WorkflowCard._STYLE_HOVER,
             },
             {
-                'icon_path': _icons / 'icon-mp3.svg', 'title': 'YouTube to MP3',
-                'desc': 'Convert to audio file  ·  VBR',
-                'action': lambda: self._open_yt_import('mp3'),
+                'icon_path': _icons / 'icon-mp4-2.svg', 'title': 'YouTube to MP4',
+                'desc': 'Convert URL to video file  ·  VBR',
+                'action': lambda: self._open_yt_import('mp4'),
                 'base':  _WorkflowCard._STYLE_REST,
                 'hover': _WorkflowCard._STYLE_HOVER,
             },
@@ -1256,6 +1402,39 @@ class DashboardWidget(QWidget):
             yt_grid.addWidget(card, 0, col_idx)
 
         vbox.addWidget(yt_widget)
+
+        # ── Local conversion cards ────────────────────────────────────────
+        convert_defs = [
+            {
+                'icon_path': _icons / 'icon-convert.svg', 'title': 'Audio to MP3',
+                'desc': 'Convert existing audio file  ·  320kbps',
+                'action': lambda: self._open_convert('wav_mp3'),
+                'base':  _WorkflowCard._STYLE_REST,
+                'hover': _WorkflowCard._STYLE_HOVER,
+            },
+            {
+                'icon_path': _icons / 'icon-convert.svg', 'title': 'Video to MP4',
+                'desc': 'Convert existing video file  ·  H.264',
+                'action': lambda: self._open_convert('video_mp4'),
+                'base':  _WorkflowCard._STYLE_REST,
+                'hover': _WorkflowCard._STYLE_HOVER,
+            },
+        ]
+
+        convert_widget = QWidget()
+        convert_grid = QGridLayout(convert_widget)
+        convert_grid.setContentsMargins(0, 0, 0, 0)
+        convert_grid.setSpacing(10)
+
+        for col_idx, defn in enumerate(convert_defs):
+            card = _IconActionCard(
+                defn['title'], defn['desc'], defn['action'], defn['icon_path'],
+                defn['base'], defn['hover'],
+            )
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            convert_grid.addWidget(card, 0, col_idx)
+
+        vbox.addWidget(convert_widget)
         return outer
 
     def _build_activity_section(self, serato_dir: Optional[Path]) -> QWidget:
@@ -1471,6 +1650,10 @@ class DashboardWidget(QWidget):
         dlg = _YTImportDialog(fmt, self._library_path, genres, artists, self)
         dlg.exec()
 
+    def _open_convert(self, mode: str) -> None:
+        dlg = _ConvertDialog(mode, self)
+        dlg.exec()
+
     def _on_select_library(self) -> None:
         # Reset always_load_last so the dialog appears on next startup
         self._settings.setValue('always_load_last', False)
@@ -1500,6 +1683,8 @@ class DashboardWidget(QWidget):
             except Exception:
                 pass
             self._worker.wait(3000)
+        if getattr(self, '_mascot_anim', None) is not None:
+            self._mascot_anim.stop()
         self._inventory = []
         self._summary = None
         self._library_path = None
@@ -1604,8 +1789,7 @@ class DashboardWidget(QWidget):
                 return
             self._check_serato_sync()
             self._run_duplicate_detection()
-            self._populate_dashboard()
-            self._stack.setCurrentIndex(2)
+            self._populate_dashboard(scanning=False)
             self.scan_finished.emit()
             if self._sync_pending:
                 self.status_message.emit('Serato library changes detected. Review required.', 'amber')
