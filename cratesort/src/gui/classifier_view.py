@@ -341,7 +341,8 @@ class ClassificationSession:
 # ---------------------------------------------------------------------------
 
 class _ClassifyWorker(QThread):
-    progress = pyqtSignal(int, int, str)   # (done, total, artist_name)
+    # (done, total, info) — info is a dict: artist, track_count, genre, recognized
+    progress = pyqtSignal(int, int, object)
     finished = pyqtSignal(object)          # ClassificationSession
     errored  = pyqtSignal(str)
 
@@ -394,7 +395,6 @@ class _ClassifyWorker(QThread):
             entries: list[ArtistEntry] = []
 
             for i, artist in enumerate(artists):
-                self.progress.emit(i + 1, total, artist)
                 tracks   = artist_tracks[artist]
                 results  = classifier.classify_all(tracks)
 
@@ -483,9 +483,25 @@ class _ClassifyWorker(QThread):
                     is_collaboration=is_collab,
                 ))
 
+                # "Recognized" = we landed on a real genre with usable confidence.
+                # 'Unclassified'/NONE means the files had no usable metadata to
+                # go on, or what they had conflicted with everything else we saw.
+                recognized = proposed_genre != 'Unclassified' and overall_conf != 'NONE'
+                self.progress.emit(i + 1, total, {
+                    'artist': artist,
+                    'track_count': len(tracks),
+                    'genre': proposed_genre,
+                    'recognized': recognized,
+                })
+
             # DJ Tools bucket (fix 4)
             if dj_tools_tracks:
-                self.progress.emit(total, total, DJ_TOOLS_LABEL)
+                self.progress.emit(total, total, {
+                    'artist': DJ_TOOLS_LABEL,
+                    'track_count': len(dj_tools_tracks),
+                    'genre': 'Specialty',
+                    'recognized': True,
+                })
                 dj_infos = [
                     TrackInfo(
                         path=str(rec.path),

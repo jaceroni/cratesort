@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -357,27 +358,44 @@ class DuplicateDetector:
     # ── Summary ───────────────────────────────────────────────────────────────
 
     def _summarize(self, groups: list[DuplicateGroup]) -> DuplicateSummary:
-        total_dupes = sum(len(g.copies) - 1 for g in groups)
-        space = sum(g.space_savings for g in groups)
-        with_conflicts = sum(1 for g in groups if g.metadata_conflicts)
-        auto = sum(1 for g in groups if not g.metadata_conflicts)
-        tier1 = sum(1 for g in groups if g.tier == 'true_duplicate')
-        tier2 = sum(1 for g in groups if g.tier == 'variant')
-        return DuplicateSummary(
-            total_groups=len(groups),
-            total_duplicate_files=total_dupes,
-            space_recoverable=space,
-            groups_with_conflicts=with_conflicts,
-            groups_auto_approvable=auto,
-            tier1_groups=tier1,
-            tier2_groups=tier2,
-            skipped_count=getattr(self, '_skipped_count', 0),
-        )
+        return summarize_groups(groups, skipped_count=getattr(self, '_skipped_count', 0))
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def summarize_groups(groups: list[DuplicateGroup], skipped_count: int = 0) -> DuplicateSummary:
+    """Pure function so callers can re-summarize after filtering groups
+    (e.g. removing ones the user dismissed) without re-running detection."""
+    total_dupes    = sum(len(g.copies) - 1 for g in groups)
+    space          = sum(g.space_savings for g in groups)
+    with_conflicts = sum(1 for g in groups if g.metadata_conflicts)
+    auto           = sum(1 for g in groups if not g.metadata_conflicts)
+    tier1          = sum(1 for g in groups if g.tier == 'true_duplicate')
+    tier2          = sum(1 for g in groups if g.tier == 'variant')
+    return DuplicateSummary(
+        total_groups=len(groups),
+        total_duplicate_files=total_dupes,
+        space_recoverable=space,
+        groups_with_conflicts=with_conflicts,
+        groups_auto_approvable=auto,
+        tier1_groups=tier1,
+        tier2_groups=tier2,
+        skipped_count=skipped_count,
+    )
+
+
+def group_fingerprint(group: DuplicateGroup) -> str:
+    """Stable identity for a duplicate group, independent of scan order —
+    used to remember a user's "keep all, don't ask again" choice across
+    future scans. Based on the copies' file paths, so renaming/moving any
+    of them (e.g. via Organize) intentionally invalidates the fingerprint —
+    resurfacing is safer than silently hiding a changed duplicate set forever.
+    """
+    paths = sorted(str(c.file_path) for c in group.copies)
+    return hashlib.sha1('|'.join(paths).encode('utf-8')).hexdigest()
+
 
 def build_crate_count_map(crate_library) -> dict[str, int]:
     """

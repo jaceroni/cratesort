@@ -105,15 +105,15 @@ C = {
     "text_muted":   "#a89b85",   # muted / labels
     "text_disabled":"#5a5248",   # disabled text
 
-    "orange":       "#D17D34",   # primary accent (Satsuma Orange)
-    "orange_hover": "#be6e2c",   # orange hover — darker, not lighter
-    "orange_press": "#a35e24",   # orange pressed/active
+    "orange":       "#aa6326",   # primary accent (Satsuma Orange) — darkened so white button text clears WCAG AA (4.5:1)
+    "orange_hover": "#925521",   # orange hover — darker, not lighter
+    "orange_press": "#7e491c",   # orange pressed/active
     "teal":         "#428175",   # secondary accent (Retro Teal)
     "teal_hover":   "#38706a",   # teal hover — darker, not lighter
 
     "success":      "#6B9E78",   # soft warm green
     "warning":      "#D4A04A",   # warm gold
-    "error":        "#C75B5B",   # muted red
+    "error":        "#c35050",   # muted red — darkened so white button text clears WCAG AA (4.5:1)
     "info":         "#428175",   # same as teal
 
     "selection":    "#D17D34",   # selected items
@@ -252,10 +252,10 @@ QPushButton[danger="true"] {{
     background-color: {C['error']};
 }}
 QPushButton[danger="true"]:hover {{
-    background-color: #b24c4c;
+    background-color: #b03c3c;
 }}
 QPushButton[danger="true"]:pressed {{
-    background-color: #9c3b3b;
+    background-color: #973434;
 }}
 
 /* ── Sidebar nav buttons ──────────────────────────────────────────── */

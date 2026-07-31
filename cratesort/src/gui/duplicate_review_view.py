@@ -14,11 +14,12 @@ _ICON_RADIO_ON   = str(_ASSETS / 'icons' / 'radio-checked.svg')
 _ICON_RADIO_OFF  = str(_ASSETS / 'icons' / 'radio-unchecked.svg')
 
 from cratesort.src.core.duplicate_detector import (
-    DuplicateGroup, DuplicateCopy, DuplicateSummary, fmt_bytes,
+    DuplicateGroup, DuplicateCopy, DuplicateSummary, fmt_bytes, group_fingerprint,
 )
 from cratesort.src.core.duplicate_consolidator import (
     DuplicateConsolidator, ConsolidationResult,
 )
+from cratesort.src.core.duplicate_dismissals import add_dismissed, remove_dismissed
 from cratesort.src.gui.overlays import _ov_alert
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -275,7 +276,7 @@ class DuplicateReviewView(QWidget):
         self._consolidate_btn = QPushButton('Consolidate Checked')
         self._consolidate_btn.setFixedHeight(36)
         self._consolidate_btn.setStyleSheet(
-            f'QPushButton {{ background: {_TEAL}; color: {_CREAM}; border: none; '
+            f'QPushButton {{ background: {_TEAL}; color: #ffffff; border: none; '
             f'border-radius: 6px; padding: 0 20px; font-weight: 600; }}'
             f'QPushButton:hover {{ background: #38706a; }}'
             f'QPushButton:pressed {{ background: #2d6358; }}'
@@ -429,6 +430,9 @@ class DuplicateReviewView(QWidget):
         return f
 
     def _build_group_card(self, idx: int, group: DuplicateGroup) -> QFrame:
+        if idx in self._dismissed:
+            return self._build_dismissed_card(idx, group)
+
         card = QFrame()
         card.setStyleSheet(
             f'QFrame {{ background: {_PANEL}; border: 1px solid #444444; border-radius: 8px; }}'
@@ -446,6 +450,19 @@ class DuplicateReviewView(QWidget):
         savings_lbl = QLabel(f'saves {fmt_bytes(group.space_savings)}')
         savings_lbl.setStyleSheet(f'color: {_TEAL}; font-size: 12px; background: transparent; border: none;')
         title_row.addWidget(savings_lbl)
+
+        keep_all_btn = QPushButton('Keep All — Don\'t Ask Again')
+        keep_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        keep_all_btn.setFixedHeight(26)
+        keep_all_btn.setToolTip('Keep every copy in this group and never flag this exact set again')
+        keep_all_btn.setStyleSheet(
+            f'QPushButton {{ background: transparent; color: {_MUTED}; '
+            f'border: 1px solid #444444; border-radius: 6px; padding: 0 10px; font-size: 11px; }}'
+            f'QPushButton:hover {{ color: {_CREAM}; border-color: {_CREAM}; }}'
+        )
+        keep_all_btn.clicked.connect(lambda _checked=False, i=idx: self._on_keep_all(i))
+        title_row.addWidget(keep_all_btn)
+
         layout.addLayout(title_row)
 
         # Radio button group — one selection per group, no page rebuild
@@ -534,6 +551,59 @@ class DuplicateReviewView(QWidget):
             layout.addWidget(warn)
 
         return card
+
+    def _build_dismissed_card(self, idx: int, group: DuplicateGroup) -> QFrame:
+        """Collapsed state for a group the user chose to keep in full — stays
+        visible (with an Undo) for the rest of this session instead of just
+        vanishing, since dismissing is otherwise a one-way, silent action."""
+        card = QFrame()
+        card.setStyleSheet(
+            f'QFrame {{ background: {_PANEL}; border: 1px solid #383838; border-radius: 8px; }}'
+        )
+        row = QHBoxLayout(card)
+        row.setContentsMargins(20, 14, 20, 14)
+        row.setSpacing(12)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(3)
+        song_lbl = QLabel(f'{group.canonical_artist}  —  {group.canonical_title}')
+        song_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 13px; font-weight: 600; background: transparent; border: none;')
+        text_col.addWidget(song_lbl)
+
+        note_lbl = QLabel(
+            f'Keeping all {len(group.copies)} copies — won\'t ask about this set again.'
+        )
+        note_lbl.setStyleSheet(f'color: {_DIM}; font-size: 12px; background: transparent; border: none;')
+        text_col.addWidget(note_lbl)
+        row.addLayout(text_col, stretch=1)
+
+        undo_btn = QPushButton('Undo')
+        undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        undo_btn.setFixedHeight(30)
+        undo_btn.setStyleSheet(
+            f'QPushButton {{ background: transparent; color: {_MUTED}; '
+            f'border: 1px solid #444444; border-radius: 6px; padding: 0 14px; font-size: 12px; }}'
+            f'QPushButton:hover {{ color: {_CREAM}; border-color: {_CREAM}; }}'
+        )
+        undo_btn.clicked.connect(lambda _checked=False, i=idx: self._on_undo_dismiss(i))
+        row.addWidget(undo_btn)
+
+        return card
+
+    def _on_keep_all(self, idx: int) -> None:
+        group = self._groups[idx]
+        self._dismissed.add(idx)
+        self._winner_overrides.pop(idx, None)
+        if self._library_path is not None:
+            add_dismissed(self._library_path, group_fingerprint(group))
+        self._populate_results()
+
+    def _on_undo_dismiss(self, idx: int) -> None:
+        group = self._groups[idx]
+        self._dismissed.discard(idx)
+        if self._library_path is not None:
+            remove_dismissed(self._library_path, group_fingerprint(group))
+        self._populate_results()
 
     def _build_copy_row(
         self,
@@ -778,7 +848,7 @@ class DuplicateReviewView(QWidget):
         classify_btn.setFixedHeight(44)
         classify_btn.setFixedWidth(260)
         classify_btn.setStyleSheet(
-            f'QPushButton {{ background: {_TEAL}; color: {_CREAM}; border: none; '
+            f'QPushButton {{ background: {_TEAL}; color: #ffffff; border: none; '
             f'border-radius: 6px; font-size: 14px; font-weight: 600; }}'
             f'QPushButton:hover {{ background: #38706a; }}'
             f'QPushButton:pressed {{ background: #2d6358; }}'

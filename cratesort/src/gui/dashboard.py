@@ -16,7 +16,7 @@ from PyQt6.QtCore import (
     Qt, QEasingCurve, QPropertyAnimation,
     QSettings, QThread, QTimer, QVariantAnimation, pyqtSignal,
 )
-from PyQt6.QtGui import QBrush, QColor, QFontMetrics, QPainter, QPen
+from PyQt6.QtGui import QBrush, QColor, QFontMetrics, QLinearGradient, QPainter, QPen
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
     QGridLayout, QHBoxLayout, QLabel,
@@ -539,10 +539,10 @@ class _ChangeReviewDialog(_CrateSortDialog):
         self._sync_btn = QPushButton('Sync && Proceed')
         self._sync_btn.setFixedHeight(36)
         self._sync_btn.setStyleSheet(
-            'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+            'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
             'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-            'QPushButton:hover { background-color: #be6e2c; }'
-            'QPushButton:pressed { background-color: #aa5d21; }'
+            'QPushButton:hover { background-color: #925521; }'
+            'QPushButton:pressed { background-color: #7e491c; }'
         )
         self._sync_btn.clicked.connect(self._on_sync)
 
@@ -593,10 +593,10 @@ class _ChangeReviewDialog(_CrateSortDialog):
             revert_btn = QPushButton('Revert')
             revert_btn.setFixedHeight(36)
             revert_btn.setStyleSheet(
-                'QPushButton { background: #C75B5B; color: #ffffff; font-size: 13px; font-weight: 600; '
+                'QPushButton { background: #c35050; color: #ffffff; font-size: 13px; font-weight: 600; '
                 'border: none; border-radius: 6px; padding: 0 12px; }'
-                'QPushButton:hover { background: #b24c4c; }'
-                'QPushButton:pressed { background: #9c3b3b; }'
+                'QPushButton:hover { background: #b03c3c; }'
+                'QPushButton:pressed { background: #973434; }'
             )
             revert_btn.clicked.connect(
                 lambda _, i=idx, f=frame, d=desc_lbl, t=time_lbl, b=revert_btn: self._on_revert(i, f, d, b)
@@ -626,10 +626,10 @@ class _ChangeReviewDialog(_CrateSortDialog):
             )
             btn.setText('Revert')
             btn.setStyleSheet(
-                'QPushButton { background: #C75B5B; color: #ffffff; font-size: 11px; font-weight: 600; '
+                'QPushButton { background: #c35050; color: #ffffff; font-size: 11px; font-weight: 600; '
                 'border: none; border-radius: 4px; padding: 2px 10px; }'
-                'QPushButton:hover { background: #b24c4c; }'
-                'QPushButton:pressed { background: #9c3b3b; }'
+                'QPushButton:hover { background: #b03c3c; }'
+                'QPushButton:pressed { background: #973434; }'
             )
         else:
             # Mark as pending revert
@@ -656,10 +656,10 @@ class _ChangeReviewDialog(_CrateSortDialog):
         if n_pending == 0:
             self._sync_btn.setText('Sync && Proceed')
             self._sync_btn.setStyleSheet(
-                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
                 'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #be6e2c; }'
-                'QPushButton:pressed { background-color: #aa5d21; }'
+                'QPushButton:hover { background-color: #925521; }'
+                'QPushButton:pressed { background-color: #7e491c; }'
             )
         elif n_pending == n_total:
             self._sync_btn.setText('Accept && Continue')
@@ -672,10 +672,10 @@ class _ChangeReviewDialog(_CrateSortDialog):
         else:
             self._sync_btn.setText('Apply && Proceed')
             self._sync_btn.setStyleSheet(
-                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
                 'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #be6e2c; }'
-                'QPushButton:pressed { background-color: #aa5d21; }'
+                'QPushButton:hover { background-color: #925521; }'
+                'QPushButton:pressed { background-color: #7e491c; }'
             )
 
     # ── Sync action ───────────────────────────────────────────────────────────
@@ -766,6 +766,74 @@ class _ChangeReviewDialog(_CrateSortDialog):
         if dt.year == now.year:
             return f'{dt.strftime("%b")} {dt.day} at {dt.strftime("%I:%M %p").lstrip("0")}'
         return f'{dt.strftime("%b")} {dt.day}, {dt.year}'
+
+
+# ---------------------------------------------------------------------------
+# _ScanActivityBeam — bounded sweeping "still working" cue for the scan banner
+# ---------------------------------------------------------------------------
+
+class _ScanActivityBeam(QWidget):
+    """A soft comet of light that sweeps back and forth in a fixed-width track.
+
+    NOT a progress bar and must never be read as one: it never grows, never
+    reaches 100%, and always returns to where it started. That's what keeps
+    it compliant with the no-fake-progress rule — a real progress bar claims
+    to measure completion (`setRange(0, total)`); this only claims "still
+    alive," the same job the pulsing mascot already does, just filling the
+    dead horizontal space next to it. Height (3px) and motion (bounded
+    ping-pong, soft gradient) are deliberately distinct from the locked
+    determinate-progress-bar spec (8px, hard-edged teal fill) so it can never
+    be mistaken for one.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(3)
+        self._pos = 0.0
+
+        curve = QEasingCurve(QEasingCurve.Type.InOutSine)
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(1800)  # distinct cadence from the mascot's 1100ms pulse
+        self._anim.setStartValue(0.0)
+        self._anim.setKeyValueAt(0.5, 1.0)
+        self._anim.setEndValue(0.0)
+        self._anim.setEasingCurve(curve)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._on_value_changed)
+
+    def start(self) -> None:
+        self._anim.start()
+
+    def stop(self) -> None:
+        self._anim.stop()
+
+    def _on_value_changed(self, value: float) -> None:
+        self._pos = value
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#383838'))
+        painter.drawRoundedRect(rect, 1.5, 1.5)
+
+        w = rect.width()
+        if w <= 0:
+            painter.end()
+            return
+        comet_w = max(24, int(w * 0.32))
+        cx = self._pos * max(0, w - comet_w)
+
+        gradient = QLinearGradient(cx, 0, cx + comet_w, 0)
+        gradient.setColorAt(0.0, QColor(66, 129, 117, 0))
+        gradient.setColorAt(0.5, QColor(66, 129, 117, 220))
+        gradient.setColorAt(1.0, QColor(66, 129, 117, 0))
+        painter.setBrush(QBrush(gradient))
+        painter.drawRoundedRect(int(cx), 0, comet_w, rect.height(), 1.5, 1.5)
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -942,26 +1010,34 @@ class DashboardWidget(QWidget):
         card_layout.setSpacing(16)
 
         if saved_path is None:
-            instr = QLabel()
-            instr.setTextFormat(Qt.TextFormat.RichText)
-            instr.setText(
-                '<div style="line-height: 145%; text-align: center;">'
-                'Select the root folder of your music library.<br>'
-                'CrateSort will scan all media files inside it, including subfolders.'
+            heading = QLabel('Point CrateSort to your _Serato_ folder and media files.')
+            heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            heading.setWordWrap(True)
+            heading.setStyleSheet(
+                'color: #f1e3c8; font-size: 14px; font-weight: 600; background: transparent; border: none;'
+            )
+            card_layout.addWidget(heading)
+
+            subtext = QLabel()
+            subtext.setTextFormat(Qt.TextFormat.RichText)
+            subtext.setText(
+                '<div style="line-height: 125%;">'
+                "If they're in different locations you'll need to move them into the "
+                'same folder to enable crate management and export features.'
                 '</div>'
             )
-            instr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            instr.setWordWrap(True)
-            instr.setStyleSheet('color: #d5c7ad; font-size: 13px; background: transparent; border: none;')
-            card_layout.addWidget(instr)
+            subtext.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            subtext.setWordWrap(True)
+            subtext.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
+            card_layout.addWidget(subtext)
 
-            btn = QPushButton('Select Music Library…')
+            btn = QPushButton('Select Your Serato & Media Folder')
             btn.setMinimumHeight(42)
             btn.setStyleSheet(
-                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
                 'border-radius: 6px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #be6e2c; }'
-                'QPushButton:pressed { background-color: #aa5d21; }'
+                'QPushButton:hover { background-color: #925521; }'
+                'QPushButton:pressed { background-color: #7e491c; }'
             )
             btn.clicked.connect(self._on_select_library)
             card_layout.addWidget(btn)
@@ -987,10 +1063,10 @@ class DashboardWidget(QWidget):
             btn = QPushButton('Select Music Library…')
             btn.setMinimumHeight(42)
             btn.setStyleSheet(
-                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
                 'border-radius: 6px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #be6e2c; }'
-                'QPushButton:pressed { background-color: #aa5d21; }'
+                'QPushButton:hover { background-color: #925521; }'
+                'QPushButton:pressed { background-color: #7e491c; }'
             )
             btn.clicked.connect(self._on_select_library)
             card_layout.addWidget(btn)
@@ -1016,10 +1092,10 @@ class DashboardWidget(QWidget):
             load_btn = QPushButton('Manage Last Library')
             load_btn.setMinimumHeight(42)
             load_btn.setStyleSheet(
-                'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+                'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
                 'border-radius: 6px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #be6e2c; }'
-                'QPushButton:pressed { background-color: #aa5d21; }'
+                'QPushButton:hover { background-color: #925521; }'
+                'QPushButton:pressed { background-color: #7e491c; }'
             )
 
             choose_btn = QPushButton('Choose Different Library')
@@ -1086,7 +1162,10 @@ class DashboardWidget(QWidget):
             f'border-radius: 10px; }}'
         )
         panel_h = QHBoxLayout(panel)
-        panel_h.setContentsMargins(18, 16, 18, 16)
+        # Margins are 1px asymmetric (16/17) so this panel's sizeHint lands on
+        # exactly the same height as the stat-card row it's replaced by once the
+        # scan finishes — otherwise the layout visibly jumps at that transition.
+        panel_h.setContentsMargins(18, 16, 18, 17)
         panel_h.setSpacing(14)
 
         self._mascot: Optional[QSvgWidget] = None
@@ -1108,21 +1187,42 @@ class DashboardWidget(QWidget):
             anim.setLoopCount(-1)
             self._mascot = mascot
             self._mascot_anim = anim
-            panel_h.addWidget(mascot)
+            panel_h.addWidget(mascot, alignment=Qt.AlignmentFlag.AlignVCenter)
             anim.start()
 
+        # Hero readout — live file count in the same big-number language as the
+        # stat cards it will be replaced by, so a large (e.g. 20k-track) library
+        # reads as active progress rather than just a pulsing icon.
         text_col = QVBoxLayout()
-        text_col.setSpacing(2)
-        self._scan_label = QLabel('Scanning library…')
-        self._scan_label.setStyleSheet(
-            'font-size: 14px; font-weight: 500; color: #f1e3c8; background: transparent; border: none;'
+        text_col.setSpacing(3)
+
+        count_row = QHBoxLayout()
+        count_row.setSpacing(6)
+        self._scan_found_num = QLabel('0')
+        self._scan_found_num.setStyleSheet(
+            'font-size: 26px; font-weight: 500; color: #f1e3c8; background: transparent; border: none;'
         )
-        self._scan_count = QLabel('Discovering files…')
-        self._scan_count.setStyleSheet(
+        count_row.addWidget(self._scan_found_num, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        self._scan_label = QLabel('files found')
+        self._scan_label.setStyleSheet(
             'font-size: 12px; color: #a89b85; background: transparent; border: none;'
         )
-        text_col.addWidget(self._scan_label)
+        count_row.addWidget(self._scan_label, alignment=Qt.AlignmentFlag.AlignBottom)
+        count_row.addStretch(1)
+        text_col.addLayout(count_row)
+
+        self._scan_count = QLabel('Discovering files…')
+        self._scan_count.setStyleSheet(
+            'font-size: 11px; color: #7a6a55; letter-spacing: 0.02em; background: transparent; border: none;'
+        )
         text_col.addWidget(self._scan_count)
+
+        text_col.addSpacing(6)
+        self._scan_beam = _ScanActivityBeam()
+        text_col.addWidget(self._scan_beam)
+        self._scan_beam.start()
+
         panel_h.addLayout(text_col, stretch=1)
 
         self._scan_cancel = QPushButton('Cancel')
@@ -1302,10 +1402,10 @@ class DashboardWidget(QWidget):
         btn = QPushButton('Review Duplicates')
         btn.setFixedHeight(36)
         btn.setStyleSheet(
-            'QPushButton { background: #D17D34; color: #ffffff; border: none; '
+            'QPushButton { background: #aa6326; color: #ffffff; border: none; '
             'border-radius: 6px; padding: 0 18px; font-size: 13px; font-weight: 600; }'
-            'QPushButton:hover { background: #be6e2c; }'
-            'QPushButton:pressed { background: #aa5d21; }'
+            'QPushButton:hover { background: #925521; }'
+            'QPushButton:pressed { background: #7e491c; }'
         )
         btn.clicked.connect(self.duplicates_requested.emit)
         row.addWidget(btn)
@@ -1692,7 +1792,8 @@ class DashboardWidget(QWidget):
         self.status_message.emit('', '')
 
     def _on_scan_progress(self, count: int, dir_name: str) -> None:
-        self._scan_count.setText(f'{count:,} files found…  ({dir_name})')
+        self._scan_found_num.setText(f'{count:,}')
+        self._scan_count.setText(f'Scanning “{dir_name}”…')
 
     def _on_scan_finished(self, inventory, summary) -> None:
         if self._scan_cancelled:
@@ -1757,7 +1858,10 @@ class DashboardWidget(QWidget):
             return
         try:
             from collections import defaultdict
-            from cratesort.src.core.duplicate_detector import DuplicateDetector
+            from cratesort.src.core.duplicate_detector import (
+                DuplicateDetector, group_fingerprint, summarize_groups,
+            )
+            from cratesort.src.core.duplicate_dismissals import load_dismissed
             from cratesort.src.serato.database_reader import read_track_play_counts
 
             counts: dict[str, int] = defaultdict(int)
@@ -1775,6 +1879,14 @@ class DashboardWidget(QWidget):
                 crate_count_map=crate_count_map,
                 play_count_map=play_count_map,
             )
+
+            # Drop groups the user previously said to always keep — they never
+            # reach the banner count or the review screen.
+            dismissed = load_dismissed(self._library_path) if self._library_path else set()
+            if dismissed:
+                groups  = [g for g in groups if group_fingerprint(g) not in dismissed]
+                summary = summarize_groups(groups, skipped_count=summary.skipped_count)
+
             self._dup_groups  = groups
             self._dup_summary = summary
         except Exception as exc:

@@ -361,14 +361,14 @@ class _UnsavedChangesDialog(_CrateSortDialog):
         leave_btn = QPushButton('Leave Anyway')
         leave_btn.setFixedHeight(36)
         leave_btn.setStyleSheet(
-            'QPushButton { background: #C75B5B; color: #ffffff; border: none; '
+            'QPushButton { background: #c35050; color: #ffffff; border: none; '
             'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-            'QPushButton:hover { background: #b24c4c; }'
-            'QPushButton:pressed { background: #9c3b3b; }'
+            'QPushButton:hover { background: #b03c3c; }'
+            'QPushButton:pressed { background: #973434; }'
         )
         leave_btn.clicked.connect(self.accept)
 
-        stay_btn = QPushButton('Stay and Finish')
+        stay_btn = QPushButton('Stay & Finish')
         stay_btn.setFixedHeight(36)
         stay_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
@@ -417,6 +417,7 @@ class _AnimatedStatCardWidget(QFrame):
         self._title_label = QLabel(title)
         self._title_label.setProperty('role', 'stat_label')
         self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setWordWrap(True)
         self._title_label.setStyleSheet(
             'font-size: 10px; color: #a89b85; letter-spacing: 0.06em; '
             'background: transparent; border: none;'
@@ -451,18 +452,18 @@ class _AnimatedStatCardWidget(QFrame):
 # ---------------------------------------------------------------------------
 
 class _AnalyzeLibraryModal(_CrateSortDialog):
-    """Frameless 520×280 card displayed over the overlay during auto-classify."""
+    """Frameless card displayed over the overlay during auto-classify."""
 
     review_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(520, 320)
+        self.setFixedWidth(720)
 
         # Use standard Teal accent layout (safe action/progress)
         layout = _create_dialog_layout(self)
 
-        headline = QLabel('Analyzing Library')
+        headline = QLabel('Analyzing Library…')
         headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         headline.setStyleSheet(
             'color: #f1e3c8; font-size: 22px; font-weight: 600; '
@@ -473,7 +474,13 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
 
         subtitle = QLabel()
         subtitle.setTextFormat(Qt.TextFormat.RichText)
-        subtitle.setText('<div style="line-height: 145%; text-align: center;">Analyzing your DJ library and media files – validating artists and genres...</div>')
+        subtitle.setText(
+            '<div style="line-height: 145%; text-align: center;">'
+            "If your library is big, this'll take a while. We're scanning all of "
+            "your media files to see if the metadata is correct. You'll be able "
+            'to approve, deny, and edit our suggested changes next.'
+            '</div>'
+        )
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet(
             'color: #d5c7ad; font-size: 13px; background: transparent; border: none;'
@@ -482,16 +489,38 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
         layout.addWidget(subtitle)
         layout.addSpacing(8)
 
-        # Stat cards row
+        # Stat cards row — file-count story first (total, then its recognized/
+        # unrecognized breakdown), then the artist/genre payoff that comes out
+        # of it, so related numbers read as one connected block left to right.
         cards_row = QHBoxLayout()
         cards_row.setSpacing(10)
-        self._card_tracks  = _AnimatedStatCardWidget('Tracks Analyzed',   self)
-        self._card_artists = _AnimatedStatCardWidget('Artists Classified', self)
-        self._card_fixes   = _AnimatedStatCardWidget('Corrections Made',   self)
-        cards_row.addWidget(self._card_tracks)
+        self._card_files        = _AnimatedStatCardWidget('Files Analyzed',      self)
+        self._card_recognized   = _AnimatedStatCardWidget('Files Recognized',    self)
+        self._card_unrecognized = _AnimatedStatCardWidget('Files Unrecognized',  self)
+        self._card_artists      = _AnimatedStatCardWidget('Artists Recognized',  self)
+        self._card_genres       = _AnimatedStatCardWidget('Genres Recognized',   self)
+        cards_row.addWidget(self._card_files)
+        cards_row.addWidget(self._card_recognized)
+        cards_row.addWidget(self._card_unrecognized)
         cards_row.addWidget(self._card_artists)
-        cards_row.addWidget(self._card_fixes)
+        cards_row.addWidget(self._card_genres)
         layout.addLayout(cards_row)
+        layout.addSpacing(4)
+
+        # Footer note — the "why this matters" payoff, always visible (not just
+        # on completion) so it's read while people are still watching the cards.
+        footer = QLabel()
+        footer.setTextFormat(Qt.TextFormat.RichText)
+        footer.setText(
+            '<div style="line-height: 140%; text-align: center;">'
+            'This stage not only helps you find and sort your files, but it will '
+            'help determine where your files go during the Organize stage.'
+            '</div>'
+        )
+        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        footer.setWordWrap(True)
+        footer.setStyleSheet('color: #a89b85; font-size: 11px; background: transparent; border: none;')
+        layout.addWidget(footer)
 
         # Action stack — fixed height keeps modal dimensions stable on transition
         self._action_stack = QStackedWidget()
@@ -534,10 +563,19 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
 
         layout.addWidget(self._action_stack)
 
-    def update_stats(self, tracks_count: int, artists_count: int) -> None:
-        self._card_tracks.update_target(tracks_count)
-        self._card_artists.update_target(artists_count)
-        # TODO: Corrections Made — real-time comparison signal not yet available
+    def update_stats(
+        self,
+        files_analyzed: int,
+        files_recognized: int,
+        files_unrecognized: int,
+        artists_recognized: int,
+        genres_recognized: int,
+    ) -> None:
+        self._card_files.update_target(files_analyzed)
+        self._card_recognized.update_target(files_recognized)
+        self._card_unrecognized.update_target(files_unrecognized)
+        self._card_artists.update_target(artists_recognized)
+        self._card_genres.update_target(genres_recognized)
 
     def update_percent(self, percent: int) -> None:
         self._progress_bar.setValue(percent)
@@ -597,9 +635,9 @@ class LibraryBrowserView(QWidget):
         self._analyze_modal:          Optional[_AnalyzeLibraryModal] = None
         self._auto_classify_session                                   = None
         self._processed_artists:      set                            = set()
-        self._processed_tracks_count: int                            = 0
-        self._auto_artist_tracks_map: dict                           = {}
-        self._auto_dj_tools_count:    int                            = 0
+        self._processed_files_count:  int                            = 0
+        self._recognized_files_count: int                            = 0
+        self._seen_genres:            set                            = set()
 
         # Inline editor state — at most one open at a time
         self._edit_item:     Optional[QTreeWidgetItem] = None
@@ -844,7 +882,7 @@ class LibraryBrowserView(QWidget):
         accept_btn = QPushButton('Accept Reclassifications')
         accept_btn.setFixedHeight(36)
         accept_btn.setStyleSheet(
-            'QPushButton { background: #428175; color: #f1e3c8; border: none; '
+            'QPushButton { background: #428175; color: #ffffff; border: none; '
             'border-radius: 6px; padding: 0 16px; font-size: 13px; font-weight: 600; }'
             'QPushButton:hover { background: #38706a; }'
             'QPushButton:pressed { background: #2d6358; }'
@@ -878,7 +916,7 @@ class LibraryBrowserView(QWidget):
 
         self._classify_btn = QPushButton('Classify Library')
         self._classify_btn.setStyleSheet(
-            'QPushButton { background-color: #428175; color: #f1e3c8; '
+            'QPushButton { background-color: #428175; color: #ffffff; '
             'font-size: 13px; font-weight: 600; border: none; border-radius: 6px; '
             'padding: 0 16px; }'
             'QPushButton:hover { background-color: #38706a; }'
@@ -923,7 +961,7 @@ class LibraryBrowserView(QWidget):
 
         classify_btn = QPushButton('Classify Library')
         classify_btn.setStyleSheet(
-            'QPushButton { background-color: #428175; color: #f1e3c8; '
+            'QPushButton { background-color: #428175; color: #ffffff; '
             'font-size: 11px; font-weight: 500; border: none; border-radius: 4px; '
             'padding: 8px 20px; }'
             'QPushButton:hover { background-color: #38706a; }'
@@ -2215,40 +2253,10 @@ class LibraryBrowserView(QWidget):
                     pass
 
             # No session yet — show the Analyze Library modal and run the worker
-            from cratesort.src.gui.classifier_view import (
-                _extract_primary_artist, _canonical_artist,
-                DJ_TOOLS_LABEL, _DJ_TOOLS_FOLDER_PATTERNS,
-            )
-            _VIDEO_PURPOSE = frozenset({
-                'movie clips', '_movie clips', 'commercials', '_commercials',
-                'clips', 'films', 'visuals', '_visuals',
-            })
-
-            # Pre-compile artist → track_count map (mirrors _ClassifyWorker grouping)
-            artist_tracks_map: dict[str, int] = {}
-            dj_tools_count = 0
-            for rec in self._inventory:
-                raw_artist = rec.artist or ''
-                no_artist  = (
-                    not raw_artist
-                    or raw_artist.lower() in ('unknown artist', 'various', 'fx')
-                )
-                if rec.is_video:
-                    if any(p in str(rec.path).lower() for p in _VIDEO_PURPOSE):
-                        dj_tools_count += 1
-                        continue
-                if no_artist and rec.duration and rec.duration < 60:
-                    if any(p in str(rec.path).lower() for p in _DJ_TOOLS_FOLDER_PATTERNS):
-                        dj_tools_count += 1
-                        continue
-                primary, _ = _extract_primary_artist(raw_artist or 'Unknown Artist')
-                canonical  = _canonical_artist(primary)
-                artist_tracks_map[canonical] = artist_tracks_map.get(canonical, 0) + 1
-
-            self._auto_artist_tracks_map = artist_tracks_map
-            self._auto_dj_tools_count    = dj_tools_count
             self._processed_artists      = set()
-            self._processed_tracks_count = 0
+            self._processed_files_count  = 0
+            self._recognized_files_count = 0
+            self._seen_genres            = set()
 
             main_window = self.window()
             self._analyze_modal = _AnalyzeLibraryModal(main_window)
@@ -2294,18 +2302,22 @@ class LibraryBrowserView(QWidget):
 
     # ── Auto-classify modal slots ──────────────────────────────────────
 
-    def _on_auto_classify_progress(self, done: int, total: int, artist_name: str) -> None:
-        from cratesort.src.gui.classifier_view import DJ_TOOLS_LABEL
+    def _on_auto_classify_progress(self, done: int, total: int, info: dict) -> None:
         if self._analyze_modal is None:
             return
+        artist_name = info['artist']
         if artist_name not in self._processed_artists:
             self._processed_artists.add(artist_name)
-            if artist_name == DJ_TOOLS_LABEL:
-                self._processed_tracks_count += self._auto_dj_tools_count
-            else:
-                self._processed_tracks_count += self._auto_artist_tracks_map.get(artist_name, 0)
+            self._processed_files_count += info['track_count']
+            if info['recognized']:
+                self._recognized_files_count += info['track_count']
+                self._seen_genres.add(info['genre'])
         self._analyze_modal.update_stats(
-            self._processed_tracks_count, len(self._processed_artists)
+            files_analyzed=self._processed_files_count,
+            files_recognized=self._recognized_files_count,
+            files_unrecognized=self._processed_files_count - self._recognized_files_count,
+            artists_recognized=len(self._processed_artists),
+            genres_recognized=len(self._seen_genres),
         )
         if total > 0:
             self._analyze_modal.update_percent(int((done / total) * 100))
@@ -2331,13 +2343,20 @@ class LibraryBrowserView(QWidget):
         if self._analyze_modal is not None:
             modal = self._analyze_modal
             self._analyze_modal = None
-            modal.close()       # emits finished → _CrateSortDialog._cleanup_overlay handles scrim
-            modal.deleteLater()
-        self._auto_classify_session  = None
-        self._processed_artists      = set()
-        self._processed_tracks_count = 0
-        self._auto_artist_tracks_map = {}
-        self._auto_dj_tools_count    = 0
+            # _CrateSortDialog.done() defers the real close (and the overlay-scrim
+            # cleanup tied to `finished`) until its exit animation completes —
+            # deleteLater() right after close() used to race that animation and
+            # win, tearing down `_exit_anim` before `finished` ever fired and
+            # leaving the modal scrim stuck on screen. Deleting only once
+            # `finished` actually arrives lets the animation and overlay cleanup
+            # run to completion first.
+            modal.finished.connect(modal.deleteLater)
+            modal.close()
+        self._auto_classify_session   = None
+        self._processed_artists       = set()
+        self._processed_files_count   = 0
+        self._recognized_files_count  = 0
+        self._seen_genres             = set()
 
     def _enter_classify_mode(self, session) -> None:
         self._classify_mode = True

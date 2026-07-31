@@ -32,7 +32,7 @@ _TEAL     = '#428175'
 _SEP      = '#383838'
 _ROW_BASE = '#242424'
 _ROW_ALT  = '#2a2a2a'
-_DANGER   = '#C75B5B'
+_DANGER   = '#c35050'
 
 # Stack indices
 _STATE_GATE     = 0
@@ -450,10 +450,10 @@ class _UnclassifiedWarningDialog(_CrateSortDialog):
         proceed_btn = QPushButton('Proceed')
         proceed_btn.setFixedHeight(36)
         proceed_btn.setStyleSheet(
-            'QPushButton { background-color: #D17D34; color: #ffffff; border: none; '
+            'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
             'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-            'QPushButton:hover { background-color: #be6e2c; }'
-            'QPushButton:pressed { background-color: #aa5d21; }'
+            'QPushButton:hover { background-color: #925521; }'
+            'QPushButton:pressed { background-color: #7e491c; }'
         )
         proceed_btn.clicked.connect(self.accept)
 
@@ -734,8 +734,8 @@ class OrganizeView(QWidget):
                     f'QPushButton {{ background-color: {_DANGER}; color: #ffffff; '
                     f'border: none; border-radius: 6px; padding: 0 12px; '
                     f'font-size: 13px; font-weight: 600; }}'
-                    f'QPushButton:hover {{ background-color: #b24c4c; }}'
-                    f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
+                    f'QPushButton:hover {{ background-color: #b03c3c; }}'
+                    f'QPushButton:pressed {{ background-color: #973434; }}'
                 )
                 rb_btn.clicked.connect(
                     lambda _, p=log_path: self._on_rollback_requested(p)
@@ -1111,8 +1111,8 @@ class OrganizeView(QWidget):
             f'QPushButton {{ background-color: {_DANGER}; color: #ffffff; '
             f'border: none; border-radius: 5px; padding: 7px 16px; '
             f'font-size: 13px; font-weight: 600; min-height: 28px; }}'
-            f'QPushButton:hover {{ background-color: #b24c4c; }}'
-            f'QPushButton:pressed {{ background-color: #9c3b3b; }}'
+            f'QPushButton:hover {{ background-color: #b03c3c; }}'
+            f'QPushButton:pressed {{ background-color: #973434; }}'
             f'QPushButton:disabled {{ background-color: #3a3a3a; color: #a89b85; }}'
         )
         self._rollback_btn.clicked.connect(self._on_rollback_requested)

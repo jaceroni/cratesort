@@ -274,8 +274,6 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet(f'background: {C["border"]}; max-height: 1px;')
         layout.addWidget(sep)
 
-        layout.addSpacing(8)
-
         # Nav buttons (exclusive, checkable)
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
@@ -642,8 +640,10 @@ class MainWindow(QMainWindow):
         """
         Enable/disable nav buttons based on app state.
 
-        State 1/2 — No library or no Serato: Library, Crates, Organize disabled.
-        State 3   — Library + Serato present: all items enabled.
+        State 1 — No library: Library, Crates, Organize disabled.
+        State 2 — Library present, no Serato: only Crates disabled (it's the
+                  only tab that actually depends on a _Serato_ folder).
+        State 3 — Library + Serato present: all items enabled.
         While a scan is actively running, every tab except Dashboard stays
         disabled regardless of state — nothing else is ready to use yet.
         """
@@ -658,13 +658,12 @@ class MainWindow(QMainWindow):
             if scanning:
                 btn.setEnabled(False)
                 btn.setToolTip('Scanning your library — this tab will be available once the scan finishes.')
-            elif state <= 2 and i in (1, 2, 3):
+            elif state == 1 and i in (1, 2, 3):
                 btn.setEnabled(False)
-                btn.setToolTip(
-                    'Load a library to get started.'
-                    if state == 1 else
-                    'Serato folder not found at this library location.'
-                )
+                btn.setToolTip('Load a library to get started.')
+            elif state == 2 and i == 2:
+                btn.setEnabled(False)
+                btn.setToolTip('Serato folder not found at this library location.')
             else:
                 btn.setEnabled(True)
                 btn.setToolTip('')

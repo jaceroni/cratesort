@@ -101,7 +101,7 @@ class SettingsView(QWidget):
         path_col.addWidget(self._path_label)
         path_row.addLayout(path_col, stretch=1)
 
-        change_btn = self._action_btn('Change Library', _ORANGE, '#b8682a', '#9c5520')
+        change_btn = self._action_btn('Change Library', '#aa6326', '#925521', '#7e491c')
         change_btn.clicked.connect(self._on_change_library)
         path_row.addWidget(change_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         card_vbox.addLayout(path_row)
@@ -154,7 +154,7 @@ class SettingsView(QWidget):
         card_vbox.addLayout(self._setting_row(
             'Reset Track Table Columns',
             'Restore default column widths in the Crates and Library tabs.',
-            self._action_btn('Reset Columns', '#3a3a3a', '#4a4a4a', '#2a2a2a', text_color=_CREAM),
+            self._action_btn('Reset Columns', '#3a3a3a', '#4a4a4a', '#2a2a2a', text_color='#ffffff'),
             self._on_reset_columns,
         ))
 

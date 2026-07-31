@@ -310,9 +310,9 @@ def _ov_confirm(
     layout.addWidget(body_lbl)
     layout.addSpacing(12)
 
-    confirm_bg    = '#C75B5B' if confirm_danger else '#428175'
-    confirm_hover = '#b24c4c' if confirm_danger else '#38706a'
-    confirm_press = '#9c3b3b' if confirm_danger else '#2d6358'
+    confirm_bg    = '#c35050' if confirm_danger else '#428175'
+    confirm_hover = '#b03c3c' if confirm_danger else '#38706a'
+    confirm_press = '#973434' if confirm_danger else '#2d6358'
 
     yes_btn = QPushButton(confirm_text)
     yes_btn.setFixedHeight(36)

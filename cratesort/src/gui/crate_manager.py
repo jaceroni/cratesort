@@ -72,7 +72,7 @@ _TRACKS_MIME = 'application/x-cratesort-tracks'
 _MUTED  = '#a89b85'
 _CREAM  = '#f1e3c8'
 _TEAL   = '#428175'
-_ORANGE = '#D17D34'
+_ORANGE = '#aa6326'
 _PANEL  = '#2F2F2F'
 _BORDER = '#444444'
 
@@ -951,8 +951,29 @@ class _ExportProgressDialog(_CrateSortDialog):
 
 
 # ---------------------------------------------------------------------------
-# Crate Manager view
+# Launch Serato button — wraps to a second line instead of clipping when the
+# crate sidebar is narrowed (QPushButton has no native word-wrap, so the wrap
+# point is recomputed against actual width on every resize).
 # ---------------------------------------------------------------------------
+
+class _LaunchSeratoButton(QPushButton):
+
+    _ONE_LINE  = 'Save Crates && Launch Serato  ↗'
+    _LINE_ONE  = 'Save Crates &&'
+    _LINE_TWO  = 'Launch Serato  ↗'
+    _H_PADDING = 24  # matches the 12px/side CSS padding in its stylesheet
+
+    def __init__(self, parent=None):
+        super().__init__(self._ONE_LINE, parent)
+        self.setFixedHeight(44)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        available  = self.width() - self._H_PADDING
+        needs_wrap = self.fontMetrics().horizontalAdvance(self._ONE_LINE) > available
+        self.setText(f'{self._LINE_ONE}\n{self._LINE_TWO}' if needs_wrap else self._ONE_LINE)
+        self.setFixedHeight(58 if needs_wrap else 44)
+
 
 class CrateManagerView(QWidget):
     track_selected      = pyqtSignal(str)
@@ -1231,8 +1252,8 @@ class CrateManagerView(QWidget):
         new_crate_btn.setStyleSheet(
             f'QPushButton {{ background: {_ORANGE}; color: #ffffff; font-size: 13px; '
             f'font-weight: 600; border: none; border-radius: 6px; padding: 0 12px; }}'
-            f'QPushButton:hover {{ background: #b8682a; }}'
-            f'QPushButton:pressed {{ background: #9c5520; }}'
+            f'QPushButton:hover {{ background: #925521; }}'
+            f'QPushButton:pressed {{ background: #7e491c; }}'
         )
         new_crate_btn.clicked.connect(self._on_new_crate)
         row.addWidget(new_crate_btn)
@@ -1250,21 +1271,6 @@ class CrateManagerView(QWidget):
         )
         smart_crate_btn.clicked.connect(self._on_new_smart_crate)
         row.addWidget(smart_crate_btn)
-
-        row.addSpacing(24)
-
-        launch_serato_btn = QPushButton('▶ Launch Serato')
-        launch_serato_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        launch_serato_btn.setFixedHeight(36)
-        launch_serato_btn.setToolTip('Save your crates and open Serato')
-        launch_serato_btn.setStyleSheet(
-            f'QPushButton {{ background: {_TEAL}; color: #ffffff; font-size: 13px; '
-            f'font-weight: 600; border: none; border-radius: 6px; padding: 0 12px; }}'
-            f'QPushButton:hover {{ background: #38706a; }}'
-            f'QPushButton:pressed {{ background: #2d6358; }}'
-        )
-        launch_serato_btn.clicked.connect(self.launch_serato_requested.emit)
-        row.addWidget(launch_serato_btn)
 
         return tb
 
@@ -1365,6 +1371,31 @@ class CrateManagerView(QWidget):
         self._crate_drop_line.hide()
 
         layout.addWidget(self._crate_tree, stretch=1)
+
+        # Launch Serato — pulled out of the top toolbar (where it read as a
+        # third peer to New/Smart Crate) and anchored below the crate tree so
+        # its weight as the hand-off action is unambiguous.
+        launch_row = QFrame()
+        launch_row.setStyleSheet(
+            f'QFrame {{ background: #2F2F2F; border: none; '
+            f'border-right: 1px solid {_BORDER}; border-top: 1px solid {_BORDER}; }}'
+        )
+        launch_layout = QVBoxLayout(launch_row)
+        launch_layout.setContentsMargins(12, 12, 12, 12)
+
+        launch_serato_btn = _LaunchSeratoButton()
+        launch_serato_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        launch_serato_btn.setToolTip('Save your crates and open Serato')
+        launch_serato_btn.setStyleSheet(
+            f'QPushButton {{ background: {_TEAL}; color: #ffffff; font-size: 13px; '
+            f'font-weight: 600; border: none; border-radius: 8px; padding: 0 12px; }}'
+            f'QPushButton:hover {{ background: #38706a; }}'
+            f'QPushButton:pressed {{ background: #2d6358; }}'
+        )
+        launch_serato_btn.clicked.connect(self.launch_serato_requested.emit)
+        launch_layout.addWidget(launch_serato_btn)
+
+        layout.addWidget(launch_row)
         return panel
 
     # ── Track panel (right) ────────────────────────────────────────────
@@ -1489,7 +1520,7 @@ class CrateManagerView(QWidget):
     def _build_status_bar(self) -> QFrame:
         bar = QFrame()
         bar.setStyleSheet(
-            f'QFrame {{ background: {_PANEL}; border-top: 1px solid {_BORDER}; }}'
+            f'QFrame {{ background: {_PANEL}; border: none; }}'
         )
         row = QHBoxLayout(bar)
         row.setContentsMargins(16, 6, 16, 6)
