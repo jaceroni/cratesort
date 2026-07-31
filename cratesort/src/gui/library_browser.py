@@ -858,10 +858,11 @@ class LibraryBrowserView(QWidget):
         msg = QLabel()
         msg.setTextFormat(Qt.TextFormat.RichText)
         msg.setText(
-            '<div style="line-height: 16.5px;">This is your library how we see it — review the '
-            'artists and their nested files. Right-click/double-click an artist or their tracks '
-            'to correct anything that looks off. Not sure about something? Change its genre to '
-            "'Unclassified' and move on. Your files are not touched until you reorganize.</div>"
+            '<div style="line-height: 19px;">Here’s your library as we see it: sorted and '
+            'grouped by artist. Double-click an artist row to reveal associated files. Right-click '
+            'a file to approve or edit artist association. This step ensures that '
+            'your files are classified correctly. All folders and filenames echo what is seen here. '
+            "If you're unsure, mark it Unclassified. You can always come back and change it.</div>"
         )
         msg.setWordWrap(True)
         msg.setStyleSheet(

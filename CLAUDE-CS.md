@@ -66,19 +66,23 @@ CrateSort is the single writer. Serato is the reader. CrateSort handles all orga
 - **Deeper dark** (active parent crate): `#000000`
 - **Cream text**: `#f1e3c8`
 - **Orange accent / selection**: `#D17D34`
+- **Orange button fill**: `#aa6326` (darkened 2026-07-30 — see below)
 - **Selected crate / warm brown**: `#573d26`
 - **Teal action color**: `#428175`
-- **Red / cancel / destructive**: `#C75B5B`
+- **Red / cancel / destructive (non-button)**: `#C75B5B`
+- **Red button fill**: `#c35050` (darkened 2026-07-30 — see below)
 - **Row separator**: `#383838`
 - **Grid lines**: `#383838`
 - **Branch connector lines**: `#4a4a4a`
 
 ### Color rules (critical)
 
-- **Teal (`#428175`) = action.** Drag indicators, status confirmations, active Undo/Redo buttons, teal flashes on inline edits.
-- **Orange (`#D17D34`) = selection / CTA.** Selected crate highlight, step numbers, New Crate button, primary action cards.
-- **Red (`#C75B5B`) = cancel / undo / destructive.** Every Cancel, Rollback, Revert, Delete, and Stop button. Hover: `#b24c4c`. Pressed: `#9c3b3b`. No exceptions.
+- **Teal (`#428175`) = action.** Drag indicators, status confirmations, active Undo/Redo buttons, teal flashes on inline edits. White button text already clears WCAG AA (4.54:1) unchanged.
+- **Orange (`#D17D34`) = selection / CTA for non-button uses** (selected crate highlight, step numbers, icon fills, accent text/borders). **Button fills use the darkened `#aa6326` instead** — white text on the original brighter orange only hit 3.14:1, failing WCAG AA's 4.5:1 minimum; `#aa6326` clears it (4.64:1). Hover `#925521`, pressed `#7e491c`.
+- **Red (`#C75B5B`) = cancel / undo / destructive for non-button uses** (error text, accents). **Button fills use the darkened `#c35050` instead** — same AA-contrast reasoning as orange (white text on `#C75B5B` was 4.17:1, still short of 4.5:1). Hover `#b03c3c`, pressed `#973434`. No exceptions.
 - **Never swap teal and orange roles.**
+- **All button text is white (`#ffffff`), never cream.** Cream on any of the three fill colors above fails or barely clears AA contrast — cream is reserved for text on dark panel/background surfaces, not button fills. Locked 2026-07-30.
+- **Button labels use `&`, never the word "and."** Matches the existing PyQt6 `&&`-escaping convention for literal ampersands.
 
 ### Button hover rule
 
@@ -129,8 +133,12 @@ After reorg or rollback completes, `OrganizeView.reorg_completed` fires → `Mai
 
 The launch screen is a context-aware single screen — no popup dialog. It lives in `DashboardWidget._build_welcome()` as stack index 0.
 
-### First launch (no saved library path):
-- Shows `cs-logo-mascot-stacked.svg` logo, tagline, single "Select Music Library…" button
+### First launch (no saved library path), copy updated 2026-07-30:
+- Shows `cs-logo-mascot-stacked.svg` logo, tagline
+- Heading (14px, weight 600, cream): "Point CrateSort to your `_Serato_` folder and media files."
+- Subtext (12px, muted `#a89b85`): "If they're in different locations you'll need to move them into the same folder to enable crate management and export features."
+- Button: "Select Your Serato & Media Folder" (no ellipsis — a longer label here visibly crowded the button)
+- This wording deliberately implies the ideal folder structure (one folder containing both media and `_Serato_` as siblings) without hard-requiring it — see Nav state rules above for what happens when `_Serato_` isn't found at the picked location (only Crates gets gated, not the whole app)
 
 ### Returning user (saved library path exists):
 - Same logo and tagline
@@ -161,10 +169,15 @@ The launch screen is a context-aware single screen — no popup dialog. It lives
 - Library, Crates, Organize, **and Settings**: all disabled, tooltip: "Scanning your library — this tab will be available once the scan finishes." (Settings has nothing useful to offer at this point either — see `MainWindow._is_scanning_in_progress()`.)
 - The "Manage Library / Manage Crates / Organize Media" cards on the dashboard itself are also grayed out (`_WorkflowCard.set_disabled(True)`) for the same reason, even though the tab click would be a no-op anyway.
 
-**Library loaded, scan complete:**
+**Library loaded, scan complete, `_Serato_` folder found:**
 - All nav items: Active
 - No classification gate on any nav item
 - Organize shows warning dialog if unclassified tracks exist — does NOT hard block
+
+**Library loaded, scan complete, no `_Serato_` folder found (added 2026-07-30):**
+- Library and Organize: **Active** — neither has a real dependency on Serato (Library edits write tags directly via mutagen; Organize's `FileOrganizer` already guards every Serato-specific step with `if plan.serato_dir and plan.serato_dir.exists()`)
+- Crates: **Disabled**, tooltip "Serato folder not found at this library location." — this is the only tab that actually needs `_Serato_` to do anything (reads/writes crate files). `CrateManagerView.load()` also has its own independent empty-state check for this (`serato_dir.exists()` → empty-state page, "No Serato library found. Go to Settings to load a library that contains a `_Serato_` folder.")
+- `MainWindow._apply_nav_state()` implements this as three explicit states (1/2/3) rather than the old `state <= 2` collapse that used to disable Library/Crates/Organize together — see `_get_app_state()` docstring for the exact state numbers.
 
 Stale library path (saved in QSettings but no longer exists on disk): path and `always_load_last` both cleared from QSettings immediately; welcome screen shown in first-launch state (commit 739c97e).
 
@@ -205,15 +218,17 @@ When `load()` runs and `_is_classification_complete()` returns `False` **and `se
 When the user tries to navigate away from Library while in classify mode, `_UnsavedClassifyDialog` appears with:
 - **Headline**: "Classifications not saved"
 - **Body**: "You haven't accepted your classifications yet — your genre corrections won't be written to your files until you do."
-- **Primary button (teal)**: "Stay and Finish" — closes dialog, keeps user in classify mode
+- **Primary button (teal)**: "Stay & Finish" — closes dialog, keeps user in classify mode
 - **Secondary button (red)**: "Leave Anyway" — exits classify mode, allows navigation
 
 This dialog is the only navigate-away guard for classify mode. Do not add additional dialogs or change these labels without explicit approval.
 
-### Classify mode banner copy (locked)
+### Classify mode banner copy (locked, updated 2026-07-30)
 
 The classify mode banner reads:
-> "This is your library how we see it — review the artists and their nested files. Right-click/double-click an artist or their tracks to correct anything that looks off. Not sure about something? Change its genre to 'Unclassified' and move on. Your files are not touched until you reorganize."
+> "Here's your library as we see it: sorted and grouped by artist. Double-click an artist row to reveal associated files. Right-click a file to approve or edit artist association. This step ensures that your files are classified correctly. All folders and filenames echo what is seen here. If you're unsure, mark it Unclassified. You can always come back and change it."
+
+Rendered as rich text with `line-height: 19px` (was 16.5px — increased 2026-07-30, felt too tight). No em dash — Brandy's "no em dashes in UI copy" rule applies; use a colon or restructure instead.
 
 Do not change this copy without explicit approval.
 
@@ -225,23 +240,24 @@ Three classes live in `library_browser.py`, inserted before `LibraryBrowserView`
 
 **`_ModalOverlay`** — now lives in `src/gui/overlays.py`. See **Dialog & Overlay Architecture** section below.
 
-**`_AnalyzeLibraryModal(_CrateSortDialog)`** — inherits `_CrateSortDialog` from `overlays.py` (overlay scrim + bounce animation handled by base class). Fixed `520×280`. Inner `QFrame#modal_container` (`#2F2F2F`, 1px `#444444` border, 12px radius) provides the visual surface. Contains:
-- Headline + subtitle labels
-- Row of 3 `_AnimatedStatCardWidget` cards: Tracks Analyzed, Artists Classified, Corrections Made (last one stays at 0 — `# TODO: real-time comparison signal not yet available`)
+**`_AnalyzeLibraryModal(_CrateSortDialog)`** — inherits `_CrateSortDialog` from `overlays.py` (overlay scrim + bounce animation handled by base class). **`setFixedWidth(720)` only — height is NOT fixed** (rebuilt 2026-07-30; the old `setFixedSize(520, 320)` fought the base class's own `adjustSize()`-based sizing and squeezed the stat cards below their minimum height, causing overlapping/clipped text at real-world DPI). Inner `QFrame#modal_container` (`#2F2F2F`, 1px `#444444` border, 12px radius) provides the visual surface. Contains:
+- Headline "Analyzing Library…" + subtitle
+- Row of **5** `_AnimatedStatCardWidget` cards, in this order (grouped so related numbers read together — file-count story first, then the artist/genre payoff): **Files Analyzed → Files Recognized → Files Unrecognized → Artists Recognized → Genres Recognized**. All five are live and real — the old 3-card version's "Corrections Made" card is gone; it always showed a hardcoded 0 (`# TODO: real-time comparison signal not yet available`) and was removed rather than kept faking data. Card title labels have `setWordWrap(True)` so they're never clipped regardless of DPI-driven dialog padding.
+- Footer note (always visible, neutral `#a89b85` styling, no warning icon): "This stage not only helps you find and sort your files, but it will help determine where your files go during the Organize stage."
 - `QStackedWidget` (fixed 45px height, no layout jump):
   - Page 0: 4px `QProgressBar` (`#383838` bg, `#428175` chunk), determinate from first progress tick
   - Page 1: "Review Results" button (180×36px, teal)
 - `review_requested = pyqtSignal()` — emitted by the button
 
-**API:** `update_stats(tracks_count, artists_count)`, `update_percent(percent)`, `on_classification_complete()` (switches stack to page 1).
+**API:** `update_stats(files_analyzed, files_recognized, files_unrecognized, artists_recognized, genres_recognized)`, `update_percent(percent)`, `on_classification_complete()` (switches stack to page 1).
 
-**Pre-compile step** (before starting worker): iterates `self._inventory` using the same DJ-tools/video grouping logic as `_ClassifyWorker.run()` to build `_auto_artist_tracks_map: dict[str, int]` and `_auto_dj_tools_count: int`. Progress slot uses these to increment `_processed_tracks_count` as each artist name arrives.
+**Data flow (rewritten 2026-07-30):** `_ClassifyWorker.progress` now emits `(done, total, info)` where `info` is a dict — `{'artist', 'track_count', 'genre', 'recognized'}` — computed per-artist in `_ClassifyWorker.run()` (classifier_view.py) right after that artist's genre vote resolves, not before. `recognized = proposed_genre != 'Unclassified' and overall_conf != 'NONE'`. `library_browser.py`'s `_on_auto_classify_progress` accumulates: `_processed_files_count` (running total), `_recognized_files_count` (only when `recognized`), `_seen_genres` (a set, only when `recognized` — `Unclassified` is never counted as a "genre recognized"). This replaced an older, now-removed pre-compile step (`_auto_artist_tracks_map`/`_auto_dj_tools_count`) that duplicated the worker's own grouping logic just to know track counts per artist — no longer needed since the worker reports `track_count` directly.
 
-**Cleanup:** `_cleanup_auto_classify_ui()` — calls `modal.close()` which emits `finished` → `_CrateSortDialog._cleanup_overlay` tears down the scrim automatically. Resets all `_auto_*` state fields. Called by `_on_review_results_clicked` (then enters classify mode with `_auto_classify_session`) and `_on_auto_classify_error`.
+**Cleanup — real bug fixed 2026-07-30:** `_cleanup_auto_classify_ui()` used to call `modal.close(); modal.deleteLater()` back to back. `_CrateSortDialog.done()` does **not** synchronously emit `finished` — it starts a 384ms exit animation and only calls the real `super().done()` (which emits `finished` → triggers `_cleanup_overlay()`, the scrim teardown) once that animation completes via `_finish_close`. Calling `deleteLater()` immediately after `close()` destroyed the dialog (and its `_exit_anim`) before the animation could finish, so `finished` never fired and the click-blocking `_ModalOverlay` scrim was left on screen forever. **Fix:** `modal.finished.connect(modal.deleteLater); modal.close()` — deletion now waits for the real close to complete. This pattern (don't `deleteLater()` a `_CrateSortDialog` immediately after `close()`) applies to any future code closing one of these dialogs outside the normal `accept()`/`reject()` button-click path.
 
-### Modal subtitle copy (locked)
+### Modal subtitle copy (locked, updated 2026-07-30)
 
-> "Analyzing your DJ library and media files – validating artists and genres..."
+> "If your library is big, this'll take a while. We're scanning all of your media files to see if the metadata is correct. You'll be able to approve, deny, and edit our suggested changes next."
 
 ### Overlay rendering requirement
 
@@ -295,7 +311,7 @@ After any genre change, `_populate_genre_sidebar()` and `_apply_filter()` are ca
 
 When the user clicks a nav item while classify mode is active, `_UnsavedClassifyDialog` appears:
 - "Leave Anyway" (red) — exits classify mode without saving, allows navigation
-- "Stay and Finish" (teal) — dismisses dialog, keeps user in Library
+- "Stay & Finish" (teal) — dismisses dialog, keeps user in Library
 
 ### Unclassified genre
 
@@ -374,7 +390,9 @@ Thin public wrapper around the internal mutagen tag helpers. Loads the file with
 
 Rendered immediately by `_start_scan_now()`, before the background `_ScanWorker` has produced any data (`self._summary`/`self._inventory` are reset to `None`/`[]` first).
 
-1. **Scanning banner** (`_build_scanning_banner()`) — replaces the stat-cards section entirely (no zero-value stat cards — that reads as broken, not "in progress"). A single panel: eyebrow "SCANNING YOUR LIBRARY", the pulsing mascot (`cs-logo-mascot-only.svg`, `QGraphicsOpacityEffect` + `QPropertyAnimation` looping 0.3→1.0→0.3 opacity, `InOutSine`, 1100ms, `setLoopCount(-1)` — this is the app's standard "busy but not a spinner" indicator, see Motion system below), a live "N files found" label (`self._scan_count`, updated by `_on_scan_progress`), and a Cancel button (`self._scan_cancel` → `_on_cancel_scan`, which resets `_library_path`/`_summary` to `None` and returns to the welcome screen, index 0).
+1. **Scanning banner** (`_build_scanning_banner()`) — replaces the stat-cards section entirely (no zero-value stat cards — that reads as broken, not "in progress"). A single panel: eyebrow "SCANNING YOUR LIBRARY", the pulsing mascot (`cs-logo-mascot-only.svg`, `QGraphicsOpacityEffect` + `QPropertyAnimation` looping 0.3→1.0→0.3 opacity, `InOutSine`, 1100ms, `setLoopCount(-1)` — this is the app's standard "busy but not a spinner" indicator, see Motion system below), a live hero readout (`self._scan_found_num` — big 26px count — plus `self._scan_count` status text, updated by `_on_scan_progress`), a **`_ScanActivityBeam`** (added 2026-07-30, fills the dead horizontal space next to the count on large libraries where the number climbs too slowly to feel alive), and a Cancel button (`self._scan_cancel` → `_on_cancel_scan`, which resets `_library_path`/`_summary` to `None` and returns to the welcome screen, index 0).
+
+   **`_ScanActivityBeam(QWidget)`** (dashboard.py, module level, above `DashboardWidget`) — a bounded comet of light (soft `QLinearGradient`, transparent→teal `#428175`→transparent, ~32% of track width) that sweeps back and forth in a fixed 3px-tall track (`#383838`), via `QVariantAnimation` ping-ponging 0.0→1.0→0.0, `InOutSine`, 1800ms loop, `setLoopCount(-1)`. **This is NOT a progress bar and must never be redesigned to look like one** — it never grows, never reaches 100%, always returns to start. That's what keeps it compliant with the locked no-fake-progress rule below: it claims "still alive," never "X% done." Deliberately 3px (not the locked progress-bar 8px) and a soft gradient (not a hard-edged fill) so it can't be mistaken for a real determinate bar. Started via `.start()` right after being added to `text_col`; there is no matching `.stop()` call on scan completion (consistent with the pre-existing mascot animation, which also isn't explicitly stopped — the banner is simply swapped out of view).
 2. **Action Cards**, rendered via `_build_action_cards_section(scanning=True)` — same section as the ready state (see below), except the 3 "Go To" cards are passed `card.set_disabled(True)` (see `_WorkflowCard.set_disabled()`) since they depend on scan data. The YouTube-import and local-conversion cards are **not** disabled — neither needs the library scan to function.
 3. No activity feed, no footer — both depend on scan/sync data that isn't ready yet.
 
@@ -1424,7 +1442,7 @@ Apply rubber hose energy to:
 Never apply rubber hose energy to:
 - Destructive confirmations — these should feel deliberate, not playful (subtle-overshoot dialog variant, not a different animation family)
 - Error states — these should feel immediate and clear
-- The actual *value* of a loading indicator — a busy/scanning state should never fake progress or bounce its percentage. It's fine (and now standard, see the mascot-pulse pattern above) for a *decorative* "still alive" indicator next to a real, honest progress readout to have bounce/spring energy — the rule is about not faking the data, not about banning all motion during a wait.
+- The actual *value* of a loading indicator — a busy/scanning state should never fake progress or bounce its percentage. It's fine (and now standard, see the mascot-pulse pattern above) for a *decorative* "still alive" indicator next to a real, honest progress readout to have bounce/spring energy — the rule is about not faking the data, not about banning all motion during a wait. **Worked example (2026-07-30): `_ScanActivityBeam`** in `dashboard.py` — a bounded comet that sweeps back and forth next to the real file-count readout on the scanning banner. It never grows, never reaches 100%, always returns to start — it asserts "still working," never "X% done." This is the reference case if this question comes up again: decorative liveliness cues are fine, simulated measurement is not.
 
 **Duration guidelines (updated July 2026 — these are the actual shipped, validated numbers, not aspirational targets):**
 - Micro-interactions (flash, highlight, hover): 100–150ms
