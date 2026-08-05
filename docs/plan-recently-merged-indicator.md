@@ -1,5 +1,7 @@
 # Track-level "recently merged" indicator (Library tab)
 
+**Status: SHIPPED 2026-08-05.** Implemented as planned below — see `CLAUDE-CS.md` → "Locked decision — August 2026 (track-level 'recently merged' indicator)" for the final as-built writeup (color/glyph choice, verification results). This doc is kept as the original design rationale, not an open TODO.
+
 ## Context
 
 CrateSort's duplicate consolidation ("Rinse Your Library") already writes a durable, detailed record of every merge — `_CrateSort/duplicate_consolidation_<timestamp>.json`, one per consolidation run, listing every loser file absorbed into every winner file. But nothing anywhere in the app ever reads these files back. The only user-visible trace of a consolidation event is the one-time celebration screen ("N duplicates cleaned up · Y GB freed") — the instant that's dismissed, the Library tab shows no indication that any specific track was just merged. A user who runs Rinse, then checks Library, sees the duplicate rows are simply gone — indistinguishable from any other reason a track count might have changed.
