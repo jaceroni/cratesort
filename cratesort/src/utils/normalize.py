@@ -42,7 +42,10 @@ def normalize_title(title: str) -> str:
         r'|original\s+mix'
         r'|single\s+version'
         r'|mono|stereo'
-        r'|bonus\s+track)\s*[\)\]]',
+        r'|bonus\s+track'
+        r'|extended(?:\s+mix)?'
+        r'|radio\s+edit|club\s+mix|instrumental|acapella|a[- ]?cappella'
+        r'|live|acoustic)\s*[\)\]]',
         '', title, flags=re.I,
     )
     # Strip parenthesized years: "Title (1982)", "Title (2023)"

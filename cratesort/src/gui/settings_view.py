@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import (
     QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
+from cratesort.src.core.duplicate_dismissals import load_dismissed, save_dismissed
+from cratesort.src.core.scan_cache import clear_cache
 from cratesort.src.gui.overlays import _ov_alert, _ov_confirm
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,27 @@ class SettingsView(QWidget):
             self._on_reset_columns,
         ))
 
+        card_vbox.addWidget(self._sep())
+
+        # Reset dismissed duplicate groups
+        card_vbox.addLayout(self._setting_row(
+            'Reset Duplicate Alerts',
+            'Clear all "Keep All — Don\'t Ask Again" choices so those duplicate '
+            'groups reappear on your next library scan.',
+            self._action_btn('Reset Alerts', '#3a3a3a', '#4a4a4a', '#2a2a2a', text_color='#ffffff'),
+            self._on_reset_duplicate_dismissals,
+        ))
+
+        card_vbox.addWidget(self._sep())
+
+        # Force a full rescan (clears the incremental scan cache)
+        card_vbox.addLayout(self._setting_row(
+            'Force Full Rescan',
+            'Re-read every file\'s tags from scratch on your next library scan, '
+            'instead of reusing cached data from last time.',
+            self._action_btn('Force Rescan', '#3a3a3a', '#4a4a4a', '#2a2a2a', text_color='#ffffff'),
+            self._on_force_full_rescan,
+        ))
 
         vbox.addWidget(card)
         return section
@@ -296,6 +319,40 @@ class SettingsView(QWidget):
             self._info('Classification session cleared.')
         else:
             self._info('No classification session found.')
+
+    def _on_reset_duplicate_dismissals(self) -> None:
+        if not self._library_path:
+            self._warn('No library loaded.')
+            return
+        dismissed = load_dismissed(self._library_path)
+        if not dismissed:
+            self._info('No dismissed duplicate alerts found.')
+            return
+        if not self._confirm(
+            'Reset Duplicate Alerts',
+            f'This clears {len(dismissed)} "Keep All — Don\'t Ask Again" '
+            'choice(s). Those duplicate groups will be flagged again on your '
+            'next library scan.\n\n'
+            'Continue?',
+        ):
+            return
+        save_dismissed(self._library_path, set())
+        self._info('Duplicate alerts reset.')
+
+    def _on_force_full_rescan(self) -> None:
+        if not self._library_path:
+            self._warn('No library loaded.')
+            return
+        if not self._confirm(
+            'Force Full Rescan',
+            'Your next library scan will re-read every file\'s tags from '
+            'scratch instead of reusing cached data. On a large library '
+            'this can take significantly longer than usual.\n\n'
+            'Continue?',
+        ):
+            return
+        clear_cache(self._library_path)
+        self._info('Scan cache cleared — next scan will be a full rescan.')
 
     # ── Helper widgets ────────────────────────────────────────────────
 

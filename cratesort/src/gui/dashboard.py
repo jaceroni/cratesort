@@ -35,8 +35,10 @@ except ImportError:
 sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
 
 from cratesort.src.utils.checkpoint import save_checkpoint, load_checkpoint, detect_changes
-from cratesort.src.serato.database_reader import read_track_add_dates
-from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _create_dialog_layout
+from cratesort.src.serato.database_reader import read_track_add_dates, read_track_metadata, _normalize_pfil_keys
+from cratesort.src.gui.overlays import (
+    _CrateSortDialog, _ov_alert, _create_dialog_layout, _AnimatedStatCardWidget,
+)
 from cratesort.src.gui.yt_import_dialog import _YTImportDialog
 from cratesort.src.gui.convert_dialog import _ConvertDialog
 
@@ -49,6 +51,11 @@ _ORG, _APP = 'JWBC', 'CrateSort'
 
 # Minimum time the scanning UI stays visible (ms)
 _MIN_SCAN_DISPLAY_MS = 1500
+
+# Minimum time the classification-prep phase stays visible (ms) — this phase
+# is pure in-memory work and can finish almost instantly on a small library,
+# so a small floor keeps the stat cards visibly animating rather than flashing.
+_MIN_CLASSIFY_DISPLAY_MS = 1000
 
 _GRIP_COLOR       = '#a89b85'
 _GRIP_COLOR_HOVER = '#d4c4ae'
@@ -866,6 +873,10 @@ class DashboardWidget(QWidget):
         self._summary       = None
         self._scan_start_ms = 0
         self._scan_cancelled = False
+        self._classify_worker = None  # _ClassifyWorker, imported lazily like LibraryScanner
+        self._classify_tally = None
+        self._classify_start_ms = 0
+        self._classifying = False
         self._sync_pending = False
         self._detected_changes = []
         self._current_crates = {}
@@ -1031,7 +1042,7 @@ class DashboardWidget(QWidget):
             subtext.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
             card_layout.addWidget(subtext)
 
-            btn = QPushButton('Select Your Serato & Media Folder')
+            btn = QPushButton('Select Your Serato && Media Folder')
             btn.setMinimumHeight(42)
             btn.setStyleSheet(
                 'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
@@ -1190,27 +1201,29 @@ class DashboardWidget(QWidget):
             panel_h.addWidget(mascot, alignment=Qt.AlignmentFlag.AlignVCenter)
             anim.start()
 
-        # Hero readout — live file count in the same big-number language as the
-        # stat cards it will be replaced by, so a large (e.g. 20k-track) library
-        # reads as active progress rather than just a pulsing icon.
+        # Live stats — the same 5-card row the Library tab's "Analyze Library"
+        # modal used to show on its own, separate popup. Classification now
+        # runs automatically right after the file scan, still on this same
+        # scanning screen, so scanning and classifying read as one continuous
+        # progress story instead of two back-to-back "scanning" experiences.
+        # Files Analyzed climbs during phase 1 (file scan); the other 4 stay
+        # at 0 until phase 2 (classification) starts populating them.
         text_col = QVBoxLayout()
         text_col.setSpacing(3)
 
-        count_row = QHBoxLayout()
-        count_row.setSpacing(6)
-        self._scan_found_num = QLabel('0')
-        self._scan_found_num.setStyleSheet(
-            'font-size: 26px; font-weight: 500; color: #f1e3c8; background: transparent; border: none;'
-        )
-        count_row.addWidget(self._scan_found_num, alignment=Qt.AlignmentFlag.AlignBottom)
-
-        self._scan_label = QLabel('files found')
-        self._scan_label.setStyleSheet(
-            'font-size: 12px; color: #a89b85; background: transparent; border: none;'
-        )
-        count_row.addWidget(self._scan_label, alignment=Qt.AlignmentFlag.AlignBottom)
-        count_row.addStretch(1)
-        text_col.addLayout(count_row)
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(8)
+        self._scan_card_analyzed     = _AnimatedStatCardWidget('Files Analyzed')
+        self._scan_card_recognized   = _AnimatedStatCardWidget('Files Recognized')
+        self._scan_card_unrecognized = _AnimatedStatCardWidget('Files Unrecognized')
+        self._scan_card_artists      = _AnimatedStatCardWidget('Artists Recognized')
+        self._scan_card_genres       = _AnimatedStatCardWidget('Genres Recognized')
+        for card in (
+            self._scan_card_analyzed, self._scan_card_recognized,
+            self._scan_card_unrecognized, self._scan_card_artists, self._scan_card_genres,
+        ):
+            cards_row.addWidget(card)
+        text_col.addLayout(cards_row)
 
         self._scan_count = QLabel('Discovering files…')
         self._scan_count.setStyleSheet(
@@ -1783,6 +1796,14 @@ class DashboardWidget(QWidget):
             except Exception:
                 pass
             self._worker.wait(3000)
+        if self._classify_worker and self._classify_worker.isRunning():
+            self._classify_worker.cancel()
+            try:
+                self._classify_worker.finished.disconnect()
+            except Exception:
+                pass
+            self._classify_worker.wait(3000)
+        self._classifying = False
         if getattr(self, '_mascot_anim', None) is not None:
             self._mascot_anim.stop()
         self._inventory = []
@@ -1792,17 +1813,142 @@ class DashboardWidget(QWidget):
         self.status_message.emit('', '')
 
     def _on_scan_progress(self, count: int, dir_name: str) -> None:
-        self._scan_found_num.setText(f'{count:,}')
+        self._scan_card_analyzed.update_target(count)
         self._scan_count.setText(f'Scanning “{dir_name}”…')
 
     def _on_scan_finished(self, inventory, summary) -> None:
         if self._scan_cancelled:
             return
+        self._apply_serato_overlay(inventory)
         self._inventory = inventory
         self._summary   = summary
         elapsed_ms = int(time.time() * 1000) - self._scan_start_ms
         delay = max(0, _MIN_SCAN_DISPLAY_MS - elapsed_ms)
+        QTimer.singleShot(delay, self._start_classification_phase)
+
+    def _start_classification_phase(self) -> None:
+        """
+        Run library classification automatically right after the file scan,
+        still on this same scanning screen — this is what used to be a
+        separate "Analyzing Library" popup the first time the user opened
+        Library. By the time that tab is opened, classification_session.json
+        already exists, so the existing skip-logic in
+        LibraryBrowserView._on_classify_clicked opens straight into the
+        classified view with no second "scanning" experience. The modal
+        remains as a fallback for the (rare) case this phase never ran or
+        failed — see _on_classify_phase_error.
+
+        Copy here must never imply classification is "done" — the library
+        isn't classified in any meaningful sense until the user reviews and
+        accepts on the Library screen. This phase only proposes associations.
+        """
+        if self._scan_cancelled:
+            return
+        from cratesort.src.gui.classifier_view import ClassifyProgressTally, _ClassifyWorker
+
+        # Files Analyzed is frozen at its final scan total rather than fed
+        # from the classifier's own tally: both converge to the same number
+        # (every scanned track), but the classifier counts it by accumulating
+        # per-artist-group as it goes, starting from 0 — re-feeding that into
+        # the same animated card would visibly count it back DOWN before
+        # climbing back up. The other 4 cards are genuinely phase-2-only
+        # concepts with nothing from phase 1 to conflict with.
+        self._scan_card_analyzed.update_target(len(self._inventory))
+        self._scan_count.setText('Preparing artist & genre associations…')
+
+        self._classify_tally    = ClassifyProgressTally()
+        self._classify_start_ms = int(time.time() * 1000)
+        self._classifying       = True
+
+        self._classify_worker = _ClassifyWorker(self._inventory, self._library_path)
+        self._classify_worker.progress.connect(self._on_classify_progress)
+        self._classify_worker.finished.connect(self._on_classify_phase_finished)
+        self._classify_worker.errored.connect(self._on_classify_phase_error)
+        self._classify_worker.start()
+
+    def _on_classify_progress(self, done: int, total: int, info: dict) -> None:
+        if self._scan_cancelled or self._classify_tally is None:
+            return
+        tally = self._classify_tally.add(info)
+        self._scan_card_recognized.update_target(tally['files_recognized'])
+        self._scan_card_unrecognized.update_target(tally['files_unrecognized'])
+        self._scan_card_artists.update_target(tally['artists_recognized'])
+        self._scan_card_genres.update_target(tally['genres_recognized'])
+
+    def _on_classify_phase_finished(self, session) -> None:
+        self._classifying = False
+        if self._scan_cancelled:
+            return
+        try:
+            session.save()
+            session.apply_library_edits()
+        except Exception as exc:
+            logger.warning('[Classify] Failed to save dashboard-phase session: %s', exc)
+        elapsed_ms = int(time.time() * 1000) - self._classify_start_ms
+        delay = max(0, _MIN_CLASSIFY_DISPLAY_MS - elapsed_ms)
         QTimer.singleShot(delay, self._show_dashboard)
+
+    def _on_classify_phase_error(self, message: str) -> None:
+        self._classifying = False
+        logger.warning('[Classify] Dashboard-phase classification failed: %s', message)
+        # No session file was written, so the existing _AnalyzeLibraryModal
+        # fallback in LibraryBrowserView._on_classify_clicked will naturally
+        # retry when the user opens the Library tab — proceed to the
+        # dashboard rather than blocking on a failure here.
+        if not self._scan_cancelled:
+            self._show_dashboard()
+
+    def _apply_serato_overlay(self, inventory: list) -> None:
+        """
+        Overlay Serato's own BPM/comment onto matching tracks. These fields
+        can be edited live in Serato (e.g. mid-set) without ever touching
+        the audio file itself, so a file-mtime-based scan cache alone would
+        never see the change. Serato's `database V2` is one small binary
+        file, cheap to parse fresh on every launch regardless of library
+        size or scan-cache state.
+
+        Deliberately does NOT overlay genre. Genre is different from
+        BPM/comment: CrateSort has its own dedicated classification/Accept
+        workflow that owns genre authoritatively (Serato has no equivalent
+        "edit genre live mid-set" feature the way it does for BPM/comment).
+        A real bug was found and fixed here: overlaying Serato's genre
+        unconditionally meant every classification a user accepted got
+        silently reverted on the next launch — Accept writes the new genre
+        to the audio file itself, but never touches Serato's own database,
+        so Serato's database still had the pre-classification genre, and
+        this overlay was overwriting the correct, freshly-written file tag
+        with that stale value every time. Confirmed empirically: a track
+        classified "FX" → "Specialty" and correctly written to disk by
+        Accept reverted straight back to "FX" the moment this overlay ran
+        on the next scan, before this fix.
+
+        Matches by trying every candidate key `_normalize_pfil_keys()` would
+        derive from a track's own path (not just a direct absolute-path
+        lookup) — Serato's stored paths only agree with `rec.path` when the
+        library's root hasn't moved since Serato last wrote them, and this
+        overlay needs to keep matching across a renamed folder or remounted
+        drive for the feature to be reliable.
+        """
+        if not self._library_path:
+            return
+        serato_dir = self._library_path / '_Serato_'
+        if not serato_dir.exists():
+            return
+        db_metadata = read_track_metadata(serato_dir)
+        if not db_metadata:
+            return
+        for rec in inventory:
+            entry = None
+            for key in _normalize_pfil_keys(rec.path.as_posix()):
+                entry = db_metadata.get(key)
+                if entry:
+                    break
+            if entry is None:
+                continue
+            if entry.bpm is not None:
+                rec.bpm = entry.bpm
+            if entry.comment is not None:
+                rec.comment = entry.comment
 
     def _check_serato_sync(self) -> None:
         serato_dir = self._library_path / '_Serato_' if self._library_path else None
@@ -1966,8 +2112,7 @@ class DashboardWidget(QWidget):
         return banner
 
     def _on_scan_error(self, message: str) -> None:
-        self._scan_label.setText('Scan failed')
-        self._scan_count.setText(message)
+        self._scan_count.setText(f'Scan failed — {message}')
         self.status_message.emit(f'Scan error: {message}', 'error')
 
     def _run_scan(self, library_path: Path) -> None:

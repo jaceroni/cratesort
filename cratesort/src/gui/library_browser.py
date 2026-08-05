@@ -9,7 +9,9 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QByteArray, QEvent, QRect, QSettings, QSize, QTimer, pyqtSignal
 
-from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _create_dialog_layout
+from cratesort.src.gui.overlays import (
+    _CrateSortDialog, _ov_alert, _create_dialog_layout, _AnimatedStatCardWidget,
+)
 from cratesort.src.utils.undo_manager import (
     UndoManager, LibraryFieldEditCommand, LibraryTagsEditCommand,
     LibraryGenreChangeCommand, LibraryReassignArtistCommand,
@@ -384,70 +386,6 @@ class _UnsavedChangesDialog(_CrateSortDialog):
         layout.addLayout(btns)
 
 # ---------------------------------------------------------------------------
-# _AnimatedStatCardWidget — count-up stat card for the Analyze Library modal
-# ---------------------------------------------------------------------------
-
-class _AnimatedStatCardWidget(QFrame):
-    """Smoothly animates a numeric value towards a moving target at 60 fps."""
-
-    def __init__(self, title: str, parent=None):
-        super().__init__(parent)
-        self._current_value = 0
-        self._target_value  = 0
-
-        self.setStyleSheet(
-            'QFrame { background-color: #1a1a1a; border: 1px solid #444444; '
-            'border-radius: 8px; }'
-        )
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(4)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self._value_label = QLabel('0')
-        self._value_label.setProperty('role', 'stat')
-        self._value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._value_label.setStyleSheet(
-            'font-size: 22px; font-weight: 600; color: #f1e3c8; '
-            'background: transparent; border: none;'
-        )
-        layout.addWidget(self._value_label)
-
-        self._title_label = QLabel(title)
-        self._title_label.setProperty('role', 'stat_label')
-        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_label.setWordWrap(True)
-        self._title_label.setStyleSheet(
-            'font-size: 10px; color: #a89b85; letter-spacing: 0.06em; '
-            'background: transparent; border: none;'
-        )
-        layout.addWidget(self._title_label)
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(16)
-        self._timer.timeout.connect(self._tick)
-
-    def update_target(self, target: int) -> None:
-        self._target_value = target
-        if not self._timer.isActive():
-            self._timer.start()
-
-    def _tick(self) -> None:
-        diff = self._target_value - self._current_value
-        if diff == 0:
-            self._timer.stop()
-            return
-        if diff > 0:
-            step = max(1, int(diff * 0.15))
-            self._current_value = min(self._target_value, self._current_value + step)
-        else:
-            step = min(-1, int(diff * 0.15))
-            self._current_value = max(self._target_value, self._current_value + step)
-        self._value_label.setText(f'{self._current_value:,}')
-
-
-# ---------------------------------------------------------------------------
 # _AnalyzeLibraryModal — frameless modal shown during first-run classification
 # ---------------------------------------------------------------------------
 
@@ -520,7 +458,13 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         footer.setWordWrap(True)
         footer.setStyleSheet('color: #a89b85; font-size: 11px; background: transparent; border: none;')
-        layout.addWidget(footer)
+        # Small note, not full-width body text — cap it at half the dialog's
+        # content width (same DPI-derived padding as _create_dialog_layout).
+        screen = QApplication.primaryScreen()
+        dpi = screen.physicalDotsPerInch() if screen else 96.0
+        pad = int(round(dpi * 0.7 * 0.8))
+        footer.setFixedWidth(int((720 - 2 * pad) * 0.68))
+        layout.addWidget(footer, 0, Qt.AlignmentFlag.AlignHCenter)
 
         # Action stack — fixed height keeps modal dimensions stable on transition
         self._action_stack = QStackedWidget()
@@ -557,6 +501,7 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
             'QPushButton:hover { background-color: #38706a; }'
             'QPushButton:pressed { background-color: #2d6358; }'
         )
+        self._review_btn.setEnabled(False)
         self._review_btn.clicked.connect(self.review_requested.emit)
         btn_layout.addWidget(self._review_btn)
         self._action_stack.addWidget(btn_wrapper)  # index 1
@@ -581,6 +526,7 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
         self._progress_bar.setValue(percent)
 
     def on_classification_complete(self) -> None:
+        self._review_btn.setEnabled(True)
         self._action_stack.setCurrentIndex(1)
 
 
@@ -634,10 +580,7 @@ class LibraryBrowserView(QWidget):
         # Auto-classify modal state
         self._analyze_modal:          Optional[_AnalyzeLibraryModal] = None
         self._auto_classify_session                                   = None
-        self._processed_artists:      set                            = set()
-        self._processed_files_count:  int                            = 0
-        self._recognized_files_count: int                            = 0
-        self._seen_genres:            set                            = set()
+        self._classify_tally = None  # ClassifyProgressTally, imported lazily
 
         # Inline editor state — at most one open at a time
         self._edit_item:     Optional[QTreeWidgetItem] = None
@@ -696,12 +639,16 @@ class LibraryBrowserView(QWidget):
                         if track.genre_tag:
                             self._track_overrides[track.path] = track.genre_tag
                 self._has_classification = bool(self._session_genre)
-                print(f'[LibraryBrowser] _track_overrides ({len(self._track_overrides)} entries):')
-                for p, g in list(self._track_overrides.items())[:10]:
-                    print(f'  {Path(p).name} → {g}')
             except Exception as exc:
                 import traceback
                 print(f'[LibraryBrowser] Session load error: {exc}\n{traceback.format_exc()}')
+
+        # The merged Confidence/Status column (LC_CLS_CONF) is persistent —
+        # visible whenever classification data exists, in or out of classify
+        # mode — not just toggled on entering/exiting review. load() only
+        # ever runs outside classify mode, so it's always the 'Status' label.
+        self._tree.setColumnHidden(LC_CLS_CONF, not self._has_classification)
+        self._tree.headerItem().setText(LC_CLS_CONF, 'Status')
 
         self._edits = {}
         self._load_edits()
@@ -1016,7 +963,14 @@ class LibraryBrowserView(QWidget):
     def _refresh_classify_btn(self) -> None:
         if self._classify_mode:
             return
-        self._classify_btn.setEnabled(self._count_unclassified_artists() > 0)
+        # Hidden entirely once nothing's left unclassified — not muted/disabled.
+        # A "Reclassify" action was tried and deliberately dropped: classification
+        # already reruns automatically on every app launch, and a manual re-check
+        # mid-session can't surface anything the persistent Status column (Edited/
+        # Approved/Unclassified) isn't already showing live — "Change Genre..."
+        # never writes to the file, so the classifier's own read of a track never
+        # changes just because a user overrode its genre.
+        self._classify_btn.setVisible(self._count_unclassified_artists() > 0)
 
     def _build_genre_sidebar(self) -> QFrame:
         frame = QFrame()
@@ -1292,6 +1246,13 @@ class LibraryBrowserView(QWidget):
             item.setForeground(LC_ARTIST, _red)
             item.setForeground(LC_GENRE, _red)
             item.setToolTip(LC_ARTIST, 'Classify this artist to move all tracks out of Unclassified.')
+
+        # Persistent Status (LC_CLS_CONF, outside classify mode) — this method
+        # is only ever called from _rebuild_tree, which never runs while
+        # classify_mode is active, so no mode check is needed here.
+        status_label, status_color = self._derive_persistent_status(artist, genre)
+        item.setText(LC_CLS_CONF, status_label)
+        item.setForeground(LC_CLS_CONF, QBrush(QColor(status_color)) if status_color else QBrush())
 
         # Lazy-load placeholder
         dummy = QTreeWidgetItem(item)
@@ -2238,7 +2199,9 @@ class LibraryBrowserView(QWidget):
     def _on_classify_clicked(self, checked: bool = False, auto_classify: bool = False) -> None:
         if not self._inventory or not self._library_path:
             return
-        from cratesort.src.gui.classifier_view import ClassificationSession, _ClassifyWorker
+        from cratesort.src.gui.classifier_view import (
+            ClassificationSession, ClassifyProgressTally, _ClassifyWorker,
+        )
 
         session_file = self._library_path / '_CrateSort' / 'classification_session.json'
 
@@ -2254,10 +2217,7 @@ class LibraryBrowserView(QWidget):
                     pass
 
             # No session yet — show the Analyze Library modal and run the worker
-            self._processed_artists      = set()
-            self._processed_files_count  = 0
-            self._recognized_files_count = 0
-            self._seen_genres            = set()
+            self._classify_tally = ClassifyProgressTally()
 
             main_window = self.window()
             self._analyze_modal = _AnalyzeLibraryModal(main_window)
@@ -2292,33 +2252,25 @@ class LibraryBrowserView(QWidget):
     def _on_classify_finished(self, session) -> None:
         session.save()
         session.apply_library_edits()
-        self._classify_btn.setEnabled(True)
-        self._classify_btn.setText('Classify Library')
+        self._refresh_classify_btn()
         self._enter_classify_mode(session)
 
     def _on_classify_error(self, message: str) -> None:
-        self._classify_btn.setEnabled(True)
-        self._classify_btn.setText('Classify Library')
+        self._refresh_classify_btn()
         _show_dark_alert(self.window(), 'Classification Failed', message[:500])
 
     # ── Auto-classify modal slots ──────────────────────────────────────
 
     def _on_auto_classify_progress(self, done: int, total: int, info: dict) -> None:
-        if self._analyze_modal is None:
+        if self._analyze_modal is None or self._classify_tally is None:
             return
-        artist_name = info['artist']
-        if artist_name not in self._processed_artists:
-            self._processed_artists.add(artist_name)
-            self._processed_files_count += info['track_count']
-            if info['recognized']:
-                self._recognized_files_count += info['track_count']
-                self._seen_genres.add(info['genre'])
+        tally = self._classify_tally.add(info)
         self._analyze_modal.update_stats(
-            files_analyzed=self._processed_files_count,
-            files_recognized=self._recognized_files_count,
-            files_unrecognized=self._processed_files_count - self._recognized_files_count,
-            artists_recognized=len(self._processed_artists),
-            genres_recognized=len(self._seen_genres),
+            files_analyzed=tally['files_analyzed'],
+            files_recognized=tally['files_recognized'],
+            files_unrecognized=tally['files_unrecognized'],
+            artists_recognized=tally['artists_recognized'],
+            genres_recognized=tally['genres_recognized'],
         )
         if total > 0:
             self._analyze_modal.update_percent(int((done / total) * 100))
@@ -2354,10 +2306,7 @@ class LibraryBrowserView(QWidget):
             modal.finished.connect(modal.deleteLater)
             modal.close()
         self._auto_classify_session   = None
-        self._processed_artists       = set()
-        self._processed_files_count   = 0
-        self._recognized_files_count  = 0
-        self._seen_genres             = set()
+        self._classify_tally          = None
 
     def _enter_classify_mode(self, session) -> None:
         self._classify_mode = True
@@ -2391,13 +2340,40 @@ class LibraryBrowserView(QWidget):
 
         QTimer.singleShot(0, _reorder_cls_cols)
 
-        # Teal-tinted column headers
-        for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
+        # LC_CLS_CONF is a persistent column outside classify mode (shows
+        # Status), so its header keeps the tree's default color — only the
+        # classify-mode-exclusive columns get the teal review-mode tint.
+        for col in (LC_CLS_PROPOSED, LC_CLS_STATUS):
             self._tree.headerItem().setForeground(col, QBrush(QColor('#428175')))
+        self._tree.headerItem().setText(LC_CLS_CONF, 'Confidence')
         self._populate_classify_columns()
         self._update_empty_state()
         self._classify_banner_frame.setVisible(True)
         self._classify_btn.setVisible(False)
+
+    def _derive_persistent_status(self, artist: str, current_genre: str) -> tuple[str, str]:
+        """
+        Persistent (always-visible, not just during classify-mode review)
+        status for an artist — deliberately NOT sourced from ArtistEntry.state,
+        which is unreliable in practice: the 'approved' transition only exists
+        in dead code (_ClassifierViewLegacy, never instantiated), "Accept
+        Reclassifications" never re-saves it, and "Reassign Artist" silently
+        fails to persist it. Comparing the final genre against the
+        classifier's original proposal (both already loaded by load()) is
+        correct by construction instead.
+
+        Returns (label, hex_color), or ('', '') if this artist has no
+        classification data at all yet.
+        """
+        if artist not in self._session_genre:
+            return '', ''
+        proposed_genre, _confidence = self._session_genre[artist]
+        _UC = {'', '—', 'Unclassified', 'Untagged'}
+        if current_genre in _UC:
+            return '△ Unclassified', '#C75B5B'
+        if current_genre == proposed_genre:
+            return '✓ Approved', '#6B9E78'
+        return '✎ Edited', '#428175'
 
     def _populate_classify_columns(self) -> None:
         _BG_NORMAL = '#1c2825'
@@ -2450,19 +2426,40 @@ class LibraryBrowserView(QWidget):
         self._classify_mode = False
         self._classify_session = None
         self._classify_results = {}
-        # Clear classify column text
+        # Clear classify-only column text — LC_CLS_CONF is excluded, it's about
+        # to be repopulated with the persistent Status value below, not cleared.
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
-            for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
+            for col in (LC_CLS_PROPOSED, LC_CLS_STATUS):
                 item.setText(col, '')
                 item.setData(col, Qt.ItemDataRole.BackgroundRole, None)
-        # Restore pre-classify header state (column order + widths), then hide columns
+        # Restore pre-classify header state (column order + widths), then hide
+        # the classify-only columns. LC_CLS_CONF is deliberately re-forced
+        # visible right after — the restored blob may have snapshotted it as
+        # hidden (captured pre-entry, before this persistent-column feature
+        # existed), and it must stay visible whenever classification data exists.
         if getattr(self, '_pre_classify_header_state', None):
             self._tree.header().restoreState(self._pre_classify_header_state)
             self._pre_classify_header_state = None
-        for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
+        for col in (LC_CLS_PROPOSED, LC_CLS_STATUS):
             self._tree.headerItem().setForeground(col, QBrush(QColor('#a89b85')))
             self._tree.setColumnHidden(col, True)
+        self._tree.setColumnHidden(LC_CLS_CONF, not self._has_classification)
+        self._tree.headerItem().setText(LC_CLS_CONF, 'Status')
+
+        # Repopulate LC_CLS_CONF with the persistent Status value — the text
+        # currently there is leftover Confidence data from classify-mode
+        # review, not the always-on status this column shows outside it.
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            artist = data.get('artist', '')
+            current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+            label, color = self._derive_persistent_status(artist, current_genre)
+            item.setText(LC_CLS_CONF, label)
+            item.setForeground(LC_CLS_CONF, QBrush(QColor(color)) if color else QBrush())
+            item.setData(LC_CLS_CONF, Qt.ItemDataRole.BackgroundRole, None)
+
         self._update_empty_state()
         self._classify_banner_frame.setVisible(False)
         self._classify_btn.setVisible(True)

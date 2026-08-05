@@ -59,24 +59,103 @@ class _ModalOverlay(QWidget):
         event.accept()   # block clicks from reaching widgets underneath
 
 
+class _AnimatedStatCardWidget(QFrame):
+    """Smoothly animates a numeric value towards a moving target at 60 fps.
+    Shared by the Library tab's Analyze Library modal and the dashboard's
+    scanning-phase stat cards — both animate live classification progress."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._current_value = 0
+        self._target_value  = 0
+
+        self.setStyleSheet(
+            'QFrame { background-color: #1a1a1a; border: 1px solid #444444; '
+            'border-radius: 8px; }'
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._value_label = QLabel('0')
+        self._value_label.setProperty('role', 'stat')
+        self._value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._value_label.setStyleSheet(
+            'font-size: 22px; font-weight: 600; color: #f1e3c8; '
+            'background: transparent; border: none;'
+        )
+        layout.addWidget(self._value_label)
+
+        self._title_label = QLabel(title)
+        self._title_label.setProperty('role', 'stat_label')
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setWordWrap(True)
+        self._title_label.setStyleSheet(
+            'font-size: 10px; color: #a89b85; letter-spacing: 0.06em; '
+            'background: transparent; border: none;'
+        )
+        layout.addWidget(self._title_label)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def update_target(self, target: int) -> None:
+        self._target_value = target
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _tick(self) -> None:
+        diff = self._target_value - self._current_value
+        if diff == 0:
+            self._timer.stop()
+            return
+        if diff > 0:
+            step = max(1, int(diff * 0.15))
+            self._current_value = min(self._target_value, self._current_value + step)
+        else:
+            step = min(-1, int(diff * 0.15))
+            self._current_value = max(self._target_value, self._current_value + step)
+        self._value_label.setText(f'{self._current_value:,}')
+
+
 class _CrateSortDialog(QDialog):
     """Base dialog for all CrateSort custom dialogs.
     Handles overlay scrim and show/bounce animation."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+        # Tool (not plain Dialog) so the OS treats this as a floating panel of
+        # the app: it stays above the app's own windows natively, and hides
+        # itself when the app is deactivated rather than floating over other
+        # apps' windows the way WindowStaysOnTopHint would.
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._elastic = True
 
         self._overlay: Optional[_ModalOverlay] = None
-        parent_win = parent.window() if parent is not None else None
-        if parent_win is not None:
-            self._overlay = _ModalOverlay(parent_win)
+        # Re-raised whenever the parent app window is (re)activated, so the
+        # dialog can never end up stuck behind the app's own window — but it
+        # is NOT WindowStaysOnTopHint, so it won't float above other apps.
+        self._parent_win = parent.window() if parent is not None else None
+        if self._parent_win is not None:
+            self._overlay = _ModalOverlay(self._parent_win)
             self._overlay.set_modal(self)
             self._overlay.show()
             self._overlay.raise_()
+            self._parent_win.installEventFilter(self)
         self.finished.connect(self._cleanup_overlay)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._parent_win and event.type() in (
+            QEvent.Type.WindowActivate, QEvent.Type.Show,
+        ):
+            self.raise_()
+            if self._overlay is not None:
+                self._overlay.raise_()
+        return super().eventFilter(obj, event)
 
     def showEvent(self, event) -> None:
         # Ensure layout is computed so width()/height() are accurate before centering.
@@ -177,6 +256,8 @@ class _CrateSortDialog(QDialog):
         super().done(self._pending_result)
 
     def _cleanup_overlay(self) -> None:
+        if self._parent_win is not None:
+            self._parent_win.removeEventFilter(self)
         if self._overlay is not None:
             self._overlay.removeFromParent()
             self._overlay.hide()

@@ -17,11 +17,21 @@ _DB_FILENAME = 'database V2'
 
 class TrackDbEntry:
     """Parsed per-track data from Serato's database V2."""
-    __slots__ = ('add_date', 'play_count')
+    __slots__ = ('add_date', 'play_count', 'bpm', 'genre', 'comment')
 
-    def __init__(self, add_date: Optional[datetime], play_count: Optional[int]):
+    def __init__(
+        self,
+        add_date:   Optional[datetime],
+        play_count: Optional[int],
+        bpm:        Optional[float] = None,
+        genre:      Optional[str]   = None,
+        comment:    Optional[str]   = None,
+    ):
         self.add_date   = add_date
         self.play_count = play_count
+        self.bpm        = bpm
+        self.genre      = genre
+        self.comment    = comment
 
 
 # Module-level cache: serato_dir path → {file_path: TrackDbEntry}
@@ -31,7 +41,9 @@ _CACHE: dict[str, dict[str, TrackDbEntry]] = {}
 def read_track_metadata(serato_dir: str | Path) -> dict[str, TrackDbEntry]:
     """
     Parse Serato's `database V2` and return a mapping of track file path
-    (from the `pfil` field) to a TrackDbEntry with add_date and play_count.
+    (from the `pfil` field) to a TrackDbEntry with add_date, play_count,
+    bpm, genre, and comment — Serato's own values for whatever the user
+    has edited live in Serato, independent of the audio file's own tags.
 
     Results are cached per serato_dir for the session lifetime.
     Returns an empty dict on any error; never raises.
@@ -150,7 +162,12 @@ def _parse_database_full(db_path: Path) -> dict[str, TrackDbEntry]:
     Inner fields read from each otrk:
         pfil  — UTF-16 BE string, the track's file path
         uadd  — uint32 BE, Unix timestamp of add date
-        uply  — uint32 BE, play count
+        utpc  — uint32 BE, play count (NOT `uply` — confirmed empirically
+                against real Serato-written database files; `uply` does
+                not exist in any real database V2 file tested)
+        tbpm  — UTF-16 BE string, BPM (e.g. "128.00")
+        tgen  — UTF-16 BE string, genre
+        tcom  — UTF-16 BE string, freeform comment
     """
     data   = db_path.read_bytes()
     result: dict[str, TrackDbEntry] = {}
@@ -200,6 +217,9 @@ def _parse_otrk_full(otrk_data: bytes) -> Optional[tuple[str, TrackDbEntry]]:
     file_path:  Optional[str]      = None
     add_date:   Optional[datetime] = None
     play_count: Optional[int]      = None
+    bpm:        Optional[float]    = None
+    genre:      Optional[str]      = None
+    comment:    Optional[str]      = None
     pos  = 0
     dlen = len(otrk_data)
 
@@ -242,13 +262,34 @@ def _parse_otrk_full(otrk_data: bytes) -> Optional[tuple[str, TrackDbEntry]]:
             except (struct.error, OSError, OverflowError):
                 pass
 
-        elif tag_str == 'uply' and field_len == 4:
+        elif tag_str == 'utpc' and field_len == 4:
             try:
                 count = struct.unpack('>I', value)[0]
                 play_count = count  # 0 is valid (track added but never played)
             except struct.error:
                 pass
 
+        elif tag_str == 'tbpm':
+            try:
+                bpm = float(value.decode('utf-16-be', errors='replace'))
+            except (UnicodeDecodeError, ValueError):
+                pass
+
+        elif tag_str == 'tgen':
+            try:
+                genre = value.decode('utf-16-be', errors='replace') or None
+            except Exception:
+                pass
+
+        elif tag_str == 'tcom':
+            try:
+                comment = value.decode('utf-16-be', errors='replace') or None
+            except Exception:
+                pass
+
     if file_path:
-        return file_path, TrackDbEntry(add_date=add_date, play_count=play_count)
+        return file_path, TrackDbEntry(
+            add_date=add_date, play_count=play_count,
+            bpm=bpm, genre=genre, comment=comment,
+        )
     return None

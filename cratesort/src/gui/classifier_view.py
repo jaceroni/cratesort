@@ -224,12 +224,6 @@ class ClassificationSession:
         }
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
-        print(f'[CrateSort] Session saved → {path}')
-        for e in data['entries'][:5]:
-            label = e['final_genre'] or e['proposed_genre']
-            print(f'  artist: {e["artist"]} → {label}')
-            for t in e['tracks'][:3]:
-                print(f'    track: {t["filename"]} → genre_tag={t["genre_tag"]}')
 
     @classmethod
     def load(cls, path: Path) -> 'ClassificationSession':
@@ -340,6 +334,42 @@ class ClassificationSession:
 # Background worker
 # ---------------------------------------------------------------------------
 
+class ClassifyProgressTally:
+    """
+    Accumulates per-artist classification progress into running totals for
+    the 5-stat-card display (Files Analyzed/Recognized/Unrecognized, Artists
+    Recognized, Genres Recognized). Shared by the dashboard's automatic
+    classification phase and the Library tab's `_AnalyzeLibraryModal`
+    fallback so the same counting rules aren't hand-rolled twice.
+
+    Note: "artists_recognized" means artists *processed* (deduped by name),
+    not filtered by recognized — preserving the established semantic from
+    the original modal rather than silently changing its meaning here.
+    """
+
+    def __init__(self):
+        self._processed_artists: set[str] = set()
+        self._processed_files_count = 0
+        self._recognized_files_count = 0
+        self._seen_genres: set[str] = set()
+
+    def add(self, info: dict) -> dict:
+        artist_name = info['artist']
+        if artist_name not in self._processed_artists:
+            self._processed_artists.add(artist_name)
+            self._processed_files_count += info['track_count']
+            if info['recognized']:
+                self._recognized_files_count += info['track_count']
+                self._seen_genres.add(info['genre'])
+        return {
+            'files_analyzed':     self._processed_files_count,
+            'files_recognized':   self._recognized_files_count,
+            'files_unrecognized': self._processed_files_count - self._recognized_files_count,
+            'artists_recognized': len(self._processed_artists),
+            'genres_recognized':  len(self._seen_genres),
+        }
+
+
 class _ClassifyWorker(QThread):
     # (done, total, info) — info is a dict: artist, track_count, genre, recognized
     progress = pyqtSignal(int, int, object)
@@ -350,6 +380,10 @@ class _ClassifyWorker(QThread):
         super().__init__(parent)
         self._inventory    = inventory
         self._library_path = library_path
+        self._cancelled     = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
 
     def run(self) -> None:
         try:
@@ -395,6 +429,8 @@ class _ClassifyWorker(QThread):
             entries: list[ArtistEntry] = []
 
             for i, artist in enumerate(artists):
+                if self._cancelled:
+                    return
                 tracks   = artist_tracks[artist]
                 results  = classifier.classify_all(tracks)
 
@@ -494,6 +530,9 @@ class _ClassifyWorker(QThread):
                     'recognized': recognized,
                 })
 
+            if self._cancelled:
+                return
+
             # DJ Tools bucket (fix 4)
             if dj_tools_tracks:
                 self.progress.emit(total, total, {
@@ -522,6 +561,9 @@ class _ClassifyWorker(QThread):
                     original_genres=sorted({r.genre for r in dj_tools_tracks if r.genre}),
                     state='pending',
                 ))
+
+            if self._cancelled:
+                return
 
             session = ClassificationSession(
                 library_path=self._library_path,

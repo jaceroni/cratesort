@@ -19,7 +19,7 @@ def update_play_count(
     new_play_count: int,
 ) -> bool:
     """
-    Update (or insert) the `uply` field for one track in Serato's `database V2`.
+    Update (or insert) the `utpc` field for one track in Serato's `database V2`.
 
     Writes atomically: patches a temp file, then renames it over the original.
     Creates a .bak backup before writing.
@@ -43,7 +43,7 @@ def update_play_count(
     # Build lookup keys for this file path (same normalization as reader)
     target_keys = set(_normalize_pfil_keys(file_path_posix))
 
-    patched, new_data = _patch_uply(data, target_keys, new_play_count)
+    patched, new_data = _patch_utpc(data, target_keys, new_play_count)
     if not patched:
         logger.warning(
             '[DatabaseWriter] Track not found in database V2: %s', file_path_posix
@@ -71,14 +71,14 @@ def update_play_count(
 # Binary patcher
 # ---------------------------------------------------------------------------
 
-def _patch_uply(
+def _patch_utpc(
     data: bytes,
     target_keys: set[str],
     new_play_count: int,
 ) -> tuple[bool, bytes]:
     """
     Scan `data` for the `otrk` record matching any key in `target_keys`.
-    Within that record, update or insert a `uply` field with `new_play_count`.
+    Within that record, update or insert a `utpc` field with `new_play_count`.
     Returns (patched: bool, new_data: bytes).
     """
     out   = bytearray()
@@ -117,7 +117,7 @@ def _patch_uply(
         if tag_str == 'otrk' and not found:
             file_path = _extract_pfil(record_data)
             if file_path and _matches(file_path, target_keys):
-                patched_record = _patch_otrk_uply(record_data, new_play_count)
+                patched_record = _patch_otrk_utpc(record_data, new_play_count)
                 out += tag
                 out += struct.pack('>I', len(patched_record))
                 out += patched_record
@@ -181,17 +181,17 @@ def _matches(file_path: str, target_keys: set[str]) -> bool:
     return False
 
 
-def _patch_otrk_uply(otrk_data: bytes, new_play_count: int) -> bytes:
+def _patch_otrk_utpc(otrk_data: bytes, new_play_count: int) -> bytes:
     """
-    Return a new otrk record body with the `uply` field set to `new_play_count`.
-    If `uply` already exists, it is updated in place.
+    Return a new otrk record body with the `utpc` field set to `new_play_count`.
+    If `utpc` already exists, it is updated in place.
     If it doesn't exist, it is appended at the end of the record.
     All other fields are preserved unchanged.
     """
     out          = bytearray()
     pos          = 0
     dlen         = len(otrk_data)
-    uply_written = False
+    utpc_written = False
 
     while pos + 8 <= dlen:
         tag = otrk_data[pos:pos + 4]
@@ -219,12 +219,12 @@ def _patch_otrk_uply(otrk_data: bytes, new_play_count: int) -> bytes:
             pos += 1
             continue
 
-        if tag_str == 'uply':
-            # Replace existing uply with new value
-            out += b'uply'
+        if tag_str == 'utpc':
+            # Replace existing utpc with new value
+            out += b'utpc'
             out += struct.pack('>I', 4)
             out += struct.pack('>I', new_play_count)
-            uply_written = True
+            utpc_written = True
         else:
             out += otrk_data[pos: pos + 8 + field_len]
 
@@ -233,9 +233,9 @@ def _patch_otrk_uply(otrk_data: bytes, new_play_count: int) -> bytes:
     # Append any partial trailing bytes
     out += otrk_data[pos:]
 
-    if not uply_written:
-        # Insert uply at the end of the record
-        out += b'uply'
+    if not utpc_written:
+        # Insert utpc at the end of the record
+        out += b'utpc'
         out += struct.pack('>I', 4)
         out += struct.pack('>I', new_play_count)
 

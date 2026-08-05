@@ -32,6 +32,16 @@ _VARIANT_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Leading track-number prefix: "02 Title", "02. Title", "02 - Title".
+_LEADING_TRACK_NUMBER = re.compile(r'^\d{1,3}[\s\.\-]+')
+
+# "Artist - Title" filename pattern (e.g. yt-dlp output with no ID3 tags).
+# Splits on the first hyphen-like separator; non-greedy artist group means
+# a filename with more than one " - " (e.g. "Artist - Title - Extended Mix")
+# still splits at the first one, leaving the rest attached to the title
+# where normalize_title's version-suffix stripping can clean it up.
+_ARTIST_TITLE_FILENAME = re.compile(r'^\s*(?P<artist>.+?)\s+[-–—]\s+(?P<title>.+?)\s*$')
+
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -129,14 +139,21 @@ class DuplicateDetector:
             if rec.artist and rec.title:
                 key = (normalize_artist(rec.artist), normalize_title(rec.title))
             else:
-                # Filename fallback: folder name → artist, filename stem → title.
-                # Covers yt-dl / ripped files that landed with no tags.
-                folder_artist  = normalize_artist(rec.path.parent.name)
-                filename_title = normalize_title(rec.path.stem)  # normalize_title strips leading track numbers
-                if not folder_artist or not filename_title:
+                stem = _LEADING_TRACK_NUMBER.sub('', rec.path.stem)
+                match = _ARTIST_TITLE_FILENAME.match(stem)
+                if match:
+                    # Filename itself encodes "Artist - Title" (e.g. a yt-dlp
+                    # download with blank ID3 tags) — parse it directly rather
+                    # than assuming the containing folder name is the artist,
+                    # so it can still collide with a properly-tagged copy.
+                    key = (normalize_artist(match.group('artist')), normalize_title(match.group('title')))
+                else:
+                    # Filename fallback: folder name → artist, filename stem → title.
+                    # Covers library layouts like Artist/01 Title.mp3.
+                    key = (normalize_artist(rec.path.parent.name), normalize_title(rec.path.stem))
+                if not key[0] or not key[1]:
                     self._skipped_count += 1
                     continue
-                key = (folder_artist, filename_title)
             buckets[key].append(rec)
 
         groups: list[DuplicateGroup] = []

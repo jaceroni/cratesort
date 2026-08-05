@@ -630,11 +630,17 @@ class MainWindow(QMainWindow):
         """True once a library has been picked but the background inventory
         scan hasn't populated data yet — disk state alone (_get_app_state)
         can't tell this apart from 'already scanned', since a _Serato_ folder
-        can exist on disk well before the in-memory scan finishes."""
+        can exist on disk well before the in-memory scan finishes. Also true
+        during the dashboard's automatic post-scan classification phase
+        (dash._classifying) — dash._summary is already set by that point
+        (set the instant the file scan itself finishes, before classification
+        starts), so without this a nav click mid-classification would slip
+        past this check and race a second _ClassifyWorker against the one
+        still running on the dashboard."""
         dash = getattr(self, '_dashboard', None)
         if dash is None:
             return False
-        return dash._library_path is not None and dash._summary is None
+        return dash._library_path is not None and (dash._summary is None or dash._classifying)
 
     def _apply_nav_state(self, state: int) -> None:
         """
@@ -901,9 +907,13 @@ class MainWindow(QMainWindow):
             self._library_browser.save_state()
         if hasattr(self, '_crate_manager'):
             self._crate_manager.save_state()
-        if hasattr(self, '_dashboard') and self._dashboard._worker:
-            self._dashboard._worker.cancel()
-            self._dashboard._worker.wait(1000)
+        if hasattr(self, '_dashboard'):
+            if self._dashboard._worker:
+                self._dashboard._worker.cancel()
+                self._dashboard._worker.wait(1000)
+            if self._dashboard._classify_worker:
+                self._dashboard._classify_worker.cancel()
+                self._dashboard._classify_worker.wait(1000)
         super().closeEvent(event)
 
     def _on_launch_serato_requested(self) -> None:

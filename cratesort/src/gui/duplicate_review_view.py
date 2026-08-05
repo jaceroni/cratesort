@@ -20,7 +20,7 @@ from cratesort.src.core.duplicate_consolidator import (
     DuplicateConsolidator, ConsolidationResult,
 )
 from cratesort.src.core.duplicate_dismissals import add_dismissed, remove_dismissed
-from cratesort.src.gui.overlays import _ov_alert
+from cratesort.src.gui.overlays import _ov_alert, _ov_confirm
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -362,8 +362,10 @@ class DuplicateReviewView(QWidget):
                         self._build_group_card(i, g),
                     )
 
+        has_actionable = any(i not in self._dismissed for i in range(len(self._groups)))
+        self._consolidate_btn.setVisible(has_actionable)
+
         if not tier1 and not tier2:
-            self._consolidate_btn.setEnabled(False)
             if skipped > 0:
                 headline = QLabel('Nothing to review.')
                 headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -878,6 +880,19 @@ class DuplicateReviewView(QWidget):
 
         if not approved:
             self.done.emit()
+            return
+
+        files_removed = sum(len(group.copies) - 1 for group, _winner in approved)
+        space_freed = sum(group.space_savings for group, _winner in approved)
+        if not _ov_confirm(
+            self,
+            'Consolidate Duplicates',
+            f'This will permanently delete {files_removed} duplicate '
+            f'file{"s" if files_removed != 1 else ""}, freeing {fmt_bytes(space_freed)}.\n\n'
+            'This cannot be undone. Continue?',
+            confirm_text='Delete Duplicates',
+            confirm_danger=True,
+        ):
             return
 
         total = len(approved)

@@ -11,6 +11,8 @@ from typing import Optional
 
 import mutagen
 
+from cratesort.src.core import scan_cache
+
 logger = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.aif', '.aiff', '.m4a', '.ogg', '.wma'}
@@ -113,6 +115,13 @@ class LibraryScanner:
         inventory: list[TrackRecord] = []
         summary = ScanSummary(root_dirs=self.root_dirs)
 
+        # Per-file cache (path -> {size, mtime, <tag fields>}) keyed off the
+        # first root dir, which is always the library root in practice —
+        # lets unchanged files skip the expensive mutagen tag-read below.
+        # Corrupt/missing cache -> empty dict -> identical to a full scan.
+        self._cache = scan_cache.load_cache(self.root_dirs[0]) if self.root_dirs else {}
+        self._new_cache: dict[str, dict] = {}
+
         # dir -> {lowercased_base_name -> stems_path}
         stems_map: dict[Path, dict[str, Path]] = {}
 
@@ -125,6 +134,9 @@ class LibraryScanner:
 
         self._attach_stems(inventory, stems_map, summary)
         self._build_summary(inventory, summary)
+
+        if self.root_dirs:
+            scan_cache.save_cache(self.root_dirs[0], self._new_cache)
 
         logger.info("Scan complete: %d files", summary.total_files)
         return inventory, summary
@@ -227,21 +239,54 @@ class LibraryScanner:
         return _STEMS_VERSION_RE.sub("", name)
 
     def _scan_file(self, path: Path, ext: str) -> TrackRecord:
-        record = TrackRecord(
-            path=path,
-            parent_dir=path.parent,
-            filename=path.name,
-            extension=ext,
-            file_size=path.stat().st_size,
-            is_audio=(ext in AUDIO_EXTENSIONS),
-            is_video=(ext in VIDEO_EXTENSIONS),
-            codec=ext.lstrip(".").upper(),
-        )
-        try:
-            self._read_tags(record, path, ext)
-        except Exception as exc:
-            record.read_error = str(exc)
-            logger.warning("Tag read error — %s: %s", path.name, exc)
+        stat = path.stat()
+        path_str = str(path)
+        cached = self._cache.get(path_str)
+
+        # Fast path: reuse cached tag data if the file's size/mtime match
+        # the last scan and that scan didn't error on this file. A file
+        # that previously errored is always retried fresh — a read error
+        # can be transient (permissions, a momentarily-locked file), and
+        # silently caching a permanent failure could hide a fixable issue.
+        if (
+            cached is not None
+            and not cached.get("read_error")
+            and cached.get("size") == stat.st_size
+            and cached.get("mtime") == stat.st_mtime
+        ):
+            record = TrackRecord(
+                path=path,
+                parent_dir=path.parent,
+                filename=path.name,
+                extension=ext,
+                file_size=stat.st_size,
+                is_audio=(ext in AUDIO_EXTENSIONS),
+                is_video=(ext in VIDEO_EXTENSIONS),
+                codec=ext.lstrip(".").upper(),
+                **{k: cached.get(k) for k in scan_cache.CACHED_FIELDS if k != "read_error"},
+            )
+        else:
+            record = TrackRecord(
+                path=path,
+                parent_dir=path.parent,
+                filename=path.name,
+                extension=ext,
+                file_size=stat.st_size,
+                is_audio=(ext in AUDIO_EXTENSIONS),
+                is_video=(ext in VIDEO_EXTENSIONS),
+                codec=ext.lstrip(".").upper(),
+            )
+            try:
+                self._read_tags(record, path, ext)
+            except Exception as exc:
+                record.read_error = str(exc)
+                logger.warning("Tag read error — %s: %s", path.name, exc)
+
+        self._new_cache[path_str] = {
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            **{k: getattr(record, k) for k in scan_cache.CACHED_FIELDS},
+        }
         return record
 
     def _read_tags(self, record: TrackRecord, path: Path, ext: str) -> None:
