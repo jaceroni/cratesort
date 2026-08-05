@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
+import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -179,6 +181,56 @@ class DuplicateConsolidator:
             errors=all_errors,
             rollback_log_path=log_path if commit else None,
         )
+
+
+def read_recent_merges(library_path: Path, within_days: int = 30) -> dict[str, dict]:
+    """
+    Aggregate completed duplicate-consolidation merges from the last `within_days`
+    days into {normalized_destination_path: {'count': int, 'most_recent': iso_date_str}}.
+
+    Read-only — scans every duplicate_consolidation_*.json under _CrateSort/ (mirrors
+    organize_view.py's _refresh_gate_screen precedent for reorganization_log_*.json)
+    and never mutates them. A track can win more than one consolidation run over time,
+    so counts/most-recent are aggregated across every matching log file, not just one.
+    """
+    result: dict[str, dict] = {}
+    crate_sort_dir = library_path / '_CrateSort'
+    if not crate_sort_dir.exists():
+        return result
+
+    cutoff = datetime.now() - timedelta(days=within_days)
+
+    for log_path in crate_sort_dir.glob('duplicate_consolidation_*.json'):
+        try:
+            with open(log_path, encoding='utf-8') as f:
+                log_data = json.load(f)
+        except Exception:
+            continue
+
+        for move in log_data.get('moves', []):
+            if not move.get('duplicate') or move.get('status') != 'completed':
+                continue
+            try:
+                executed_at = datetime.fromisoformat(move.get('executed_at', ''))
+            except Exception:
+                continue
+            if executed_at < cutoff:
+                continue
+
+            dest = move.get('destination')
+            if not dest:
+                continue
+            key = unicodedata.normalize('NFC', str(dest))
+
+            entry = result.setdefault(key, {'count': 0, 'most_recent': executed_at})
+            entry['count'] += 1
+            if executed_at > entry['most_recent']:
+                entry['most_recent'] = executed_at
+
+    for entry in result.values():
+        entry['most_recent'] = entry['most_recent'].isoformat()
+
+    return result
 
 
 # ---------------------------------------------------------------------------
