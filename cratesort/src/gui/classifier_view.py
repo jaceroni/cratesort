@@ -311,13 +311,19 @@ class ClassificationSession:
                         ))
 
         # 2. Apply genre overrides and metadata edits (artist-level and track-level)
+        _UC = {'', '—', 'Unclassified', 'Untagged'}
         for entry in self.entries:
             artist_key = _nfc(f'__artist__{entry.artist}')
-            if 'genre' in nfc_edits.get(artist_key, {}):
-                new_genre = nfc_edits[artist_key]['genre']
+            new_genre = nfc_edits.get(artist_key, {}).get('genre')
+            if new_genre and new_genre not in _UC:
                 entry.final_genre = new_genre
                 if entry.state in ('pending', 'flagged'):
                     entry.state = 'edited'
+            # new_genre == 'Unclassified' is only Accept's acknowledgment write,
+            # not a deliberate override — leave final_genre/state untouched so
+            # display_genre falls through to proposed_genre, keeping it paired
+            # with confidence instead of showing a stale "Unclassified" next to
+            # a fresh HIGH/MEDIUM/LOW confidence from the latest classify pass.
             for track in entry.tracks:
                 track_edit = nfc_edits.get(_nfc(track.path), {})
                 if 'genre' in track_edit:
@@ -391,6 +397,25 @@ class _ClassifyWorker(QThread):
 
             classifier = GenreClassifier()
 
+            # User-entered Style Tags (right-click → Edit Style Tags, on a track
+            # or on an artist row) are staged in library_edits.json only — never
+            # written to the file itself. Load them here so they can feed the
+            # classifier as an extra signal (see classifier.py Tier 2 / Tier 4).
+            edits: dict = {}
+            edits_path = self._library_path / '_CrateSort' / 'library_edits.json'
+            if edits_path.exists():
+                try:
+                    with open(edits_path, encoding='utf-8') as f:
+                        edits = json.load(f)
+                except Exception:
+                    edits = {}
+
+            def _tags_for(key: str) -> list[str]:
+                raw = edits.get(key, {}).get('tags', '')
+                return [t.strip() for t in raw.split(',') if t.strip()]
+
+            style_tags_by_path: dict[str, list[str]] = {}
+
             # Pre-classify every track; separate DJ-tools (untagged short clips)
             # from regular artist tracks so they don't skew artist-level votes.
             dj_tools_tracks: list = []
@@ -424,6 +449,10 @@ class _ClassifyWorker(QThread):
                 canonical   = _canonical_artist(primary)
                 artist_tracks[canonical].append(rec)
 
+                combined_tags = _tags_for(str(rec.path)) + _tags_for(f'__artist__{canonical}')
+                if combined_tags:
+                    style_tags_by_path[str(rec.path)] = combined_tags
+
             artists = sorted(artist_tracks.keys())
             total   = len(artists) + (1 if dj_tools_tracks else 0)
             entries: list[ArtistEntry] = []
@@ -432,7 +461,7 @@ class _ClassifyWorker(QThread):
                 if self._cancelled:
                     return
                 tracks   = artist_tracks[artist]
-                results  = classifier.classify_all(tracks)
+                results  = classifier.classify_all(tracks, style_tags_by_path=style_tags_by_path)
 
                 # Separate tracks the pre-check flagged as Specialty (short clips)
                 # — exclude them from the artist-level genre vote (fix 3)

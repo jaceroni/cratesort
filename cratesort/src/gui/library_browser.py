@@ -649,12 +649,12 @@ class LibraryBrowserView(QWidget):
                 import traceback
                 print(f'[LibraryBrowser] Session load error: {exc}\n{traceback.format_exc()}')
 
-        # The merged Confidence/Status column (LC_CLS_CONF) is persistent —
-        # visible whenever classification data exists, in or out of classify
-        # mode — not just toggled on entering/exiting review. load() only
-        # ever runs outside classify mode, so it's always the 'Status' label.
-        self._tree.setColumnHidden(LC_CLS_CONF, not self._has_classification)
-        self._tree.headerItem().setText(LC_CLS_CONF, 'Status')
+        # Confidence and Status are both persistent columns — visible whenever
+        # classification data exists, in or out of classify mode. Their
+        # headers are never re-labeled (see HEADERS) since each only ever
+        # holds its own single kind of value.
+        self._tree.setColumnHidden(LC_CLS_CONF,   not self._has_classification)
+        self._tree.setColumnHidden(LC_CLS_STATUS, not self._has_classification)
 
         self._edits = {}
         self._load_edits()
@@ -662,8 +662,17 @@ class LibraryBrowserView(QWidget):
         self._populate_genre_sidebar()
         self._stack.setCurrentIndex(1)
 
-        # Auto-classify if the user has not yet confirmed any genre assignments
-        if not self._is_classification_complete() and self.isVisible():
+        # Auto-open the classify review banner — no manual button click required —
+        # whenever there's something to review: either nothing has ever been
+        # accepted yet, or _count_unclassified_artists() found an artist that
+        # was previously acknowledged Unclassified but now has a genuinely new,
+        # real proposal (e.g. a style tag added since the last visit resolved
+        # it). Artists with no real signal still stay silent forever, since
+        # _count_unclassified_artists() only counts a *change*, not the mere
+        # fact of being unclassified — a permanently-unresolvable track won't
+        # re-pop this on every tab visit.
+        if (not self._is_classification_complete() or self._count_unclassified_artists() > 0) \
+                and self.isVisible():
             self._on_classify_clicked(auto_classify=True)
 
         self._refresh_classify_btn()
@@ -749,7 +758,9 @@ class LibraryBrowserView(QWidget):
         self._tree.viewport().setMouseTracking(True)
         self._tree.viewport().installEventFilter(self)
 
-        # Hide classify mode columns until classify mode is active
+        # Hidden until a library with classification data is loaded. Proposed
+        # Genre stays classify-mode-only after that; Confidence/Status become
+        # permanent (see load()).
         self._tree.setColumnHidden(LC_CLS_PROPOSED, True)
         self._tree.setColumnHidden(LC_CLS_CONF,     True)
         self._tree.setColumnHidden(LC_CLS_STATUS,   True)
@@ -942,19 +953,29 @@ class LibraryBrowserView(QWidget):
         self._track_stack.setCurrentIndex(1 if has_genres else 0)
 
     def _count_unclassified_artists(self) -> int:
-        """Count artists that are Unclassified AND have no explicit genre in library_edits.
-        Artists set to Unclassified via right-click or accept are considered handled.
+        """Count artists that still need classify-mode review: never touched,
+        or previously acknowledged as Unclassified but the latest classify
+        pass now has a real, different proposal (e.g. a newly-added style tag
+        resolved it). A deliberate genre override (Change Genre/Reassign) is
+        always considered handled and never re-surfaced.
         """
         _UC = {'', '—', 'Unclassified', 'Untagged'}
         count = 0
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
-            if genre in _UC:
-                data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-                artist = data.get('artist', '')
-                if 'genre' not in self._edits.get(f'__artist__{artist}', {}):
-                    count += 1
+            if genre not in _UC:
+                continue
+            data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            artist = data.get('artist', '')
+            existing_genre = self._edits.get(f'__artist__{artist}', {}).get('genre')
+            if existing_genre and existing_genre not in _UC:
+                continue  # deliberate override — handled
+            if existing_genre in _UC:
+                proposed, _conf = self._session_genre.get(artist, ('', ''))
+                if proposed in _UC:
+                    continue  # acknowledged, and still nothing new to review
+            count += 1
         return count
 
     def has_unsaved_classify_changes(self) -> bool:
@@ -970,12 +991,17 @@ class LibraryBrowserView(QWidget):
         if self._classify_mode:
             return
         # Hidden entirely once nothing's left unclassified — not muted/disabled.
-        # A "Reclassify" action was tried and deliberately dropped: classification
-        # already reruns automatically on every app launch, and a manual re-check
-        # mid-session can't surface anything the persistent Status column (Edited/
-        # Approved/Unclassified) isn't already showing live — "Change Genre..."
-        # never writes to the file, so the classifier's own read of a track never
-        # changes just because a user overrode its genre.
+        # A standalone "Reclassify" button was tried and deliberately dropped
+        # (classification already reruns automatically on every app launch).
+        # That reasoning held as long as nothing could change the classifier's
+        # own read of a track without a manual "Change Genre" override — but
+        # Style Tags (see classifier.py Tier 2/4) broke that assumption: a
+        # user can add a style tag with no genre override at all and get a
+        # genuinely different proposal on the next launch. So this button
+        # stays visible/reappears for artists acknowledged Unclassified whose
+        # latest classify pass now has a real proposal — see
+        # _count_unclassified_artists(). Deliberate genre overrides (Change
+        # Genre/Reassign) are still always considered handled.
         self._classify_btn.setVisible(self._count_unclassified_artists() > 0)
 
     def _build_genre_sidebar(self) -> QFrame:
@@ -1220,6 +1246,20 @@ class LibraryBrowserView(QWidget):
         self._count_label.setText(f'{n:,} artists · {t:,} tracks')
         self._update_empty_state()
 
+        # _rebuild_tree() only ever paints the persistent Status column
+        # (LC_CLS_CONF via _derive_persistent_status in _make_top_level_item)
+        # — it has no idea about classify-mode's own Proposed Genre/Confidence
+        # columns. Instant-edit actions available from the tree's right-click
+        # menu (Change Genre, Reassign Artist, Edit Style Tags, ...) all call
+        # this method to refresh after writing an edit, and those menus are
+        # reachable while the classify-mode review banner is still open — so
+        # without this, a single manual edit mid-review would wipe every
+        # other row's active review painting and leave LC_CLS_PROPOSED blank,
+        # silently breaking "Accept Reclassifications" for the whole library
+        # (it reads that now-blank text to decide what to apply).
+        if self._classify_mode:
+            self._populate_classify_columns()
+
     def _make_artist_item(self, artist: str, tracks: list, genre: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem()
         item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, {'artist': artist, 'tracks': tracks})
@@ -1253,12 +1293,23 @@ class LibraryBrowserView(QWidget):
             item.setForeground(LC_GENRE, _red)
             item.setToolTip(LC_ARTIST, 'Classify this artist to move all tracks out of Unclassified.')
 
-        # Persistent Status (LC_CLS_CONF, outside classify mode) — this method
-        # is only ever called from _rebuild_tree, which never runs while
-        # classify_mode is active, so no mode check is needed here.
-        status_label, status_color = self._derive_persistent_status(artist, genre)
-        item.setText(LC_CLS_CONF, status_label)
-        item.setForeground(LC_CLS_CONF, QBrush(QColor(status_color)) if status_color else QBrush())
+        # Confidence (LC_CLS_CONF) and Status (LC_CLS_STATUS) are permanent,
+        # single-purpose columns — always populated here, in and out of
+        # classify mode, so their headers never need to lie about what's in
+        # them (Confidence never shows a Status-type value like "Edited" or
+        # vice versa). Confidence shows the classifier's raw tier for this
+        # artist; Status shows the persistent Approved/Edited/Unclassified
+        # state. Neither is touched by classify-mode's own review painting
+        # (_populate_classify_columns, Proposed Genre only) — this is the
+        # only place either column is ever written.
+        _, confidence = self._classify_lookup(artist)
+        if confidence:
+            item.setText(LC_CLS_CONF, confidence)
+            item.setForeground(LC_CLS_CONF, QBrush(QColor(self._CONF_COLORS.get(confidence, '#a89b85'))))
+
+        status_label, status_color = self._derive_persistent_status(artist)
+        item.setText(LC_CLS_STATUS, status_label)
+        item.setForeground(LC_CLS_STATUS, QBrush(QColor(status_color)) if status_color else QBrush())
 
         # Lazy-load placeholder
         dummy = QTreeWidgetItem(item)
@@ -1719,13 +1770,24 @@ class LibraryBrowserView(QWidget):
                     del self._edits[key]
             else:
                 self._edits.setdefault(key, {})['genre'] = genre
-        self._save_edits()
 
+        # Stage a per-track genre entry for anything that actually writes to
+        # disk successfully — same "free-tier write-through" pattern used for
+        # every other track field (title/album/comment/...). Without this,
+        # the track row's displayed genre (_make_track_child) keeps reading
+        # the stale self._track_overrides snapshot from classify-session-load
+        # time instead of the value that was just written, even though
+        # rec.genre itself is correctly updated by _write_disk_field.
         disk_failures = 0
         for path, genre in disk_map.items():
             rec = self._resolve_track(path)
-            if rec and not self._write_disk_field(rec, 'genre', genre):
-                disk_failures += 1
+            if rec:
+                if self._write_disk_field(rec, 'genre', genre):
+                    self._edits.setdefault(path, {})['genre'] = genre
+                else:
+                    disk_failures += 1
+        self._save_edits()
+
         if disk_failures:
             self._flash_disk_failure(
                 f'⚠ {disk_failures} track(s) could not be updated on disk — '
@@ -1990,15 +2052,38 @@ class LibraryBrowserView(QWidget):
         data  = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
         artist = data.get('artist', '')
         menu   = QMenu(self)
-        menu.addAction('✓ Approve')
+        approve   = menu.addAction('✓ Approve')
         chg       = menu.addAction('↕ Change Genre…')
         edit_tags = menu.addAction('✏ Edit Style Tags…')
-        menu.addAction('⚑ Mark for Review')
         action = menu.exec(self._tree.viewport().mapToGlobal(pos))
-        if action == chg:
+        if action == approve:
+            self._approve_artist(item, artist)
+        elif action == chg:
             self._change_genre_for_selection(artist, item.text(LC_GENRE))
         elif action == edit_tags:
             self._edit_artist_tags(item, artist)
+
+    def _approve_artist(self, item: QTreeWidgetItem, artist: str) -> None:
+        """Right-click 'Approve' — accept the classifier's current proposal
+        for just this one artist. Same write path as _change_artist_genre
+        (real per-track disk write + library_edits.json staging, undoable),
+        just sourcing the genre from the classifier's proposal instead of a
+        user-picked value from the Change Genre dialog."""
+        proposed, _confidence = self._classify_lookup(artist)
+        _UC = {'', '—', 'Unclassified', 'Untagged'}
+        if not proposed or proposed in _UC:
+            return  # nothing real proposed for this artist to approve
+        key = f'__artist__{artist}'
+        old_genre = self._edits.get(key, {}).get('genre')
+
+        artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+        disk_old = {str(rec.path): (rec.genre or '') for rec in artist_data.get('tracks', [])}
+
+        if self._undo_manager:
+            cmd = LibraryGenreChangeCommand(self, {key: old_genre}, proposed, disk_old, artist)
+            self._undo_manager.push(cmd)
+        else:
+            self._apply_library_genre({key: proposed}, {p: proposed for p in disk_old})
 
     def _track_menu(self, item: QTreeWidgetItem, pos) -> None:
         rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
@@ -2339,13 +2424,10 @@ class LibraryBrowserView(QWidget):
         # Snapshot header state so exit can restore it exactly
         self._pre_classify_header_state = self._tree.header().saveState()
 
-        # Show classify columns with target widths
+        # Confidence/Status are already visible (permanent columns — see
+        # load()); only Proposed Genre is classify-mode-exclusive.
         self._tree.setColumnHidden(LC_CLS_PROPOSED, False)
-        self._tree.setColumnHidden(LC_CLS_CONF,     False)
-        self._tree.setColumnHidden(LC_CLS_STATUS,   False)
         self._tree.setColumnWidth(LC_CLS_PROPOSED, 120)
-        self._tree.setColumnWidth(LC_CLS_CONF,      80)
-        self._tree.setColumnWidth(LC_CLS_STATUS,    80)
 
         # Defer visual reorder until the tree has registered visibility changes
         def _reorder_cls_cols():
@@ -2354,49 +2436,77 @@ class LibraryBrowserView(QWidget):
             hdr.moveSection(hdr.visualIndex(LC_CLS_PROPOSED), genre_vis + 1)
             hdr.moveSection(hdr.visualIndex(LC_CLS_CONF),     genre_vis + 2)
             hdr.moveSection(hdr.visualIndex(LC_CLS_STATUS),   genre_vis + 3)
-            for col in (LC_CLS_PROPOSED, LC_CLS_CONF, LC_CLS_STATUS):
-                self._tree.resizeColumnToContents(col)
-                if self._tree.columnWidth(col) < 60:
-                    self._tree.setColumnWidth(col, 60)
+            self._tree.resizeColumnToContents(LC_CLS_PROPOSED)
+            if self._tree.columnWidth(LC_CLS_PROPOSED) < 60:
+                self._tree.setColumnWidth(LC_CLS_PROPOSED, 60)
 
         QTimer.singleShot(0, _reorder_cls_cols)
 
-        # LC_CLS_CONF is a persistent column outside classify mode (shows
-        # Status), so its header keeps the tree's default color — only the
-        # classify-mode-exclusive columns get the teal review-mode tint.
-        for col in (LC_CLS_PROPOSED, LC_CLS_STATUS):
-            self._tree.headerItem().setForeground(col, QBrush(QColor('#428175')))
-        self._tree.headerItem().setText(LC_CLS_CONF, 'Confidence')
+        # Only the classify-mode-exclusive column gets the teal review-mode
+        # tint — Confidence/Status are permanent and keep their default color.
+        self._tree.headerItem().setForeground(LC_CLS_PROPOSED, QBrush(QColor('#428175')))
         self._populate_classify_columns()
         self._update_empty_state()
         self._classify_banner_frame.setVisible(True)
         self._classify_btn.setVisible(False)
 
-    def _derive_persistent_status(self, artist: str, current_genre: str) -> tuple[str, str]:
+    def _derive_persistent_status(self, artist: str) -> tuple[str, str]:
         """
         Persistent (always-visible, not just during classify-mode review)
         status for an artist — deliberately NOT sourced from ArtistEntry.state,
         which is unreliable in practice: the 'approved' transition only exists
         in dead code (_ClassifierViewLegacy, never instantiated), "Accept
         Reclassifications" never re-saves it, and "Reassign Artist" silently
-        fails to persist it. Comparing the final genre against the
-        classifier's original proposal (both already loaded by load()) is
-        correct by construction instead.
+        fails to persist it.
+
+        Ground truth is library_edits.json (self._edits) — NOT a comparison
+        of two genre strings. _rebuild_tree()'s displayed genre is pre-filled
+        from the classifier's own raw proposal for anything not yet accepted,
+        so comparing it against that same proposal is trivially true before
+        any real decision has ever been made (this used to render "✓ Approved"
+        on a fresh library before Accept was ever clicked once). Checking
+        whether an explicit accepted-genre edit actually exists is the only
+        way to tell "genuinely approved" apart from "not yet reviewed, but
+        the preview happens to agree."
 
         Returns (label, hex_color), or ('', '') if this artist has no
         classification data at all yet.
         """
         if artist not in self._session_genre:
             return '', ''
-        proposed_genre, _confidence = self._session_genre[artist]
+        proposed_genre, confidence = self._session_genre[artist]
         _UC = {'', '—', 'Unclassified', 'Untagged'}
-        if current_genre in _UC:
-            return '△ Unclassified', '#C75B5B'
-        if current_genre == proposed_genre:
+
+        if confidence == 'MATCHED':
+            # The file's own tag already IS the taxonomy genre — Accept
+            # deliberately never writes an edit for these (nothing to
+            # accept), so there was never anything pending.
             return '✓ Approved', '#6B9E78'
-        return '✎ Edited', '#428175'
+
+        existing_genre = self._edits.get(f'__artist__{artist}', {}).get('genre')
+        if existing_genre is None:
+            return '◔ Pending', '#a89b85'
+        if existing_genre in _UC:
+            return '△ Unclassified', '#C75B5B'
+        if existing_genre == proposed_genre:
+            return '✓ Approved', '#6B9E78'
+        return '✎ Edited', '#D4A04A'
+
+    _CONF_COLORS = {
+        'MATCHED': '#f1e3c8',
+        'HIGH':    '#428175',
+        'MEDIUM':  '#9fa4c7',
+        'LOW':     '#D17D34',
+        'NONE':    '#C75B5B',
+    }
 
     def _populate_classify_columns(self) -> None:
+        """Paint Proposed Genre for rows still pending review. Confidence and
+        Status are permanent columns maintained solely by _rebuild_tree() /
+        _make_top_level_item() — never touched here — so this never needs to
+        worry about mixing a Status-type value into the Confidence column or
+        vice versa; each column only ever holds its own one kind of value.
+        """
         _BG_NORMAL = '#1c2825'
         _BG_UC     = '#221a1a'
         _UC        = {'Unclassified', 'Untagged', ''}
@@ -2406,9 +2516,47 @@ class LibraryBrowserView(QWidget):
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
             artist = data.get('artist', '')
             current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
+
+            # Artists already settled (approved or manually edited to a real
+            # genre) are not part of this review pass — but Proposed Genre
+            # still gets painted to match the settled value (same neutral
+            # treatment MATCHED rows already use) instead of going blank.
+            # A cell going empty reads as "something was deleted" to a user
+            # watching it happen live (e.g. right-click Approve); showing
+            # agreement between Genre and Proposed Genre is the correct,
+            # reassuring signal that nothing is pending here anymore.
+            #
+            # "Settled" must be judged from library_edits.json — an explicit,
+            # real accepted genre — never from current_genre/LC_GENRE itself:
+            # _rebuild_tree() pre-fills the displayed genre from the raw
+            # classifier proposal (_classify_lookup) for anything not yet
+            # accepted, so on a never-reviewed artist current_genre already
+            # looks like a real genre even though nothing was ever accepted.
             proposed, confidence = self._classify_results.get(
                 artist, ('Unclassified', 'NONE')
             )
+
+            existing_genre = self._edits.get(f'__artist__{artist}', {}).get('genre')
+            if existing_genre and existing_genre not in _UC:
+                item.setText(LC_CLS_PROPOSED, existing_genre)
+                item.setBackground(LC_CLS_PROPOSED, QBrush(QColor(_BG_NORMAL)))
+                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#f1e3c8')))
+                continue
+            # MATCHED artists never get a library_edits.json entry — Accept
+            # deliberately skips writing one for them, since the file's own
+            # tag already IS the taxonomy genre, nothing to accept. Same
+            # "settled" treatment applies once the library has already been
+            # through a full accept cycle before (_is_classification_
+            # complete()) — on the very first-ever review nothing has an
+            # edits entry yet either, so this check would otherwise fire
+            # immediately, before the user has seen a first pass at all.
+            if confidence == 'MATCHED' and proposed == current_genre \
+                    and self._is_classification_complete():
+                item.setText(LC_CLS_PROPOSED, current_genre)
+                item.setBackground(LC_CLS_PROPOSED, QBrush(QColor(_BG_NORMAL)))
+                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#f1e3c8')))
+                continue
+
             is_uc = proposed in _UC
             changed = not is_uc and proposed != current_genre
 
@@ -2422,64 +2570,25 @@ class LibraryBrowserView(QWidget):
             elif changed:
                 item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#D17D34')))
             else:
-                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor('#7bbdad')))
-
-            # Confidence
-            item.setText(LC_CLS_CONF, confidence)
-            item.setBackground(LC_CLS_CONF, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
-            conf_color = {
-                'MATCHED': '#f1e3c8',
-                'HIGH':    '#428175',
-                'MEDIUM':  '#9fa4c7',
-                'LOW':     '#D17D34',
-                'NONE':    '#C75B5B',
-            }.get(confidence, '#a89b85')
-            item.setForeground(LC_CLS_CONF, QBrush(QColor(conf_color)))
-
-            # Status
-            status = '' if confidence == 'MATCHED' else ('Modified' if changed else '')
-            item.setText(LC_CLS_STATUS, status)
-            item.setBackground(LC_CLS_STATUS, QBrush(QColor(_BG_UC if is_uc else _BG_NORMAL)))
-            if status:
-                item.setForeground(LC_CLS_STATUS, QBrush(QColor('#D17D34')))
+                item.setForeground(LC_CLS_PROPOSED, QBrush(QColor(self._CONF_COLORS.get(confidence, '#a89b85'))))
 
     def _exit_classify_mode_cancel(self) -> None:
         self._classify_mode = False
         self._classify_session = None
         self._classify_results = {}
-        # Clear classify-only column text — LC_CLS_CONF is excluded, it's about
-        # to be repopulated with the persistent Status value below, not cleared.
+        # Only Proposed Genre needs clearing/hiding — Confidence and Status
+        # are permanent columns that were never touched by classify-mode's
+        # own painting in the first place (see _populate_classify_columns),
+        # so there's nothing stale in them to repopulate here.
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
-            for col in (LC_CLS_PROPOSED, LC_CLS_STATUS):
-                item.setText(col, '')
-                item.setData(col, Qt.ItemDataRole.BackgroundRole, None)
-        # Restore pre-classify header state (column order + widths), then hide
-        # the classify-only columns. LC_CLS_CONF is deliberately re-forced
-        # visible right after — the restored blob may have snapshotted it as
-        # hidden (captured pre-entry, before this persistent-column feature
-        # existed), and it must stay visible whenever classification data exists.
+            item.setText(LC_CLS_PROPOSED, '')
+            item.setData(LC_CLS_PROPOSED, Qt.ItemDataRole.BackgroundRole, None)
         if getattr(self, '_pre_classify_header_state', None):
             self._tree.header().restoreState(self._pre_classify_header_state)
             self._pre_classify_header_state = None
-        for col in (LC_CLS_PROPOSED, LC_CLS_STATUS):
-            self._tree.headerItem().setForeground(col, QBrush(QColor('#a89b85')))
-            self._tree.setColumnHidden(col, True)
-        self._tree.setColumnHidden(LC_CLS_CONF, not self._has_classification)
-        self._tree.headerItem().setText(LC_CLS_CONF, 'Status')
-
-        # Repopulate LC_CLS_CONF with the persistent Status value — the text
-        # currently there is leftover Confidence data from classify-mode
-        # review, not the always-on status this column shows outside it.
-        for i in range(self._tree.topLevelItemCount()):
-            item = self._tree.topLevelItem(i)
-            data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            artist = data.get('artist', '')
-            current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
-            label, color = self._derive_persistent_status(artist, current_genre)
-            item.setText(LC_CLS_CONF, label)
-            item.setForeground(LC_CLS_CONF, QBrush(QColor(color)) if color else QBrush())
-            item.setData(LC_CLS_CONF, Qt.ItemDataRole.BackgroundRole, None)
+        self._tree.headerItem().setForeground(LC_CLS_PROPOSED, QBrush(QColor('#a89b85')))
+        self._tree.setColumnHidden(LC_CLS_PROPOSED, True)
 
         self._update_empty_state()
         self._classify_banner_frame.setVisible(False)
@@ -2509,12 +2618,27 @@ class LibraryBrowserView(QWidget):
             current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
             proposed = item.text(LC_CLS_PROPOSED)
             artist_key = f'__artist__{artist}'
-            if artist_key in edits and 'genre' in edits[artist_key]:
+            existing_genre = edits.get(artist_key, {}).get('genre')
+            if existing_genre and existing_genre not in _UC:
                 continue  # user-set override — don't overwrite with classifier's proposal
+            # existing_genre == 'Unclassified' is only an acknowledgment (see the
+            # pass below), not a deliberate choice — fall through so a fresh,
+            # real proposal (e.g. a newly-added style tag resolving it) still applies.
             confidence = item.text(LC_CLS_CONF)
             if confidence == 'MATCHED' and proposed == current_genre:
                 continue  # ID3 tag already matches taxonomy — no override needed
-            if proposed and proposed not in _UC and proposed != current_genre:
+            # NOT "and proposed != current_genre" — current_genre is the tree's
+            # displayed genre, which _rebuild_tree() pre-fills from this same
+            # classifier proposal (_classify_lookup) for anything not yet
+            # accepted. That means proposed == current_genre trivially on the
+            # very first Accept ever, for every artist, before anything is
+            # actually written — which silently no-op'd Accept for the entire
+            # library (no library_edits.json entry, no disk write, no
+            # _accepted_tracks) while the row still displayed "✓ Approved"
+            # (itself the same illusion, in _derive_persistent_status). The
+            # existing_genre guard above already protects real prior
+            # acceptances/overrides, so nothing further is needed here.
+            if proposed and proposed not in _UC:
                 edits.setdefault(artist_key, {})['genre'] = proposed
                 item.setText(LC_GENRE, proposed)
                 item.setData(LC_GENRE, Qt.ItemDataRole.UserRole + 1, proposed)
@@ -2539,6 +2663,23 @@ class LibraryBrowserView(QWidget):
                 if current_genre in _UC:
                     edits[artist_key] = {'genre': 'Unclassified'}
 
+        # Write accepted genre proposals to track files on disk (free-tier write-through),
+        # and — for anything that actually succeeded — also stage a per-track genre
+        # entry in library_edits.json, same as every other track-level edit field
+        # (title/album/comment/etc.). Without this, the Library tree's track rows
+        # read from self._track_overrides (a snapshot from when the classify
+        # session was last loaded) and would keep showing the pre-accept genre
+        # until the next full relaunch+rescan, even though the file itself and
+        # the artist-level status both already reflect the real, accepted genre.
+        from cratesort.src.core.file_organizer import write_file_metadata
+        disk_failures = 0
+        for rec, genre in _accepted_tracks:
+            if write_file_metadata(rec.path, 'genre', genre):
+                rec.genre = genre
+                edits.setdefault(str(rec.path), {})['genre'] = genre
+            else:
+                disk_failures += 1
+
         edits_path.parent.mkdir(parents=True, exist_ok=True)
         save_success = False
         try:
@@ -2555,16 +2696,6 @@ class LibraryBrowserView(QWidget):
                 flag_path.touch()
             except Exception as exc:
                 print(f'[LibraryBrowser] Warning: Failed to write classification accepted flag: {exc}')
-
-        # Write accepted genre proposals to track files on disk (free-tier write-through).
-        # library_edits.json staging already stands as an Organize fallback for any failures.
-        from cratesort.src.core.file_organizer import write_file_metadata
-        disk_failures = 0
-        for rec, genre in _accepted_tracks:
-            if write_file_metadata(rec.path, 'genre', genre):
-                rec.genre = genre
-            else:
-                disk_failures += 1
 
         if _last_accept_artist:
             self._last_edited_artist  = _last_accept_artist

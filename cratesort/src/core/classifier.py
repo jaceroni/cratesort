@@ -728,13 +728,16 @@ class GenreClassifier:
 
     Classification tiers (first match wins):
       1. Genre tag is already a valid parent genre → HIGH
-      2. Genre tag found in STYLE_MAP → HIGH
-      3. Majority of style tokens from comment/genre field → MEDIUM
-      4. Ancestor folder name hint → LOW
-      5. Unclassified → NONE
+      2. User-entered style tag found in STYLE_MAP → HIGH
+      3. Genre tag found in STYLE_MAP → HIGH
+      4. Majority of style tokens from comment/genre/style-tag fields → MEDIUM
+      5. Ancestor folder name hint → LOW
+      6. Unclassified → NONE
     """
 
-    def classify(self, record: TrackRecord) -> ClassificationResult:
+    def classify(
+        self, record: TrackRecord, style_tags: Optional[list[str]] = None,
+    ) -> ClassificationResult:
         # ── Pre-check: short duration in purpose folder → Specialty (fix 3) ─
         if record.duration and record.duration < 30:
             for part in record.path.parts:
@@ -759,6 +762,21 @@ class GenreClassifier:
                 original_genre_tag=raw_genre,
             )
 
+        # ── Tier 2: User-entered style tag resolved via style map ───────────
+        # A real, valid genre tag (Tier 1) always wins outright — this only
+        # runs when the file's own tag didn't already resolve, so a style
+        # tag can fill a gap but never override a concrete existing tag.
+        for tag in (style_tags or []):
+            mapped = STYLE_MAP.get(tag.strip().lower())
+            if mapped:
+                return ClassificationResult(
+                    genre=mapped,
+                    confidence=Confidence.HIGH,
+                    reason=f"Style tag '{tag.strip()}' resolved via style map",
+                    original_genre_tag=raw_genre or None,
+                    matched_styles=[tag.strip()],
+                )
+
         # ── Junk tag: skip to style analysis ─────────────────────────────
         if genre_lower not in JUNK_GENRES:
 
@@ -770,7 +788,7 @@ class GenreClassifier:
             if genre_lower == "turntablism":
                 return self._classify_turntablism(record, raw_genre)
 
-            # ── Tier 2: Genre tag in style map ────────────────────────────
+            # ── Tier 3: Genre tag in style map ────────────────────────────
             mapped = STYLE_MAP.get(genre_lower)
             if mapped:
                 return ClassificationResult(
@@ -781,8 +799,11 @@ class GenreClassifier:
                     matched_styles=[raw_genre],
                 )
 
-        # ── Tier 3: Style tokens from comment + genre fields ──────────────
-        candidate_texts = [record.comment or "", record.genre or "", record.album or ""]
+        # ── Tier 4: Style tokens from comment + genre + style-tag fields ────
+        candidate_texts = [
+            record.comment or "", record.genre or "", record.album or "",
+            *(style_tags or []),
+        ]
         votes = self._vote_from_texts(candidate_texts, record)
         if votes:
             winner, matched = max(votes.items(), key=lambda kv: len(kv[1]))
@@ -794,7 +815,7 @@ class GenreClassifier:
                 matched_styles=matched,
             )
 
-        # ── Tier 4: Ancestor folder name hint ────────────────────────────
+        # ── Tier 5: Ancestor folder name hint ────────────────────────────
         folder_genre = self._genre_from_folder(record.path)
         if folder_genre:
             return ClassificationResult(
@@ -815,9 +836,15 @@ class GenreClassifier:
         )
 
     def classify_all(
-        self, inventory: list[TrackRecord]
+        self,
+        inventory: list[TrackRecord],
+        style_tags_by_path: Optional[dict[str, list[str]]] = None,
     ) -> list[tuple[TrackRecord, ClassificationResult]]:
-        return [(rec, self.classify(rec)) for rec in inventory]
+        style_tags_by_path = style_tags_by_path or {}
+        return [
+            (rec, self.classify(rec, style_tags=style_tags_by_path.get(str(rec.path))))
+            for rec in inventory
+        ]
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
