@@ -458,6 +458,7 @@ class _AddTracksDialog(_CrateSortDialog):
 
         self._search = QLineEdit()
         self._search.setPlaceholderText('Search tracks…')
+        self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(self._filter)
         layout.addWidget(self._search)
 

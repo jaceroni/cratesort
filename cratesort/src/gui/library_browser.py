@@ -343,7 +343,7 @@ class _UnsavedChangesDialog(_CrateSortDialog):
         # Use standard Red accent layout (warning/danger/discard)
         layout = _create_dialog_layout(self)
 
-        headline = QLabel('Unsaved Classification Changes')
+        headline = QLabel('Classifications Not Saved')
         headline.setStyleSheet(
             'color: #f1e3c8; font-size: 22px; font-weight: 600; '
             'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
@@ -353,7 +353,7 @@ class _UnsavedChangesDialog(_CrateSortDialog):
 
         body = QLabel()
         body.setTextFormat(Qt.TextFormat.RichText)
-        body.setText('<div style="line-height: 145%;">You have unsaved changes in Classify mode. If you leave now, your corrections will be lost.</div>')
+        body.setText('<div style="line-height: 145%;">You haven\'t accepted your classifications yet — your genre corrections won\'t be written to your files until you do. You can always come back and finish later.</div>')
         body.setWordWrap(True)
         body.setStyleSheet(
             'color: #d5c7ad; font-size: 14px; background: transparent; border: none;'
@@ -374,7 +374,7 @@ class _UnsavedChangesDialog(_CrateSortDialog):
         )
         leave_btn.clicked.connect(self.accept)
 
-        stay_btn = QPushButton('Stay & Finish')
+        stay_btn = QPushButton('Stay && Finish')
         stay_btn.setFixedHeight(36)
         stay_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
@@ -568,6 +568,7 @@ class LibraryBrowserView(QWidget):
         self._loaded_inv_id: Optional[int] = None
         self._inventory = []
         self._edits: dict[str, dict[str, str]] = {}
+        self._confidence_backfilled = False
         self._settings = QSettings('JWBC', 'CrateSort')
         # Genre sidebar selection
         self._sidebar_genre: str = 'All'
@@ -868,6 +869,7 @@ class LibraryBrowserView(QWidget):
         self._search.setPlaceholderText('Search artist, title, album…')
         self._search.setMaximumWidth(260)
         self._search.setFixedHeight(36)
+        self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(self._apply_filter)
         row.addWidget(self._search)
 
@@ -1152,6 +1154,7 @@ class LibraryBrowserView(QWidget):
     def _rebuild_tree(self) -> None:
         self._tree.setSortingEnabled(False)
         self._tree.clear()
+        self._confidence_backfilled = False
 
         # Group tracks by canonical artist
         artist_tracks: dict[str, list] = defaultdict(list)
@@ -1205,6 +1208,9 @@ class LibraryBrowserView(QWidget):
             for rec in tracks:
                 if rec.extension:
                     formats.add(rec.extension.lstrip('.').upper())
+
+        if self._confidence_backfilled:
+            self._save_edits()
 
         # Column widths (only set on fresh load to respect QSettings restoreState)
         if not self._settings.value(_SETTINGS_KEY):
@@ -1302,7 +1308,29 @@ class LibraryBrowserView(QWidget):
         # state. Neither is touched by classify-mode's own review painting
         # (_populate_classify_columns, Proposed Genre only) — this is the
         # only place either column is ever written.
+        #
+        # Once an artist is settled (Approved or Edited), Confidence always
+        # reads MATCHED — frozen in library_edits.json at decision time (see
+        # _apply_library_genre / _exit_classify_mode_accept). Deliberate,
+        # confirmed with Jace 2026-08-07: a library the user has already
+        # reviewed shouldn't keep flashing the pre-decision LOW/NONE color
+        # forever — that reads as "still needs attention" / an uncleaned
+        # library even after they've explicitly signed off. The original
+        # tier is only ever meaningful before a decision is made; a future
+        # "reset classification" feature can surface it again on demand.
         _, confidence = self._classify_lookup(artist)
+        frozen = self._frozen_confidence(artist)
+        existing_override = self._edits.get(f'__artist__{artist}', {}).get('genre')
+        if frozen != 'MATCHED' and existing_override and existing_override not in _UC_ARTIST:
+            # Backfill/migrate: covers artists settled before Confidence-
+            # freezing existed at all (frozen == '') and artists frozen by
+            # an earlier build of this feature that froze the original tier
+            # instead of always MATCHED (frozen == 'HIGH'/'LOW'/...). Either
+            # way, once settled it should read MATCHED from here on.
+            self._edits[f'__artist__{artist}']['confidence'] = 'MATCHED'
+            self._confidence_backfilled = True
+            frozen = 'MATCHED'
+        confidence = frozen or confidence
         if confidence:
             item.setText(LC_CLS_CONF, confidence)
             item.setForeground(LC_CLS_CONF, QBrush(QColor(self._CONF_COLORS.get(confidence, '#a89b85'))))
@@ -1420,6 +1448,13 @@ class LibraryBrowserView(QWidget):
         except Exception:
             pass
         return '', ''
+
+    def _frozen_confidence(self, artist: str) -> str:
+        """Confidence tier frozen at the moment this artist was last settled
+        (Approved/Edited via Accept Reclassifications, right-click Approve, or
+        Change Genre), or '' if never settled. See _apply_library_genre /
+        _exit_classify_mode_accept for where this gets written."""
+        return self._edits.get(f'__artist__{artist}', {}).get('confidence', '')
 
     # ── Lazy loading ──────────────────────────────────────────────────
 
@@ -1766,10 +1801,19 @@ class LibraryBrowserView(QWidget):
         for key, genre in edits_map.items():
             if genre is None:
                 self._edits.get(key, {}).pop('genre', None)
+                self._edits.get(key, {}).pop('confidence', None)
                 if key in self._edits and not self._edits[key]:
                     del self._edits[key]
             else:
                 self._edits.setdefault(key, {})['genre'] = genre
+                # Freeze Confidence to MATCHED the moment this artist is
+                # settled (Approved or Edited) — a reviewed library shouldn't
+                # keep flashing the pre-decision LOW/NONE color at the user
+                # forever; that reads as "still needs attention" even after
+                # they've explicitly signed off. See _frozen_confidence for
+                # the read side.
+                if key.startswith('__artist__'):
+                    self._edits[key]['confidence'] = 'MATCHED'
 
         # Stage a per-track genre entry for anything that actually writes to
         # disk successfully — same "free-tier write-through" pattern used for
@@ -2027,26 +2071,33 @@ class LibraryBrowserView(QWidget):
         new_genre = dlg.selected_genre
 
         old_edits: dict[str, Optional[str]] = {}
+        disk_old: dict[str, str] = {}
         for item in selected:
             if item.parent() is None:
                 data   = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
                 artist = data.get('artist', '')
                 key = f'__artist__{artist}'
+                for rec in data.get('tracks', []):
+                    disk_old[str(rec.path)] = rec.genre or ''
             else:
                 rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
                 if not rec:
                     continue
                 key = str(rec.path)
+                disk_old[str(rec.path)] = rec.genre or ''
             old_edits[key] = self._edits.get(key, {}).get('genre')
         if not old_edits:
             return
 
         label = hint_label or f'{len(selected)} items'
         if self._undo_manager:
-            cmd = LibraryGenreChangeCommand(self, old_edits, new_genre, {}, label)
+            cmd = LibraryGenreChangeCommand(self, old_edits, new_genre, disk_old, label)
             self._undo_manager.push(cmd)
         else:
-            self._apply_library_genre({k: new_genre for k in old_edits}, {})
+            self._apply_library_genre(
+                {k: new_genre for k in old_edits},
+                {p: new_genre for p in disk_old},
+            )
 
     def _artist_menu(self, item: QTreeWidgetItem, pos) -> None:
         data  = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
@@ -2065,7 +2116,7 @@ class LibraryBrowserView(QWidget):
 
     def _approve_artist(self, item: QTreeWidgetItem, artist: str) -> None:
         """Right-click 'Approve' — accept the classifier's current proposal
-        for just this one artist. Same write path as _change_artist_genre
+        for just this one artist. Same write path as _change_genre_for_selection
         (real per-track disk write + library_edits.json staging, undoable),
         just sourcing the genre from the classifier's proposal instead of a
         user-picked value from the Change Genre dialog."""
@@ -2116,32 +2167,6 @@ class LibraryBrowserView(QWidget):
             QApplication.clipboard().setText(rec.title or '')
         elif action == cp_p:
             QApplication.clipboard().setText(path)
-
-    def _change_track_genre(self, child: QTreeWidgetItem, rec) -> None:
-        """Change genre on the right-clicked track and any other selected tracks."""
-        from cratesort.src.gui.classifier_view import _ChangeGenreDialog
-        current = rec.genre or ''
-        dlg = _ChangeGenreDialog(rec.filename, current, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        new_genre = dlg.selected_genre
-        selected = [item for item in self._tree.selectedItems() if item.parent()]
-        if child not in selected:
-            selected = [child]
-
-        old_edits: dict[str, Optional[str]] = {}
-        for sel in selected:
-            sel_rec = sel.data(LC_PATH, Qt.ItemDataRole.UserRole)
-            if sel_rec:
-                old_edits[str(sel_rec.path)] = self._edits.get(str(sel_rec.path), {}).get('genre')
-        if not old_edits:
-            return
-
-        if self._undo_manager:
-            cmd = LibraryGenreChangeCommand(self, old_edits, new_genre, {}, rec.filename)
-            self._undo_manager.push(cmd)
-        else:
-            self._apply_library_genre({k: new_genre for k in old_edits}, {})
 
     def _reassign_track(self, child: QTreeWidgetItem) -> None:
         """Move one or more selected tracks to a different (existing or new) artist group."""
@@ -2197,25 +2222,6 @@ class LibraryBrowserView(QWidget):
             }
             disk_map = {path: new_artist for path in moves}
             self._apply_library_reassign(edits_map, disk_map)
-
-    def _change_artist_genre(self, item: QTreeWidgetItem, artist: str) -> None:
-        from cratesort.src.gui.classifier_view import _ChangeGenreDialog
-        current = item.text(LC_GENRE)
-        dlg = _ChangeGenreDialog(artist, current, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        new_genre = dlg.selected_genre
-        key = f'__artist__{artist}'
-        old_genre = self._edits.get(key, {}).get('genre')
-
-        artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-        disk_old = {str(rec.path): (rec.genre or '') for rec in artist_data.get('tracks', [])}
-
-        if self._undo_manager:
-            cmd = LibraryGenreChangeCommand(self, {key: old_genre}, new_genre, disk_old, artist)
-            self._undo_manager.push(cmd)
-        else:
-            self._apply_library_genre({key: new_genre}, {p: new_genre for p in disk_old})
 
     def _edit_artist_tags(self, item: QTreeWidgetItem, artist: str) -> None:
         from cratesort.src.gui.classifier_view import _EditTagsDialog
@@ -2477,6 +2483,14 @@ class LibraryBrowserView(QWidget):
         proposed_genre, confidence = self._session_genre[artist]
         _UC = {'', '—', 'Unclassified', 'Untagged'}
 
+        # NOT self._frozen_confidence() here — that answers "what does the
+        # Confidence column show" (always 'MATCHED' once settled, see
+        # _apply_library_genre), which is a display-only decision. Status
+        # needs the classifier's live, natural confidence to detect the one
+        # case Accept never writes an edit for (raw tag already valid) —
+        # conflating the two collapses Edited into Approved for every
+        # settled artist, since a frozen 'MATCHED' would short-circuit here
+        # before the existing_genre/proposed_genre comparison below runs.
         if confidence == 'MATCHED':
             # The file's own tag already IS the taxonomy genre — Accept
             # deliberately never writes an edit for these (nothing to
@@ -2640,6 +2654,9 @@ class LibraryBrowserView(QWidget):
             # acceptances/overrides, so nothing further is needed here.
             if proposed and proposed not in _UC:
                 edits.setdefault(artist_key, {})['genre'] = proposed
+                # Freeze Confidence to MATCHED at accept time — same rule as
+                # _apply_library_genre, see _frozen_confidence for the read side.
+                edits[artist_key]['confidence'] = 'MATCHED'
                 item.setText(LC_GENRE, proposed)
                 item.setData(LC_GENRE, Qt.ItemDataRole.UserRole + 1, proposed)
                 item.setForeground(LC_GENRE, QBrush(QColor('#f1e3c8')))

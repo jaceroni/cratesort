@@ -29,6 +29,15 @@ Link two tracks together with a relationship label so that finding one surfaces 
 
 ---
 
+### Custom Workspace Layouts
+Column order/width in the Library tree is currently a single global OS-level setting (`QSettings`), not tied to any particular library. That's correct default behavior — the app remembers how the DJ likes to work, independent of which library is loaded — but some users may want a named, savable layout (e.g., a "file audit" layout with Path pulled forward, vs. a default "browsing" layout).
+
+**Use case:** A DJ who occasionally needs to eyeball file paths (e.g., checking Organize output) drags the Path column next to Artist, but doesn't want that as their permanent default — they want to toggle between a couple of saved column arrangements.
+
+**Why it's tabled:** Raised during 2026-08-07 testing as a "long time from now" idea, not a request to build. Needs real user-testing signal on whether the single global default is ever actually a pain point before investing in named layout presets/toggles.
+
+---
+
 ## Rinse (Duplicate Detection)
 
 ### Artwork Thumbnail on Click in Rinse Review Screen
@@ -123,4 +132,4 @@ A lightweight standalone companion app positioned as a free lead-gen piece for C
 
 ---
 
-*Last updated: August 4, 2026*
+*Last updated: August 7, 2026*

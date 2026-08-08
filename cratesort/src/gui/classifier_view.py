@@ -46,6 +46,15 @@ _DJ_TOOLS_FOLDER_PATTERNS = frozenset({
     'shoutout', 'shoutouts',
     'promo', 'promos', 'jingle', 'jingles',
     '_hotline', 'hotline', 'bchs', 'generic',
+    # 'dj tools' — without this, a track correctly bucketed here on first
+    # scan (via a source-folder pattern above) falls out on every scan
+    # *after* Organize moves it into Media/.../DJ Tools (untagged)/, since
+    # that destination folder name itself never matched any pattern. It
+    # would then reclassify as a brand-new "Unknown Artist" and Organize
+    # would propose moving it again — an infinite reclassify/reorganize
+    # loop for every DJ Tools track. This substring also matches the
+    # literal DJ_TOOLS_LABEL destination folder below.
+    'dj tools',
 })
 
 DJ_TOOLS_LABEL = 'DJ Tools (untagged)'
@@ -425,12 +434,17 @@ class _ClassifyWorker(QThread):
                 raw_artist = rec.artist or ''
                 no_artist = not raw_artist or raw_artist.lower() in ('unknown artist', 'various', 'fx')
 
-                # Fix 7: video files in purpose-video folders → DJ Tools / Specialty
+                # Fix 7: untagged video files in purpose-video folders → DJ Tools /
+                # Specialty. Requires no_artist, same as the audio DJ Tools check
+                # below — a video with a real artist tag (e.g. a commercial with
+                # a proper ©ART) is real per-artist content and must flow through
+                # normal artist grouping, not get swept into the generic bucket
+                # just for sitting in a folder named "Commercials"/"Clips"/etc.
                 _VIDEO_PURPOSE = frozenset({
                     'movie clips', '_movie clips', 'commercials', '_commercials',
                     'clips', 'films', 'visuals', '_visuals',
                 })
-                if rec.is_video:
+                if rec.is_video and no_artist:
                     path_lower = str(rec.path).lower()
                     if any(p in path_lower for p in _VIDEO_PURPOSE):
                         dj_tools_tracks.append(rec)

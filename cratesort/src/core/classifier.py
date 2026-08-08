@@ -738,6 +738,23 @@ class GenreClassifier:
     def classify(
         self, record: TrackRecord, style_tags: Optional[list[str]] = None,
     ) -> ClassificationResult:
+        raw_genre = (record.genre or "").strip()
+        genre_lower = raw_genre.lower()
+
+        # ── Tier 1: Already a valid parent genre (case-insensitive) ─────────
+        # Checked before the short-clip/purpose-folder pre-check below so an
+        # exact tag match always wins outright — a file already correctly
+        # tagged "Specialty" should never be downgraded to HIGH just because
+        # it's a short clip sitting in a Drops folder.
+        canonical_parent = next((g for g in PARENT_GENRES if g.lower() == genre_lower), None)
+        if canonical_parent:
+            return ClassificationResult(
+                genre=canonical_parent,
+                confidence=Confidence.MATCHED,
+                reason="Genre tag is a valid parent genre",
+                original_genre_tag=raw_genre,
+            )
+
         # ── Pre-check: short duration in purpose folder → Specialty (fix 3) ─
         if record.duration and record.duration < 30:
             for part in record.path.parts:
@@ -748,19 +765,6 @@ class GenreClassifier:
                         reason=f"Short clip ({record.duration:.0f}s) in purpose folder '{part}'",
                         original_genre_tag=(record.genre or None),
                     )
-
-        raw_genre = (record.genre or "").strip()
-        genre_lower = raw_genre.lower()
-
-        # ── Tier 1: Already a valid parent genre (case-insensitive) ─────────
-        canonical_parent = next((g for g in PARENT_GENRES if g.lower() == genre_lower), None)
-        if canonical_parent:
-            return ClassificationResult(
-                genre=canonical_parent,
-                confidence=Confidence.MATCHED,
-                reason="Genre tag is a valid parent genre",
-                original_genre_tag=raw_genre,
-            )
 
         # ── Tier 2: User-entered style tag resolved via style map ───────────
         # A real, valid genre tag (Tier 1) always wins outright — this only

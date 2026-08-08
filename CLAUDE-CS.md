@@ -215,13 +215,15 @@ When `load()` runs and **either** `_is_classification_complete()` is `False` (no
 
 **Manual toolbar path** (`auto_classify=False`): same existing behavior — if session exists, enter classify mode directly; otherwise disable the button, run the worker, reconnect to `_on_classify_finished` / `_on_classify_error`.
 
-### Classify mode navigate-away guard dialog
+### Classify mode navigate-away guard dialog (corrected 2026-08-07)
 
-When the user tries to navigate away from Library while in classify mode, `_UnsavedClassifyDialog` appears with:
-- **Headline**: "Classifications not saved"
-- **Body**: "You haven't accepted your classifications yet — your genre corrections won't be written to your files until you do."
-- **Primary button (teal)**: "Stay & Finish" — closes dialog, keeps user in classify mode
+When the user tries to navigate away from Library while in classify mode, `_UnsavedChangesDialog` (`library_browser.py` — **not** `_UnsavedClassifyDialog`, a name that never existed in code) appears, triggered from `main_window.py`'s `_on_nav()` via `has_unsaved_classify_changes()`. That check is just `self._classify_mode` — it fires whenever classify mode is active at all, including the very first auto-triggered review on a fresh library, not only after the user has actually touched anything.
+- **Headline**: "Classifications Not Saved"
+- **Body**: "You haven't accepted your classifications yet — your genre corrections won't be written to your files until you do. You can always come back and finish later."
+- **Primary button (teal)**: "Stay && Finish" (Qt double-ampersand — a single `&` is a mnemonic marker and silently disappears from the rendered label; this exact bug shipped once already, watch for it in any new button text)
 - **Secondary button (red)**: "Leave Anyway" — exits classify mode, allows navigation
+
+**"Leave Anyway" does not lose anything.** It only calls `_exit_classify_mode_cancel()`, which clears the transient Proposed Genre column and hides the classify banner — `classification_session.json` was already persisted by the dashboard's classify phase independent of this UI flag, and nothing in `library_edits.json` is touched. The review simply reopens next visit since nothing was Accepted. The body copy above was rewritten 2026-08-07 after it was found to claim "your corrections will be lost" (literally false) and to reference "Classify mode" (internal jargon the user never opted into — this review auto-opens with no click required, see "Auto-classify" above).
 
 This dialog is the only navigate-away guard for classify mode. Do not add additional dialogs or change these labels without explicit approval.
 
@@ -287,17 +289,21 @@ Classification is complete when `_CrateSort/classification_accepted.flag` exists
 
 `_is_classification_complete()` checks for this flag file. It does NOT check `library_edits.json` entry counts or `classification_session.json` existence.
 
-### Confidence column — permanent, five-tier, never changes on accept
+### Confidence column — permanent, five-tier while pending, frozen to MATCHED once settled (redesigned 2026-08-07)
 
-Confidence is a **permanent** column (see column architecture above) — it always shows the classifier's raw tier for an artist, in and out of classify mode, **and it never changes once an artist is Approved/Edited**. This is deliberate: Confidence answers "how did the classifier arrive at this genre" (a historical fact about classification method), not "has this been decided yet" (that's Status's job, below). A HIGH-confidence artist stays HIGH forever after approval — it must never flip to MATCHED just because a human signed off on it, since that would misrepresent what the file's raw tag actually said. The practical value, confirmed with Jace 2026-08-06: once a library is fully Approved, Confidence becomes a standing quality/audit signal — any Approved row that isn't MATCHED or HIGH is a candidate worth a second look later, and that only works if approval doesn't erase the tier.
+Confidence is a **permanent** column (see column architecture above), populated in `_make_artist_item()` (`library_browser.py`). Before an artist is settled it shows the classifier's live raw tier, re-read every classify pass. **Once an artist is settled (Approved or Edited), Confidence always reads MATCHED — the original tier is discarded, not preserved.**
+
+This is a deliberate reversal of the original design, which froze the *original* tier forever as a standing "quality/audit signal" (any Approved row that wasn't MATCHED/HIGH was meant to be a candidate for a second look). That reasoning was scrapped 2026-08-07 after real-world testing showed the actual effect: a fully-reviewed, fully-Approved library kept flashing LOW/NONE/red at the user on every visit, which reads as "this library is still dirty" — the opposite of the intended signal, and especially wrong for a manual Edit/override, where the pre-edit tier (e.g. NONE, for an artist the classifier had zero signal on) has no bearing on a human's deliberate decision. Jace's call: **only a genuinely undecided (Pending) artist should ever show its original tier.** A future "reset classification" feature may reintroduce a way to see the original tier again on demand — not built yet.
 
 | Tier | Meaning | Color |
 |---|---|---|
-| MATCHED | Existing ID3 tag matches taxonomy exactly — no change needed | `#f1e3c8` (cream) |
-| HIGH | Genre tag resolved via style map, or a user Style Tag resolved via style map | `#428175` (teal) |
-| MEDIUM | Style-token analysis (comment/genre/Style Tag fields) | `#9fa4c7` (lavender) |
-| LOW | Limited signal, user should review | `#D17D34` (orange) |
-| NONE | No usable data, user must decide | `#C75B5B` (red) |
+| MATCHED | Existing ID3 tag matches taxonomy exactly, **or** the artist has been Approved/Edited (frozen, regardless of original tier) | `#f1e3c8` (cream) |
+| HIGH | Genre tag resolved via style map, or a user Style Tag resolved via style map — **pending only** | `#428175` (teal) |
+| MEDIUM | Style-token analysis (comment/genre/Style Tag fields) — **pending only** | `#9fa4c7` (lavender) |
+| LOW | Limited signal, user should review — **pending only** | `#D17D34` (orange) |
+| NONE | No usable data, user must decide — **pending only** | `#C75B5B` (red) |
+
+**Implementation**: `_apply_library_genre()` and `_exit_classify_mode_accept()` both write `'confidence': 'MATCHED'` into the artist's `library_edits.json` entry at the same moment they write `'genre'` — this is the freeze. `_frozen_confidence(artist)` reads it back; `_make_artist_item()` prefers it over a fresh `_classify_lookup()` read whenever present. `_derive_persistent_status()` deliberately does **not** use `_frozen_confidence()` — it needs the classifier's live natural confidence to detect the one case Accept never writes an edit for (raw tag already valid); reusing the frozen value there would collapse Edited into Approved for every settled artist, since a frozen MATCHED would short-circuit before the genre-comparison logic runs. **Backfill/migration**: `_make_artist_item()` also freezes on the fly for any settled artist whose stored `confidence` is missing *or* isn't `'MATCHED'` (`frozen != 'MATCHED'`, not `not frozen`) — the latter check exists because an earlier, short-lived build of this feature froze the *original* tier instead of MATCHED, and that stale data needs upgrading too, not just artists with no frozen value at all. `_rebuild_tree()` batches these into one `_save_edits()` call rather than one per artist.
 
 MATCHED entries are not written to `library_edits.json` on Accept — their existing tag is their classification, so there's nothing to accept. Both `_count_unclassified_artists()` and `_populate_classify_columns()` account for this explicitly (see their respective sections) — a MATCHED artist never accumulates a real edits entry, so any "is this settled" check that only looks for an edits entry must also special-case `confidence == 'MATCHED'`.
 
@@ -324,6 +330,14 @@ Right-click → Edit Style Tags (on a track or an artist row) stages a comma-sep
 - Non-matching Style Tags still aren't wasted — they're appended to the candidate-text pool for Tier 4's (renumbered) token-vote analysis (MEDIUM confidence), alongside comment/genre fields.
 - `_ClassifyWorker.run()` (`classifier_view.py`) loads `library_edits.json` once per classify pass and merges both track-level and artist-level (`__artist__{name}`) tags into a `style_tags_by_path` dict, passed through `GenreClassifier.classify_all(tracks, style_tags_by_path=...)`.
 - Since classification already reruns automatically on every launch, a Style Tag added in one session resolves on the *next* launch's classify pass — surfaced automatically via the zero-click auto-trigger above, no manual reclassify needed.
+
+### Tier ordering and DJ Tools bucketing — two real bugs fixed 2026-08-07
+
+**Tier 1 (exact tag match) now runs before the short-clip/purpose-folder pre-check in `classifier.py`.** It used to run *after* — a file under 30s sitting in a folder matching `_SHORT_SPECIALTY_FOLDERS` (`drops`, `__drops`, `artists`, `fx`, etc.) was forced to `Specialty`/HIGH unconditionally, even when its own tag was already an exact, valid parent genre that Tier 1 would have matched at MATCHED. Confirmed live: two DJ-drop files already tagged exactly `Specialty` were permanently capped at HIGH no matter what write-through did to the tag, because the pre-check never let Tier 1 run at all. Rule going forward: an exact tag match always wins outright, checked before any duration/folder heuristic.
+
+**Video files in purpose folders now require `no_artist` before bucketing into DJ Tools ("Fix 7", `classifier_view.py` `_ClassifyWorker.run()`).** The video branch checked `rec.is_video` + path-matches-`_VIDEO_PURPOSE` (`commercials`, `_commercials`, `clips`, `films`, `visuals`, etc.) with no artist check at all — unlike the very next block (the equivalent audio-side DJ Tools check), which correctly requires `no_artist` first. Any video with a perfectly valid `©ART` tag sitting in e.g. a `_Commercials` folder had that real artist silently discarded and got dumped into the generic "DJ Tools (untagged)" bucket. Confirmed live against two commercial `.mp4` files with clean, complete metadata (real `©ART`, valid `©gen`) that CrateSort's scanner read correctly — the bug was purely in this grouping step, not tag-reading. Fixed by adding the same `no_artist` requirement the audio path already has.
+
+**`_DJ_TOOLS_FOLDER_PATTERNS` (`classifier_view.py`) now includes `'dj tools'`.** Without it, a track correctly bucketed into DJ Tools on first scan (matched a *source*-folder pattern like `generic`/`__drops`) fell out on every scan *after* Organize moved it into its destination `Media/.../DJ Tools (untagged)/` folder — that destination folder name itself never matched any pattern in the set. It would then reclassify as a brand-new "Unknown Artist" and Organize would propose moving it again, an infinite reclassify/reorganize churn for any DJ Tools track once organized. The pattern-match is a plain substring check against the full lowercased path, so `'dj tools'` also matches the literal `DJ_TOOLS_LABEL` destination folder (`'DJ Tools (untagged)'`) without needing an exact-string reference.
 
 ### Artist genre fallback chain (in _rebuild_tree)
 
@@ -406,14 +420,18 @@ Thin public wrapper around the internal mutagen tag helpers. Loads the file with
 **Supported formats:** MP3/WAV/AIFF, MP4/M4A, FLAC.
 **Not supported:** `tags` (style tags — virtual-only, deferred).
 
+**Known gap, found 2026-08-07, not yet fixed**: `write_file_metadata()` returns `True` whenever mutagen opens the file and `.save()` doesn't throw — it never checks whether `_write_metadata_tag()`/the per-format `_write_*` helper actually matched a branch and changed anything. For an unsupported extension (anything outside the three format groups above, e.g. `.ogg`), this is a silent no-op reported as success. Confirmed real by testing directly against files, but not the root cause of the bug that prompted the investigation (see next paragraph) — left as a known latent issue.
+
 ### Write-through call sites in `library_browser.py`
 
 | Method | Field written | Failure behavior |
 |---|---|---|
 | `_commit_active_editor` | `title/album/bpm/year/comment` | Reverts cell display; 5s warning in `_count_label`; staging in `library_edits.json` always preserved |
 | `_reassign_track` | `artist` | Single warning after all tracks; partial success accepted |
-| `_apply_library_genre` (shared by `_change_artist_genre`, `_approve_artist`, and undo/redo via `LibraryGenreChangeCommand`) | `genre` (all tracks for artist) | Disk-failure count flashed via `_flash_disk_failure`; partial success accepted |
+| `_apply_library_genre` (shared by `_change_genre_for_selection`, `_approve_artist`, and undo/redo via `LibraryGenreChangeCommand`) | `genre` (all tracks for artist or track) | Disk-failure count flashed via `_flash_disk_failure`; partial success accepted |
 | `_exit_classify_mode_accept` | `genre` (all accepted tracks) | Same; flag file still written |
+
+**Real bug fixed 2026-08-07 — "Change Genre…" silently never wrote to disk.** The artist-row and track-row context menus' "Change Genre…" action both dispatch to `_change_genre_for_selection()`, the single live write path for manual genre overrides. It was calling `_apply_library_genre(edits_map, {})` — a hardcoded empty `disk_map` — so it only ever staged `library_edits.json`, never touched the actual file, even though the UI flashed success and Status showed Edited/Approved. Meanwhile `_change_artist_genre` and `_change_track_genre` (now deleted) had the *correct* disk-write logic but had zero call sites anywhere — dead code that never got wired to the menu that needed it. Fixed by building a real `disk_map` (track path → new genre, covering every track under an artist-row selection or the track itself for a track-row selection) directly inside `_change_genre_for_selection()`, matching the working pattern `_approve_artist` already used, then deleting the two orphaned methods as fully redundant. Caught via direct reproduction against a real test file (`write_file_metadata()` worked correctly in isolation; the menu action just never called it) — another instance of this codebase's known dead-code pattern, see `[[feedback_verify_ui_reachability]]`.
 
 **`_approve_artist` (added 2026-08-06)** — right-click → Approve on an artist row. Applies the classifier's *current proposed genre* (`_classify_lookup`) through the exact same `_apply_library_genre` write path as Change Genre, just sourcing the value from the classifier instead of a dialog. **Was a completely dead menu item before this fix** — the QAction was added to the context menu but the dispatch `if/elif` chain never checked for it, so clicking did nothing. `'⚑ Mark for Review'` was found dead in the same menu at the same time (traced `ArtistEntry.state == 'flagged'` — only ever set/read inside `_ClassifierViewLegacy`, dead code) and removed outright rather than built out, confirmed with Jace.
 
