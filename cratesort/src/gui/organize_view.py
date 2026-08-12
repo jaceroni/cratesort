@@ -1234,21 +1234,22 @@ class OrganizeView(QWidget):
         skipped = len(result.skipped)
 
         self._done_label.setText('Reorganization complete!')
-        detail = f'{moved:,} file{"s" if moved != 1 else ""} moved successfully.'
+        line1 = f'{moved:,} file{"s" if moved != 1 else ""} moved successfully.'
         if failed:
-            detail += f'  {failed:,} file{"s" if failed != 1 else ""} failed.'
+            line1 += f' {failed:,} file{"s" if failed != 1 else ""} failed.'
         if skipped:
-            detail += (
-                f'  {skipped:,} file{"s" if skipped != 1 else ""} could not be moved'
+            line1 += (
+                f' {skipped:,} file{"s" if skipped != 1 else ""} could not be moved'
                 f' — destination already existed. Check the log for details.'
             )
+        lines = [line1]
         if moved > 0:
             summary = result.crate_rewrite_summary
             if summary and summary.get('paths_rewritten', 0) > 0:
-                detail += f'  {summary["crates_modified"]:,} crate(s) updated.'
+                lines.append(f'{summary["crates_modified"]:,} crate(s) updated.')
             else:
-                detail += '  Crate paths not updated — use Repair Crate Paths in Settings.'
-        self._done_detail.setText(detail)
+                lines.append('Crate paths not updated — use Repair Crate Paths in Settings.')
+        self._done_detail.setText('\n'.join(lines))
         self._rollback_btn.setVisible(True)
         self._rollback_btn.setEnabled(bool(self._rollback_log_path))
         self._done_back_btn.setEnabled(True)

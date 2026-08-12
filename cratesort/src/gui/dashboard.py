@@ -13,15 +13,17 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import (
-    Qt, QEasingCurve, QPropertyAnimation,
+    Qt, QEasingCurve, QPointF, QPropertyAnimation, QRectF,
     QSettings, QThread, QTimer, QVariantAnimation, pyqtSignal,
 )
-from PyQt6.QtGui import QBrush, QColor, QFontMetrics, QLinearGradient, QPainter, QPen
+from PyQt6.QtGui import (
+    QBrush, QColor, QFontMetrics, QLinearGradient, QPainter, QPen, QRadialGradient,
+)
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
+    QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
     QGridLayout, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem,
-    QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSplitter,
     QSplitterHandle, QStackedWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -47,6 +49,8 @@ _LOGO_SVG       = _ASSETS / 'logo' / 'cs-logo-mascot-stacked.svg'
 _MASCOT_SVG     = _ASSETS / 'logo' / 'cs-logo-mascot-only.svg'
 _ICON_CHECKED   = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
 _ICON_UNCHECKED = str(_ASSETS / 'icons' / 'checkbox-unchecked.svg')
+_ICON_RADIO_ON  = str(_ASSETS / 'icons' / 'radio-checked.svg')
+_ICON_RADIO_OFF = str(_ASSETS / 'icons' / 'radio-unchecked.svg')
 _ORG, _APP = 'JWBC', 'CrateSort'
 
 # Minimum time the scanning UI stays visible (ms)
@@ -451,16 +455,37 @@ class _ChangeReviewDialog(_CrateSortDialog):
     """
     Review Serato library changes detected since the last session.
 
-    Each row shows the change description, when it happened, and a Revert
-    button. Clicking Revert marks that change as pending revert (row grays out,
-    button becomes Undo). Clicking Undo cancels the pending revert. No disk
-    writes happen until the user clicks Sync & Proceed — at that point all
-    pending reverts are executed and the checkpoint is saved. Clicking Cancel
-    leaves the checkpoint unchanged and the sync banner remains.
+    Each row shows the change description, when it happened, and a
+    two-option radio pair — exactly one is selected per row, first
+    option selected by default. The option text is per-change-type
+    (see _RADIO_LABELS) and states the concrete resulting outcome for
+    the crate/tracks themselves — e.g. "Leave Removed" / "Restore
+    Crate" for a crate removal — rather than a generic "Keep"/"Undo"
+    (which reads ambiguously: keep the *crate*, or keep the *removal*?)
+    or "Approve"/"Remove" (which both sound destructive next to a
+    removal-type change). Selecting the second option marks that change
+    as pending revert. No disk writes happen until the user clicks
+    Apply & Continue — at that point all pending reverts are executed
+    and the checkpoint is saved. Clicking Cancel leaves the checkpoint
+    unchanged and the sync banner remains.
     """
 
     _TEAL_TYPES   = {'crate_added', 'tracks_added', 'renamed', 'added'}
     _ORANGE_TYPES = {'crate_removed', 'tracks_removed', 'removed'}
+
+    # Per-row option text describing the actual resulting state, not an
+    # abstract "keep/undo the change" — "Keep"/"Undo" alone read as
+    # ambiguous next to a *removal* ("keep the removal, or keep the
+    # crate?"). Each pair below states outcomes directly: what happens
+    # to the crate/tracks themselves if this option is selected.
+    _RADIO_LABELS: dict[str, tuple[str, str]] = {
+        'crate_added':    ('Keep Crate',    'Delete Crate'),
+        'crate_removed':  ('Leave Removed', 'Restore Crate'),
+        'renamed':        ('Keep New Name', 'Revert Name'),
+        'tracks_added':   ('Keep Tracks',   'Remove Tracks'),
+        'tracks_removed': ('Leave Removed', 'Restore Tracks'),
+    }
+    _DEFAULT_RADIO_LABELS = ('Keep', 'Undo')
 
     def __init__(
         self,
@@ -471,17 +496,17 @@ class _ChangeReviewDialog(_CrateSortDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setMinimumSize(540, 480)
+        self.setMinimumWidth(540)
 
         self._serato_dir         = serato_dir
         self._updated_crates     = dict(current_crates)
-        self._pending_reverts:   set[int] = set()   # indices into self._changes
+        self._pending_reverts:   set[int] = set()   # indices into self._changes marked for removal
         self._changes            = list(changes)
 
         # Use the standard dialog layout builder with Orange accent (selection/confirm)
         layout = _create_dialog_layout(self)
 
-        title = QLabel('Serato Library Changes Detected')
+        title = QLabel('Serato Crate Changes Detected')
         title.setStyleSheet(
             'color: #f1e3c8; font-size: 22px; font-weight: 600; '
             'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
@@ -490,16 +515,16 @@ class _ChangeReviewDialog(_CrateSortDialog):
         layout.addSpacing(6)
 
         if checkpoint_timestamp:
-            day = checkpoint_timestamp.day
-            since_str = checkpoint_timestamp.strftime(f'%B {day}, %Y at %I:%M %p')
+            date_str = checkpoint_timestamp.strftime('%m/%d/%y')
+            time_str = checkpoint_timestamp.strftime('%I:%M %p').lstrip('0')
             desc_text = (
-                f'Changes detected since your last session on {since_str}. '
-                'Mark any changes to revert before syncing.'
+                f'Things have changed since your last session on {date_str} at {time_str}. '
+                'Please review the changes below before your next session:'
             )
         else:
             desc_text = (
-                'Changes detected since your last CrateSort session. '
-                'Mark any changes to revert before syncing.'
+                'Things have changed since your last CrateSort session. '
+                'Please review the changes below before your next session:'
             )
         desc = QLabel()
         desc.setTextFormat(Qt.TextFormat.RichText)
@@ -513,6 +538,7 @@ class _ChangeReviewDialog(_CrateSortDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }')
 
         rows_container = QWidget()
@@ -521,7 +547,11 @@ class _ChangeReviewDialog(_CrateSortDialog):
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(4)
         scroll.setWidget(rows_container)
-        layout.addWidget(scroll, stretch=1)
+        # Cap the visible list so it scrolls past ~6 rows instead of forcing
+        # the dialog to grow unbounded; below the cap, the dialog shrinks to
+        # fit the actual number of changes (no leftover blank space).
+        scroll.setMaximumHeight(300)
+        layout.addWidget(scroll)
 
         self._row_frames: list[QFrame] = []
         for i, change in enumerate(self._changes):
@@ -543,7 +573,7 @@ class _ChangeReviewDialog(_CrateSortDialog):
         )
         self._cancel_btn.clicked.connect(self.reject)
 
-        self._sync_btn = QPushButton('Sync && Proceed')
+        self._sync_btn = QPushButton('Apply && Continue')
         self._sync_btn.setFixedHeight(36)
         self._sync_btn.setStyleSheet(
             'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
@@ -596,94 +626,52 @@ class _ChangeReviewDialog(_CrateSortDialog):
         h.addWidget(time_lbl)
 
         can_revert = self._can_revert(change)
+        keep_text, undo_text = self._RADIO_LABELS.get(ctype, self._DEFAULT_RADIO_LABELS)
+
+        radio_group = QButtonGroup(frame)
+        radio_group.setExclusive(True)
+
+        keep_radio = QRadioButton(keep_text)
+        keep_radio.setCursor(Qt.CursorShape.PointingHandCursor)
+        keep_radio.setStyleSheet(self._RADIO_STYLE)
+        radio_group.addButton(keep_radio)
+        h.addWidget(keep_radio)
+
+        undo_radio: Optional[QRadioButton] = None
         if can_revert:
-            revert_btn = QPushButton('Revert')
-            revert_btn.setFixedHeight(36)
-            revert_btn.setStyleSheet(
-                'QPushButton { background: #c35050; color: #ffffff; font-size: 13px; font-weight: 600; '
-                'border: none; border-radius: 6px; padding: 0 12px; }'
-                'QPushButton:hover { background: #b03c3c; }'
-                'QPushButton:pressed { background: #973434; }'
-            )
-            revert_btn.clicked.connect(
-                lambda _, i=idx, f=frame, d=desc_lbl, t=time_lbl, b=revert_btn: self._on_revert(i, f, d, b)
-            )
-            h.addWidget(revert_btn)
+            undo_radio = QRadioButton(undo_text)
+            undo_radio.setCursor(Qt.CursorShape.PointingHandCursor)
+            undo_radio.setStyleSheet(self._RADIO_STYLE)
+            radio_group.addButton(undo_radio)
+            h.addWidget(undo_radio)
+        else:
+            keep_radio.setEnabled(False)
+
+        keep_radio.setChecked(True)
+
+        if undo_radio is not None:
+            undo_radio.toggled.connect(lambda checked, i=idx: self._on_undo_toggled(i, checked))
 
         self._row_frames.append(frame)
         return frame
 
-    # ── Revert interaction ────────────────────────────────────────────────────
+    # ── Keep / Undo interaction ──────────────────────────────────────────────
 
-    def _on_revert(
-        self,
-        idx: int,
-        frame: QFrame,
-        desc_lbl: QLabel,
-        btn: QPushButton,
-    ) -> None:
-        if idx in self._pending_reverts:
-            # Undo the pending revert
-            self._pending_reverts.discard(idx)
-            frame.setStyleSheet(
-                'QFrame { background: #2a2a2a; border: none; border-radius: 4px; }'
-            )
-            desc_lbl.setStyleSheet(
-                'color: #f1e3c8; font-size: 13px; background: transparent; border: none;'
-            )
-            btn.setText('Revert')
-            btn.setStyleSheet(
-                'QPushButton { background: #c35050; color: #ffffff; font-size: 11px; font-weight: 600; '
-                'border: none; border-radius: 4px; padding: 2px 10px; }'
-                'QPushButton:hover { background: #b03c3c; }'
-                'QPushButton:pressed { background: #973434; }'
-            )
-        else:
-            # Mark as pending revert
+    _RADIO_STYLE = (
+        'QRadioButton { color: #a89b85; font-size: 12px; font-weight: 600; '
+        'background: transparent; border: none; spacing: 6px; padding: 0 4px; }'
+        'QRadioButton::indicator { width: 16px; height: 16px; }'
+        f'QRadioButton::indicator:unchecked {{ image: url("{_ICON_RADIO_OFF}"); }}'
+        f'QRadioButton::indicator:checked   {{ image: url("{_ICON_RADIO_ON}");  }}'
+        'QRadioButton:checked { color: #f1e3c8; }'
+        'QRadioButton:disabled { color: #5a5a5a; }'
+    )
+
+    def _on_undo_toggled(self, idx: int, checked: bool) -> None:
+        if checked:
             self._pending_reverts.add(idx)
-            frame.setStyleSheet(
-                'QFrame { background: #222222; border: 1px solid #3a3a3a; border-radius: 4px; }'
-            )
-            desc_lbl.setStyleSheet(
-                'color: #5a5a5a; font-size: 13px; text-decoration: line-through; '
-                'background: transparent; border: none;'
-            )
-            btn.setText('Undo')
-            btn.setStyleSheet(
-                'QPushButton { background: #2a2a2a; color: #a89b85; font-size: 11px; font-weight: 600; '
-                'border: 1px solid #444; border-radius: 4px; padding: 2px 10px; }'
-                'QPushButton:hover { background: #383838; }'
-            )
-
-        self._update_sync_btn_state()
-
-    def _update_sync_btn_state(self) -> None:
-        n_pending = len(self._pending_reverts)
-        n_total   = len(self._changes)
-        if n_pending == 0:
-            self._sync_btn.setText('Sync && Proceed')
-            self._sync_btn.setStyleSheet(
-                'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
-                'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #925521; }'
-                'QPushButton:pressed { background-color: #7e491c; }'
-            )
-        elif n_pending == n_total:
-            self._sync_btn.setText('Accept && Continue')
-            self._sync_btn.setStyleSheet(
-                'QPushButton { background-color: #428175; color: #ffffff; border: none; '
-                'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #38706a; }'
-                'QPushButton:pressed { background-color: #2d6358; }'
-            )
         else:
-            self._sync_btn.setText('Apply && Proceed')
-            self._sync_btn.setStyleSheet(
-                'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
-                'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
-                'QPushButton:hover { background-color: #925521; }'
-                'QPushButton:pressed { background-color: #7e491c; }'
-            )
+            self._pending_reverts.discard(idx)
 
     # ── Sync action ───────────────────────────────────────────────────────────
 
@@ -780,27 +768,36 @@ class _ChangeReviewDialog(_CrateSortDialog):
 # ---------------------------------------------------------------------------
 
 class _ScanActivityBeam(QWidget):
-    """A soft comet of light that sweeps back and forth in a fixed-width track.
+    """A soft comet of light that bounces back and forth in a fixed-width
+    track, drawn as a plain symmetric teal->gold->teal gradient — no image
+    asset, no directional head/tail, no off-screen phases.
 
     NOT a progress bar and must never be read as one: it never grows, never
     reaches 100%, and always returns to where it started. That's what keeps
     it compliant with the no-fake-progress rule — a real progress bar claims
     to measure completion (`setRange(0, total)`); this only claims "still
     alive," the same job the pulsing mascot already does, just filling the
-    dead horizontal space next to it. Height (3px) and motion (bounded
-    ping-pong, soft gradient) are deliberately distinct from the locked
-    determinate-progress-bar spec (8px, hard-edged teal fill) so it can never
-    be mistaken for one.
+    dead horizontal space next to it. Track height (12px) and motion are
+    deliberately distinct from the locked determinate-progress-bar spec
+    (8px, hard-edged teal fill) so it can never be mistaken for one.
+
+    Deliberately simple: one continuous ping-pong animation, comet always
+    fully within the track, symmetric coloring so there's no "head" or
+    "tail" whose orientation could look wrong on either pass.
     """
+
+    _TRACK_H = 6    # halved again per feedback (was 12)
+    _WIDGET_H = 10  # halved again per feedback (was 20)
+    _CYCLE_MS = 1800
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(3)
+        self.setFixedHeight(self._WIDGET_H)
         self._pos = 0.0
 
         curve = QEasingCurve(QEasingCurve.Type.InOutSine)
         self._anim = QVariantAnimation(self)
-        self._anim.setDuration(1800)  # distinct cadence from the mascot's 1100ms pulse
+        self._anim.setDuration(self._CYCLE_MS)
         self._anim.setStartValue(0.0)
         self._anim.setKeyValueAt(0.5, 1.0)
         self._anim.setEndValue(0.0)
@@ -822,24 +819,55 @@ class _ScanActivityBeam(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
+        track_y = (self._WIDGET_H - self._TRACK_H) / 2
+        track_rect = rect.adjusted(0, int(track_y), 0, -int(track_y))
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor('#383838'))
-        painter.drawRoundedRect(rect, 1.5, 1.5)
+        painter.drawRoundedRect(track_rect, 1.5, 1.5)
 
         w = rect.width()
         if w <= 0:
             painter.end()
             return
-        comet_w = max(24, int(w * 0.32))
+        comet_w = max(16, int(w * 0.17))   # halved per feedback (was 32 / 0.34)
         cx = self._pos * max(0, w - comet_w)
 
+        # Dims toward each end, brightest at center — a parabola in `_pos`
+        # (0 at both ends, 1 at pos=0.5) applied as overall opacity to just
+        # the comet + glow, not the track background beneath them.
+        fade = 4.0 * self._pos * (1.0 - self._pos)
+        painter.setOpacity(max(0.0, min(1.0, fade)))
+
         gradient = QLinearGradient(cx, 0, cx + comet_w, 0)
-        gradient.setColorAt(0.0, QColor(66, 129, 117, 0))
-        gradient.setColorAt(0.5, QColor(66, 129, 117, 220))
-        gradient.setColorAt(1.0, QColor(66, 129, 117, 0))
+        gradient.setColorAt(0.00, QColor(66, 129, 117, 0))
+        gradient.setColorAt(0.18, QColor(80, 158, 143, 190))
+        gradient.setColorAt(0.35, QColor(120, 178, 150, 235))
+        gradient.setColorAt(0.5,  QColor(255, 221, 158, 255))
+        gradient.setColorAt(0.65, QColor(120, 178, 150, 235))
+        gradient.setColorAt(0.82, QColor(80, 158, 143, 190))
+        gradient.setColorAt(1.00, QColor(66, 129, 117, 0))
         painter.setBrush(QBrush(gradient))
-        painter.drawRoundedRect(int(cx), 0, comet_w, rect.height(), 1.5, 1.5)
+        painter.drawRoundedRect(QRectF(cx, track_y, comet_w, self._TRACK_H), 1.5, 1.5)
+
+        cy = self._WIDGET_H / 2.0
+        peak_x = cx + comet_w / 2.0
+        # Hard-capped so the glow's DIAMETER can never exceed the widget's
+        # own height — a prior version scaled this off track height alone
+        # (`_TRACK_H * 0.9`) and still came out taller than the widget
+        # (21.6px circle in a 20px-tall widget), so it was still getting a
+        # hard horizontal cutoff top and bottom, just a smaller one. This
+        # cap makes that geometrically impossible regardless of what
+        # _TRACK_H/_WIDGET_H get tuned to later.
+        glow_r = min(self._TRACK_H * 0.9, self._WIDGET_H / 2.0 - 1.0)
+        glow = QRadialGradient(peak_x, cy, glow_r)
+        glow.setColorAt(0.00, QColor(255, 232, 185, 130))
+        glow.setColorAt(0.25, QColor(255, 220, 170, 90))
+        glow.setColorAt(0.5,  QColor(255, 210, 155, 50))
+        glow.setColorAt(0.75, QColor(255, 205, 150, 20))
+        glow.setColorAt(1.00, QColor(255, 205, 150, 0))
+        painter.setBrush(QBrush(glow))
+        painter.drawEllipse(QPointF(peak_x, cy), glow_r, glow_r)
         painter.end()
 
 
@@ -1172,18 +1200,26 @@ class DashboardWidget(QWidget):
             f'QFrame {{ background-color: {self._PANEL}; border: 0.5px solid {self._SEP}; '
             f'border-radius: 10px; }}'
         )
-        panel_h = QHBoxLayout(panel)
-        # Margins are 1px asymmetric (16/17) so this panel's sizeHint lands on
-        # exactly the same height as the stat-card row it's replaced by once the
-        # scan finishes — otherwise the layout visibly jumps at that transition.
-        panel_h.setContentsMargins(18, 16, 18, 17)
-        panel_h.setSpacing(14)
+        panel_v = QVBoxLayout(panel)
+        panel_v.setContentsMargins(18, 16, 18, 17)
+        panel_v.setSpacing(10)
+
+        # Left column is fixed-width so the mascot (top) and status text
+        # (bottom) share one column, and the cards/beam/cancel column to its
+        # right stays aligned across both rows regardless of mascot presence.
+        LEFT_COL_WIDTH = 132
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
 
         self._mascot: Optional[QSvgWidget] = None
         self._mascot_anim: Optional[QPropertyAnimation] = None
         if _SVG_AVAILABLE and _MASCOT_SVG.exists():
             mascot = QSvgWidget(str(_MASCOT_SVG))
-            mascot.setFixedSize(40, 40)
+            # Mascot SVG's viewBox is 1063.39x1262.43 (not square); QSvgWidget
+            # stretches to fill its box with no aspect-ratio preservation, so
+            # the fixed size must match that ratio or the art looks squashed.
+            mascot.setFixedSize(84, 100)
             mascot.setStyleSheet('background: transparent;')
             mascot.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
             effect = QGraphicsOpacityEffect(mascot)
@@ -1198,8 +1234,17 @@ class DashboardWidget(QWidget):
             anim.setLoopCount(-1)
             self._mascot = mascot
             self._mascot_anim = anim
-            panel_h.addWidget(mascot, alignment=Qt.AlignmentFlag.AlignVCenter)
+            mascot_container = QWidget()
+            mascot_container.setFixedWidth(LEFT_COL_WIDTH)
+            mascot_container.setStyleSheet('background: transparent;')
+            mascot_col = QHBoxLayout(mascot_container)
+            mascot_col.setContentsMargins(0, 0, 0, 0)
+            mascot_col.addWidget(mascot, alignment=Qt.AlignmentFlag.AlignHCenter)
+            top_row.addWidget(mascot_container)
+            top_row.setAlignment(mascot_container, Qt.AlignmentFlag.AlignBottom)
             anim.start()
+        else:
+            top_row.addSpacing(LEFT_COL_WIDTH + 14)
 
         # Live stats — the same 5-card row the Library tab's "Analyze Library"
         # modal used to show on its own, separate popup. Classification now
@@ -1208,9 +1253,6 @@ class DashboardWidget(QWidget):
         # progress story instead of two back-to-back "scanning" experiences.
         # Files Analyzed climbs during phase 1 (file scan); the other 4 stay
         # at 0 until phase 2 (classification) starts populating them.
-        text_col = QVBoxLayout()
-        text_col.setSpacing(3)
-
         cards_row = QHBoxLayout()
         cards_row.setSpacing(8)
         self._scan_card_analyzed     = _AnimatedStatCardWidget('Files Analyzed')
@@ -1223,20 +1265,31 @@ class DashboardWidget(QWidget):
             self._scan_card_unrecognized, self._scan_card_artists, self._scan_card_genres,
         ):
             cards_row.addWidget(card)
-        text_col.addLayout(cards_row)
+        top_row.addLayout(cards_row, stretch=1)
+        panel_v.addLayout(top_row)
 
+        # Bottom row: status text sits under the mascot, then the comet beam
+        # picks up at the same left edge as the first stat card and runs to
+        # the Cancel button, which lines up with the last card's right edge.
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(14)
+
+        status_container = QWidget()
+        status_container.setFixedWidth(LEFT_COL_WIDTH)
+        status_container.setStyleSheet('background: transparent;')
+        status_v = QVBoxLayout(status_container)
+        status_v.setContentsMargins(0, 0, 0, 0)
         self._scan_count = QLabel('Discovering files…')
+        self._scan_count.setWordWrap(True)
         self._scan_count.setStyleSheet(
             'font-size: 11px; color: #7a6a55; letter-spacing: 0.02em; background: transparent; border: none;'
         )
-        text_col.addWidget(self._scan_count)
+        status_v.addWidget(self._scan_count)
+        bottom_row.addWidget(status_container)
 
-        text_col.addSpacing(6)
         self._scan_beam = _ScanActivityBeam()
-        text_col.addWidget(self._scan_beam)
+        bottom_row.addWidget(self._scan_beam, stretch=1)
         self._scan_beam.start()
-
-        panel_h.addLayout(text_col, stretch=1)
 
         self._scan_cancel = QPushButton('Cancel')
         self._scan_cancel.setFixedHeight(32)
@@ -1246,7 +1299,9 @@ class DashboardWidget(QWidget):
             'QPushButton:hover { color: #ff7a7a; border-color: #C75B5B; }'
         )
         self._scan_cancel.clicked.connect(self._on_cancel_scan)
-        panel_h.addWidget(self._scan_cancel, alignment=Qt.AlignmentFlag.AlignVCenter)
+        bottom_row.addWidget(self._scan_cancel, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        panel_v.addLayout(bottom_row)
 
         vbox.addWidget(panel)
         return outer
@@ -1809,6 +1864,12 @@ class DashboardWidget(QWidget):
         self._inventory = []
         self._summary = None
         self._library_path = None
+        # start_scan()'s _play_logo_exit() shrinks the welcome logo to ~0px
+        # on the way out; restore it to resting size or it stays invisible
+        # when we land back on the welcome screen here.
+        logo = getattr(self, '_welcome_logo', None)
+        if logo is not None:
+            logo.setFixedSize(self._LOGO_W, self._LOGO_H)
         self._stack.setCurrentIndex(0)
         self.status_message.emit('', '')
 
@@ -2098,7 +2159,7 @@ class DashboardWidget(QWidget):
         
         layout.addStretch()
         
-        btn = QPushButton('Review && Sync…')
+        btn = QPushButton('Review && Sync')
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(self._on_review_sync_clicked)
         btn.setFixedHeight(36)

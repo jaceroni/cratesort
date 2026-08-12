@@ -2421,32 +2421,42 @@ class LibraryBrowserView(QWidget):
         self._classify_tally          = None
 
     def _enter_classify_mode(self, session) -> None:
+        # load() re-triggers auto-classify on every visit to Library while
+        # anything's still unclassified, so this can be re-entered while
+        # classify mode is already active. Only snapshot/reorder on the
+        # actual first entry — otherwise the snapshot below would capture
+        # the already-classify-reordered layout (or a user's manual drag
+        # made *during* classify mode) as the "pre-classify" baseline,
+        # corrupting the state that exit restores.
+        already_active = self._classify_mode
         self._classify_mode = True
         self._classify_session = session
         self._classify_results = {
             entry.artist: (entry.display_genre, entry.confidence)
             for entry in session.entries
         }
-        # Snapshot header state so exit can restore it exactly
-        self._pre_classify_header_state = self._tree.header().saveState()
 
         # Confidence/Status are already visible (permanent columns — see
         # load()); only Proposed Genre is classify-mode-exclusive.
         self._tree.setColumnHidden(LC_CLS_PROPOSED, False)
         self._tree.setColumnWidth(LC_CLS_PROPOSED, 120)
 
-        # Defer visual reorder until the tree has registered visibility changes
-        def _reorder_cls_cols():
-            hdr = self._tree.header()
-            genre_vis = hdr.visualIndex(LC_GENRE)
-            hdr.moveSection(hdr.visualIndex(LC_CLS_PROPOSED), genre_vis + 1)
-            hdr.moveSection(hdr.visualIndex(LC_CLS_CONF),     genre_vis + 2)
-            hdr.moveSection(hdr.visualIndex(LC_CLS_STATUS),   genre_vis + 3)
-            self._tree.resizeColumnToContents(LC_CLS_PROPOSED)
-            if self._tree.columnWidth(LC_CLS_PROPOSED) < 60:
-                self._tree.setColumnWidth(LC_CLS_PROPOSED, 60)
+        if not already_active:
+            # Snapshot header state so exit can restore it exactly
+            self._pre_classify_header_state = self._tree.header().saveState()
 
-        QTimer.singleShot(0, _reorder_cls_cols)
+            # Defer visual reorder until the tree has registered visibility changes
+            def _reorder_cls_cols():
+                hdr = self._tree.header()
+                genre_vis = hdr.visualIndex(LC_GENRE)
+                hdr.moveSection(hdr.visualIndex(LC_CLS_PROPOSED), genre_vis + 1)
+                hdr.moveSection(hdr.visualIndex(LC_CLS_CONF),     genre_vis + 2)
+                hdr.moveSection(hdr.visualIndex(LC_CLS_STATUS),   genre_vis + 3)
+                self._tree.resizeColumnToContents(LC_CLS_PROPOSED)
+                if self._tree.columnWidth(LC_CLS_PROPOSED) < 60:
+                    self._tree.setColumnWidth(LC_CLS_PROPOSED, 60)
+
+            QTimer.singleShot(0, _reorder_cls_cols)
 
         # Only the classify-mode-exclusive column gets the teal review-mode
         # tint — Confidence/Status are permanent and keep their default color.
