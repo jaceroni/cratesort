@@ -48,8 +48,8 @@ _MODES = {
     'wav_mp3': {
         'title':     'Convert Audio to MP3',
         'subtitle':  'Audio · MP3 · 320kbps CBR — maximum quality',
-        'exts':      ('.wav', '.aiff', '.aif'),
-        'filter':    'Audio Files (*.wav *.aiff *.aif)',
+        'exts':      ('.wav', '.aiff', '.aif', '.m4a'),
+        'filter':    'Audio Files (*.wav *.aiff *.aif *.m4a)',
         'out_ext':   '.mp3',
         'noun':      'audio',
     },
@@ -128,8 +128,9 @@ class _MediaConvertWorker(QThread):
         else:
             vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
             args = [
-                '-map_metadata', '0', '-vf', vf, '-c:v', 'libx264', '-preset', 'fast',
-                '-crf', '18', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart',
+                '-map_metadata', '0', '-vf', vf, '-pix_fmt', 'yuv420p',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart',
             ]
 
         # Duration comes from this same process's own startup banner (merged stderr),

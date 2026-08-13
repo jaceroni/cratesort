@@ -11,11 +11,53 @@ _SERATO_GEOB_PREFIX = 'Serato '
 
 _MP4_TAG_EXTS = {'.mov', '.mp4', '.m4v'}
 
+# M4A/MP4 audio atoms are plain values (str/int/MP4Cover), not ID3 Frame
+# objects — map the common ones onto their ID3 equivalents so title/artist/
+# album/artwork still survive an M4A -> MP3 conversion.
+_MP4_ATOM_TO_ID3_TEXT = {
+    '\xa9nam': 'TIT2', '\xa9ART': 'TPE1', '\xa9alb': 'TALB',
+    '\xa9gen': 'TCON', '\xa9day': 'TDRC', '\xa9wrt': 'TCOM', '\xa9grp': 'TIT1',
+}
+
+
+def _copy_id3_tags(src_file, dst_id3) -> None:
+    for frame in src_file.tags.values():
+        if frame.FrameID == 'GEOB' and str(getattr(frame, 'desc', '')).startswith(_SERATO_GEOB_PREFIX):
+            continue
+        try:
+            dst_id3.add(frame)
+        except Exception:
+            pass
+
+
+def _copy_mp4_tags_as_id3(src_file, dst_id3) -> None:
+    from mutagen.id3 import APIC, Frames
+
+    for atom, frame_id in _MP4_ATOM_TO_ID3_TEXT.items():
+        values = src_file.tags.get(atom)
+        if not values:
+            continue
+        text = '; '.join(str(v) for v in values)
+        try:
+            dst_id3.add(Frames[frame_id](encoding=3, text=text))
+        except Exception:
+            pass
+
+    for cover in src_file.tags.get('covr', []):
+        mime = 'image/png' if cover.imageformat == cover.FORMAT_PNG else 'image/jpeg'
+        try:
+            dst_id3.add(APIC(encoding=3, mime=mime, type=3, desc='cover', data=bytes(cover)))
+        except Exception:
+            pass
+
 
 def copy_audio_tags(src: Path, dst: Path) -> None:
     """
-    Copy every ID3 frame (title, artist, album, genre, year, comments, artwork,
-    custom tags, etc.) from a WAV/AIFF/MP3 source onto a newly-converted MP3.
+    Copy tags (title, artist, album, genre, year, comments, artwork, custom
+    tags, etc.) from a WAV/AIFF/MP3/M4A source onto a newly-converted MP3.
+
+    WAV/AIFF/MP3 sources carry native ID3 frames, copied as-is. M4A sources
+    carry MP4 atoms instead, which are mapped onto their ID3 equivalents.
 
     Serato's own analysis caches (GEOB frames named e.g. "Serato Analysis",
     "Serato Markers2", "Serato BeatGrid") are skipped deliberately — they encode
@@ -25,6 +67,7 @@ def copy_audio_tags(src: Path, dst: Path) -> None:
     """
     from mutagen import File as MutagenFile
     from mutagen.id3 import ID3, ID3NoHeaderError
+    from mutagen.mp4 import MP4Tags
 
     try:
         src_file = MutagenFile(str(src))
@@ -42,13 +85,10 @@ def copy_audio_tags(src: Path, dst: Path) -> None:
         logger.warning('Could not open %s for tagging', dst)
         return
 
-    for frame in src_file.tags.values():
-        if frame.FrameID == 'GEOB' and str(getattr(frame, 'desc', '')).startswith(_SERATO_GEOB_PREFIX):
-            continue
-        try:
-            dst_id3.add(frame)
-        except Exception:
-            pass
+    if isinstance(src_file.tags, MP4Tags):
+        _copy_mp4_tags_as_id3(src_file, dst_id3)
+    else:
+        _copy_id3_tags(src_file, dst_id3)
 
     try:
         dst_id3.save(str(dst), v2_version=3)
