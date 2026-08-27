@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable, Optional
-from PyQt6.QtCore import Qt, QEvent, QPoint, QRect, QPropertyAnimation, QEasingCurve, QTimer
-from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRect, QRectF, QPropertyAnimation, QEasingCurve, QTimer
+from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QDialog, QLayout, QVBoxLayout, QFrame, QLabel, QPushButton, QHBoxLayout,
-    QGraphicsScene, QGraphicsView,
+    QComboBox, QGraphicsScene, QGraphicsView,
 )
 
 try:
@@ -61,25 +61,39 @@ class _ModalOverlay(QWidget):
 
 class _AnimatedStatCardWidget(QFrame):
     """Smoothly animates a numeric value towards a moving target at 60 fps.
-    Shared by the Library tab's Analyze Library modal and the dashboard's
-    scanning-phase stat cards — both animate live classification progress."""
+    The one stat-card look used everywhere in CrateSort — the dashboard's
+    scanning-phase progress cards, the Library tab's Analyze Library modal,
+    and the post-scan "Your Library" summary cards all render from this same
+    class so the frame (background, border, centered text) never changes out
+    from under the user, only the numbers inside it do.
 
-    def __init__(self, title: str, parent=None):
+    Two independent animation modes, since the two contexts drive the number
+    differently:
+      - update_target(): repeatedly nudges toward a moving target — used
+        while a scan/classify pass is live-incrementing counts.
+      - start_animation(): a one-shot eased count-up to a fixed final value,
+        optionally replayable by clicking the card — used once a total is
+        already known (e.g. post-scan summary stats)."""
+
+    def __init__(self, title: str, suffix: str = '', clickable: bool = False, parent=None):
         super().__init__(parent)
         self._current_value = 0
         self._target_value  = 0
+        self._suffix        = suffix
 
         self.setStyleSheet(
             'QFrame { background-color: #1a1a1a; border: 1px solid #444444; '
             'border-radius: 8px; }'
         )
+        if clickable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self._value_label = QLabel('0')
+        self._value_label = QLabel('0' + suffix)
         self._value_label.setProperty('role', 'stat')
         self._value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._value_label.setStyleSheet(
@@ -102,6 +116,15 @@ class _AnimatedStatCardWidget(QFrame):
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
 
+        # Duration-based count-up (start_animation) — separate timer from the
+        # step-decay one above so live scanning updates and a one-shot reveal
+        # animation can never fight over the same clock.
+        self._duration        = 1400
+        self._elapsed         = 0
+        self._duration_timer  = QTimer(self)
+        self._duration_timer.setInterval(16)
+        self._duration_timer.timeout.connect(self._duration_tick)
+
     def update_target(self, target: int) -> None:
         self._target_value = target
         if not self._timer.isActive():
@@ -118,7 +141,119 @@ class _AnimatedStatCardWidget(QFrame):
         else:
             step = min(-1, int(diff * 0.15))
             self._current_value = max(self._target_value, self._current_value + step)
-        self._value_label.setText(f'{self._current_value:,}')
+        self._value_label.setText(f'{self._current_value:,}{self._suffix}')
+
+    def start_animation(self, target: int, duration_ms: int = 1400) -> None:
+        self._target_value = target
+        self._duration = duration_ms
+        self._elapsed  = 0
+        self._value_label.setText('0' + self._suffix)
+        self._duration_timer.start()
+
+    def _duration_tick(self) -> None:
+        self._elapsed += 16
+        t = min(self._elapsed / self._duration, 1.0)
+        eased = 1.0 - (1.0 - t) ** 3
+        current = int(eased * self._target_value)
+        self._value_label.setText(f'{current:,}{self._suffix}')
+        if t >= 1.0:
+            self._duration_timer.stop()
+            self._value_label.setText(f'{self._target_value:,}{self._suffix}')
+
+    def mousePressEvent(self, event) -> None:
+        if self._duration_timer.isActive() or self._target_value:
+            self.start_animation(self._target_value, self._duration)
+        super().mousePressEvent(event)
+
+
+class _ArrowComboBox(QComboBox):
+    """QComboBox that paints itself completely from scratch — box, border,
+    label text, and triangle indicator — instead of letting Qt's own
+    QComboBox rendering pipeline draw any of it. Shared by every dialog in
+    the app that needs a combo box — use this instead of a plain QComboBox
+    with custom styling.
+
+    Every narrower attempt before this one still let `super().paintEvent()`
+    run, and every one of them still leaked some native drop-down/arrow
+    chrome through regardless of what QSS said to do with that subcontrol —
+    `image: url(data:...)` never renders at all for `::down-arrow`, the
+    border-triangle CSS trick renders as a filled rectangle, zeroing out
+    `::drop-down`/`::down-arrow` still left a stray separator artifact, and
+    patching over just that region left a visible seam against the border
+    drawn separately by `super().paintEvent()`. This finally stops calling
+    `super().paintEvent()` at all — nothing native is drawn for this widget
+    to conflict with in the first place, on any platform or style backend.
+    Popup behavior (click, keyboard nav, the item list) is untouched; only
+    the box's own paint is replaced.
+    """
+
+    def __init__(self, bg: str = '#1a1a1a', arrow_color: str = '#a89b85', parent=None):
+        super().__init__(parent)
+        self._bg_color     = QColor(bg)
+        self._border_color = QColor('#444444')
+        self._text_color   = QColor('#f1e3c8')
+        self._arrow_color  = QColor(arrow_color)
+        self._popup_open   = False
+        # App-wide standard control height — callers can still override with
+        # their own setFixedHeight() afterward, but this means a caller that
+        # forgets to set one doesn't silently end up with a cramped box (a
+        # real regression that happened here once already).
+        self.setFixedHeight(36)
+        self.setStyleSheet(
+            f'QComboBox QAbstractItemView {{ background-color: {bg}; color: #f1e3c8; '
+            'border: 1px solid #444444; border-radius: 4px; selection-background-color: #573d26; '
+            'selection-color: #f1e3c8; outline: none; }'
+            'QComboBox QAbstractItemView::item { padding: 6px 10px; }'
+        )
+
+    def showPopup(self) -> None:
+        self._popup_open = True
+        self.update()
+
+        # Popup width via QSS-styled QAbstractItemView can't be trusted to
+        # auto-size to its own content — same class of unreliability as the
+        # ::down-arrow subcontrol above — so items were rendering clipped a
+        # character or two short of their real width. Compute the width
+        # explicitly from font metrics instead of leaving it to Qt/QSS.
+        metrics = QFontMetrics(self.font())
+        longest = max((metrics.horizontalAdvance(self.itemText(i)) for i in range(self.count())), default=0)
+        # +20 item padding (10px each side) + ~24 for the native selection
+        # checkmark gutter + 2 for the popup border.
+        self.view().setMinimumWidth(max(self.width(), longest + 46))
+
+        super().showPopup()
+
+    def hidePopup(self) -> None:
+        super().hidePopup()
+        self._popup_open = False
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        painter.setPen(QPen(self._border_color, 1))
+        painter.setBrush(self._bg_color)
+        painter.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 4, 4)
+
+        text_rect = self.rect().adjusted(8, 0, -24, 0)
+        elided = QFontMetrics(self.font()).elidedText(
+            self.currentText(), Qt.TextElideMode.ElideRight, text_rect.width(),
+        )
+        painter.setPen(self._text_color)
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), elided)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._arrow_color)
+        w, h = 9.0, 5.0
+        cx = self.width() - 8 - w / 2
+        cy = self.height() / 2
+        if self._popup_open:
+            pts = [QPointF(cx - w / 2, cy + h / 2), QPointF(cx + w / 2, cy + h / 2), QPointF(cx, cy - h / 2)]
+        else:
+            pts = [QPointF(cx - w / 2, cy - h / 2), QPointF(cx + w / 2, cy - h / 2), QPointF(cx, cy + h / 2)]
+        painter.drawPolygon(QPolygonF(pts))
+        painter.end()
 
 
 class _CrateSortDialog(QDialog):

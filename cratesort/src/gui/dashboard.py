@@ -260,68 +260,6 @@ class _IconActionCard(QFrame):
 
 
 # ---------------------------------------------------------------------------
-# Animated stat card — count-up on load, click to replay
-# ---------------------------------------------------------------------------
-
-class _AnimatedStatCard(QFrame):
-    def __init__(self, target: int, suffix: str, label: str, parent=None):
-        super().__init__(parent)
-        self._target   = target
-        self._suffix   = suffix
-        self._current  = 0.0
-        self._elapsed  = 0
-        self._duration = 1400
-
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setStyleSheet(
-            'QFrame { background-color: #2F2F2F; border: 1px solid #3a3a3a; border-radius: 10px; }'
-        )
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        col = QVBoxLayout(self)
-        col.setContentsMargins(14, 16, 14, 16)
-        col.setSpacing(4)
-
-        self._num_label = QLabel('0' + suffix)
-        self._num_label.setStyleSheet(
-            'font-size: 26px; font-weight: 500; color: #f1e3c8; '
-            'background: transparent; border: none;'
-        )
-        col.addWidget(self._num_label)
-
-        stat_lbl = QLabel(label.upper())
-        stat_lbl.setStyleSheet(
-            'font-size: 11px; color: #7a6a55; letter-spacing: 0.08em; '
-            'background: transparent; border: none;'
-        )
-        col.addWidget(stat_lbl)
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(16)
-        self._timer.timeout.connect(self._tick)
-
-    def start_animation(self, duration_ms: int = 1400):
-        self._duration = duration_ms
-        self._elapsed  = 0
-        self._current  = 0.0
-        self._num_label.setText('0' + self._suffix)
-        self._timer.start()
-
-    def _tick(self):
-        self._elapsed += 16
-        t = min(self._elapsed / self._duration, 1.0)
-        eased = 1.0 - (1.0 - t) ** 3
-        self._current = eased * self._target
-        self._num_label.setText(f'{int(self._current):,}{self._suffix}')
-        if t >= 1.0:
-            self._timer.stop()
-            self._num_label.setText(f'{self._target:,}{self._suffix}')
-
-    def mousePressEvent(self, event):
-        self.start_animation(1400)
-
-
-# ---------------------------------------------------------------------------
 # Workflow card — step number turns orange on hover
 # ---------------------------------------------------------------------------
 
@@ -1207,44 +1145,14 @@ class DashboardWidget(QWidget):
         # Left column is fixed-width so the mascot (top) and status text
         # (bottom) share one column, and the cards/beam/cancel column to its
         # right stays aligned across both rows regardless of mascot presence.
-        LEFT_COL_WIDTH = 132
+        LEFT_COL_WIDTH = self._MASCOT_COL_WIDTH
 
         top_row = QHBoxLayout()
         top_row.setSpacing(14)
 
-        self._mascot: Optional[QSvgWidget] = None
-        self._mascot_anim: Optional[QPropertyAnimation] = None
-        if _SVG_AVAILABLE and _MASCOT_SVG.exists():
-            mascot = QSvgWidget(str(_MASCOT_SVG))
-            # Mascot SVG's viewBox is 1063.39x1262.43 (not square); QSvgWidget
-            # stretches to fill its box with no aspect-ratio preservation, so
-            # the fixed size must match that ratio or the art looks squashed.
-            mascot.setFixedSize(84, 100)
-            mascot.setStyleSheet('background: transparent;')
-            mascot.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-            effect = QGraphicsOpacityEffect(mascot)
-            mascot.setGraphicsEffect(effect)
-            curve = QEasingCurve(QEasingCurve.Type.InOutSine)
-            anim = QPropertyAnimation(effect, b'opacity', mascot)
-            anim.setDuration(1100)
-            anim.setKeyValueAt(0.0, 0.3)
-            anim.setKeyValueAt(0.5, 1.0)
-            anim.setKeyValueAt(1.0, 0.3)
-            anim.setEasingCurve(curve)
-            anim.setLoopCount(-1)
-            self._mascot = mascot
-            self._mascot_anim = anim
-            mascot_container = QWidget()
-            mascot_container.setFixedWidth(LEFT_COL_WIDTH)
-            mascot_container.setStyleSheet('background: transparent;')
-            mascot_col = QHBoxLayout(mascot_container)
-            mascot_col.setContentsMargins(0, 0, 0, 0)
-            mascot_col.addWidget(mascot, alignment=Qt.AlignmentFlag.AlignHCenter)
-            top_row.addWidget(mascot_container)
-            top_row.setAlignment(mascot_container, Qt.AlignmentFlag.AlignBottom)
-            anim.start()
-        else:
-            top_row.addSpacing(LEFT_COL_WIDTH + 14)
+        mascot_container = self._build_mascot(pulsing=True)
+        top_row.addWidget(mascot_container)
+        top_row.setAlignment(mascot_container, Qt.AlignmentFlag.AlignBottom)
 
         # Live stats — the same 5-card row the Library tab's "Analyze Library"
         # modal used to show on its own, separate popup. Classification now
@@ -1265,6 +1173,10 @@ class DashboardWidget(QWidget):
             self._scan_card_unrecognized, self._scan_card_artists, self._scan_card_genres,
         ):
             cards_row.addWidget(card)
+        # Reserve a fixed trailing gap matching the mascot box's own left
+        # inset (132px box - 84px art, centered = 24px) so the row reads
+        # symmetric — cards still stretch to fill the rest, same as before.
+        cards_row.addSpacing(24)
         top_row.addLayout(cards_row, stretch=1)
         panel_v.addLayout(top_row)
 
@@ -1333,6 +1245,52 @@ class DashboardWidget(QWidget):
     _TEAL     = '#428175'
     _ROW_ALT  = '#222222'
     _ROW_BASE = '#242424'
+    _MASCOT_COL_WIDTH = 132
+
+    def _build_mascot(self, pulsing: bool) -> QWidget:
+        """The one mascot fixture, shared by the scanning banner and the
+        post-scan stat row — pulsing while a scan is live, settled at full
+        opacity once the library's loaded, so it reads as one thing that
+        changes state rather than something that appears/disappears
+        entirely (the exact split the stat cards had before consolidation)."""
+        container = QWidget()
+        container.setFixedWidth(self._MASCOT_COL_WIDTH)
+        container.setStyleSheet('background: transparent;')
+        col = QHBoxLayout(container)
+        col.setContentsMargins(0, 0, 0, 0)
+
+        self._mascot = None
+        self._mascot_anim = None
+        if not (_SVG_AVAILABLE and _MASCOT_SVG.exists()):
+            return container
+
+        # Mascot SVG's viewBox is 1063.39x1262.43 (not square); QSvgWidget
+        # stretches to fill its box with no aspect-ratio preservation, so
+        # the fixed size must match that ratio or the art looks squashed.
+        mascot = QSvgWidget(str(_MASCOT_SVG))
+        mascot.setFixedSize(84, 100)
+        mascot.setStyleSheet('background: transparent;')
+        mascot.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        effect = QGraphicsOpacityEffect(mascot)
+        mascot.setGraphicsEffect(effect)
+        self._mascot = mascot
+
+        if pulsing:
+            curve = QEasingCurve(QEasingCurve.Type.InOutSine)
+            anim = QPropertyAnimation(effect, b'opacity', mascot)
+            anim.setDuration(1100)
+            anim.setKeyValueAt(0.0, 0.3)
+            anim.setKeyValueAt(0.5, 1.0)
+            anim.setKeyValueAt(1.0, 0.3)
+            anim.setEasingCurve(curve)
+            anim.setLoopCount(-1)
+            self._mascot_anim = anim
+            anim.start()
+        else:
+            effect.setOpacity(1.0)
+
+        col.addWidget(mascot, alignment=Qt.AlignmentFlag.AlignHCenter)
+        return container
 
     def _populate_dashboard(self, scanning: bool = False) -> None:
         layout = self._dashboard_layout
@@ -1396,13 +1354,29 @@ class DashboardWidget(QWidget):
         eyebrow.setStyleSheet('font-size: 10px; color: #5a5a5a; letter-spacing: 0.12em;')
         vbox.addWidget(eyebrow)
 
-        row_widget = QWidget()
-        row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(10)
+        # Same enclosing panel as the scanning banner ("SCANNING YOUR
+        # LIBRARY") — that frame must never change; only what lives inside
+        # it does (5 progress cards + a live comet beam while scanning, 4
+        # summary cards with no beam once the library's loaded).
+        panel = QFrame()
+        panel.setStyleSheet(
+            f'QFrame {{ background-color: {self._PANEL}; border: 0.5px solid {self._SEP}; '
+            f'border-radius: 10px; }}'
+        )
+        panel_v = QVBoxLayout(panel)
+        panel_v.setContentsMargins(18, 16, 18, 17)
+        panel_v.setSpacing(10)
+
+        row_layout = QHBoxLayout()
+        row_layout.setSpacing(8)
+
+        # Same mascot fixture as the scanning banner, same left position —
+        # only its opacity/pulse state changes (settled here vs. pulsing
+        # during a scan). It does not move.
+        row_layout.addWidget(self._build_mascot(pulsing=False))
 
         total_target = summary.total_files if summary else 0
-        c0 = _AnimatedStatCard(total_target, '', 'Total Tracks')
+        c0 = _AnimatedStatCardWidget('Total Tracks', clickable=True)
         row_layout.addWidget(c0)
 
         crate_target = 0
@@ -1410,27 +1384,33 @@ class DashboardWidget(QWidget):
             subcrates = serato_dir / 'Subcrates'
             if subcrates.exists():
                 crate_target = len(list(subcrates.rglob('*.crate')))
-        c1 = _AnimatedStatCard(crate_target, '', 'Total Crates')
+        c1 = _AnimatedStatCardWidget('Total Crates', clickable=True)
         row_layout.addWidget(c1)
 
         artists_target = len(summary.unique_artists) if summary else 0
-        c2 = _AnimatedStatCard(artists_target, '', 'Unique Artists')
+        c2 = _AnimatedStatCardWidget('Unique Artists', clickable=True)
         row_layout.addWidget(c2)
 
         hours_target = 0
         if inv:
             total_secs = sum(r.duration for r in inv if r.duration)
             hours_target = int(total_secs / 3600)
-        c3 = _AnimatedStatCard(hours_target, 'h', 'Hours of Music')
+        c3 = _AnimatedStatCardWidget('Hours of Music', suffix='h', clickable=True)
         row_layout.addWidget(c3)
 
-        vbox.addWidget(row_widget)
+        # Same fixed trailing gap as the scanning banner's cards_row —
+        # matches the mascot box's own left inset so both ends of the row
+        # read symmetric; cards still stretch to fill the rest.
+        row_layout.addSpacing(24)
 
+        panel_v.addLayout(row_layout)
+        vbox.addWidget(panel)
+
+        targets = [total_target, crate_target, artists_target, hours_target]
+        durations = [1600, 1400, 1500, 1300]
         cards = [c0, c1, c2, c3]
-        QTimer.singleShot(100, lambda: cards[0].start_animation(1600))
-        QTimer.singleShot(220, lambda: cards[1].start_animation(1400))
-        QTimer.singleShot(340, lambda: cards[2].start_animation(1500))
-        QTimer.singleShot(460, lambda: cards[3].start_animation(1300))
+        for i, (card, target, duration) in enumerate(zip(cards, targets, durations)):
+            QTimer.singleShot(100 + i * 120, lambda c=card, t=target, d=duration: c.start_animation(t, d))
 
         return outer
 

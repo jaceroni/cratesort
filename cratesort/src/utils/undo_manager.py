@@ -209,6 +209,135 @@ class RenameCrateCommand(Command):
         self.view._refresh(select=self.old_path)
 
 
+class CreateSmartCrateCommand(Command):
+    def __init__(self, view, name: str, rules: list, match_all: bool, live_update: bool, tracks: list[str]):
+        self.view        = view
+        self.name        = name
+        self.rules       = list(rules)
+        self.match_all   = match_all
+        self.live_update = live_update
+        self.tracks      = list(tracks)
+        self.description = f"Created smart crate '{name}'"
+
+    def execute(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.create(self.name, self.rules, self.match_all, self.live_update, self.tracks)
+        self.view._refresh(select=self.view._smart_crate_key(self.name))
+
+    def undo(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.delete(self.name)
+        self.view._refresh(select=None)
+
+
+class DuplicateSmartCrateCommand(Command):
+    """Undoable duplicate — captures the source crate's rules/tracks at the
+    moment of duplication rather than re-reading the source file on redo, so
+    redo is deterministic even if the source crate changes or is deleted."""
+
+    def __init__(
+        self, view, source_name: str, new_name: str,
+        rules: list, match_all: bool, live_update: bool, tracks: list[str],
+    ):
+        self.view        = view
+        self.source_name = source_name
+        self.new_name    = new_name
+        self.rules       = list(rules)
+        self.match_all   = match_all
+        self.live_update = live_update
+        self.tracks      = list(tracks)
+        self.description = f"Duplicated '{source_name}' as '{new_name}'"
+
+    def execute(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.create(self.new_name, self.rules, self.match_all, self.live_update, self.tracks)
+        self.view._refresh(select=self.view._smart_crate_key(self.new_name))
+
+    def undo(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.delete(self.new_name)
+        self.view._refresh(select=None)
+
+
+class UpdateSmartCrateRulesCommand(Command):
+    def __init__(
+        self, view, name: str,
+        old_rules: list, old_match_all: bool, old_live_update: bool, old_tracks: list[str],
+        new_rules: list, new_match_all: bool, new_live_update: bool, new_tracks: list[str],
+    ):
+        self.view            = view
+        self.name            = name
+        self.old_rules       = list(old_rules)
+        self.old_match_all   = old_match_all
+        self.old_live_update = old_live_update
+        self.old_tracks      = list(old_tracks)
+        self.new_rules       = list(new_rules)
+        self.new_match_all   = new_match_all
+        self.new_live_update = new_live_update
+        self.new_tracks      = list(new_tracks)
+        self.description     = f"Edited rules on '{name}'"
+
+    def execute(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.update(self.name, self.new_rules, self.new_match_all, self.new_live_update, self.new_tracks)
+        self.view._refresh(select=self.view._smart_crate_key(self.name))
+
+    def undo(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.update(self.name, self.old_rules, self.old_match_all, self.old_live_update, self.old_tracks)
+        self.view._refresh(select=self.view._smart_crate_key(self.name))
+
+
+class DeleteSmartCrateCommand(Command):
+    def __init__(self, view, name: str, rules: list, match_all: bool, live_update: bool, tracks: list[str]):
+        self.view        = view
+        self.name        = name
+        self.rules       = list(rules)
+        self.match_all   = match_all
+        self.live_update = live_update
+        self.tracks      = list(tracks)
+        self.description = f"Deleted smart crate '{name}'"
+
+    def execute(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.delete(self.name)
+        self.view._current_crate_path = '__ALL_TRACKS__'
+        self.view._refresh(select='__ALL_TRACKS__')
+
+    def undo(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.create(self.name, self.rules, self.match_all, self.live_update, self.tracks)
+        self.view._refresh(select=self.view._smart_crate_key(self.name))
+
+
+class RenameSmartCrateCommand(Command):
+    def __init__(self, view, old_name: str, new_name: str):
+        self.view        = view
+        self.old_name     = old_name
+        self.new_name     = new_name
+        self.description = f"Renamed '{old_name}' to '{new_name}'"
+
+    def execute(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.rename(self.old_name, self.new_name)
+        self.view._refresh(select=self.view._smart_crate_key(self.new_name))
+
+    def undo(self) -> None:
+        w = self.view._smart_writer()
+        if w:
+            w.rename(self.new_name, self.old_name)
+        self.view._refresh(select=self.view._smart_crate_key(self.old_name))
+
+
 class ReorderCratesCommand(Command):
     def __init__(self, view, order_key: str, old_order: list[str], new_order: list[str]):
         self.view      = view

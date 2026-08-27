@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys as _sys
@@ -11,7 +12,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QDrag, QFontMetrics, QIcon, QPen, QPixmap, QPainter
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog,
+    QAbstractItemView, QApplication, QCheckBox, QDialog,
     QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QFileDialog, QMenu, QProgressBar, QPushButton, QSplitter,
@@ -24,14 +25,28 @@ from cratesort.src.serato.database_reader import read_track_add_dates, clear_cac
 from cratesort.src.serato.crate_writer import (
     CrateWriter, read_crate_order as _read_neworder, write_crate_order as _write_neworder,
 )
+from cratesort.src.serato.smart_crate import RuleComparison, RuleField, SmartCrate, SmartCrateRule
+from cratesort.src.serato.smart_crate_reader import SmartCrateReader, SmartCrateLibrary
+from cratesort.src.serato.smart_crate_writer import SmartCrateWriter
+from cratesort.src.core.smart_crate_engine import (
+    SUPPORTED_FIELDS, FIELD_LABELS, COMPARISON_LABELS, comparisons_for_field, match_tracks,
+)
 from cratesort.src.utils.undo_manager import (
     UndoManager, AddTracksCommand, RemoveTracksCommand, ReorderTracksCommand,
     CreateCrateCommand, DeleteCrateCommand, RenameCrateCommand,
     ReorderCratesCommand, ReparentCrateCommand, EditTrackMetadataCommand,
     CrateGenreChangeCommand, CrateTagsEditCommand, CrateReassignArtistCommand,
     PromoteCrateCommand,
+    CreateSmartCrateCommand, UpdateSmartCrateRulesCommand, DeleteSmartCrateCommand, RenameSmartCrateCommand,
+    DuplicateSmartCrateCommand,
 )
-from cratesort.src.gui.overlays import _CrateSortDialog, _ov_alert, _ov_confirm, _create_dialog_layout
+from cratesort.src.gui.overlays import (
+    _ArrowComboBox, _CrateSortDialog, _ov_alert, _ov_confirm, _create_dialog_layout,
+)
+
+_ASSETS         = Path(__file__).parent.parent.parent / 'assets'
+_ICON_CHECKED   = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
+_ICON_UNCHECKED = str(_ASSETS / 'icons' / 'checkbox-unchecked.svg')
 
 # ---------------------------------------------------------------------------
 # Column indices
@@ -79,6 +94,71 @@ _BORDER = '#444444'
 _SETTINGS_KEY   = 'crate_manager_header_state'
 _ALL_TRACKS_KEY = '__ALL_TRACKS__'
 
+# Smart crates live in a separate Serato namespace (Smartcrates, not
+# Subcrates) and are flat (no %%-nesting), so their tree keys get a
+# dedicated prefix to keep them from ever colliding with a regular crate's
+# full_path key.
+_SMART_CRATE_PREFIX = '__smart__/'
+
+
+def _smart_crate_key(name: str) -> str:
+    return f'{_SMART_CRATE_PREFIX}{name}'
+
+
+def _is_smart_crate_key(key: Optional[str]) -> bool:
+    return bool(key) and key.startswith(_SMART_CRATE_PREFIX)
+
+
+def _smart_crate_name_from_key(key: str) -> str:
+    return key[len(_SMART_CRATE_PREFIX):]
+
+
+_WAND_ICON_CACHE: dict[tuple[str, int], QIcon] = {}
+
+
+def _wand_icon(color: str = '#f1e3c8', size: int = 16) -> QIcon:
+    """A small magic-wand glyph (diagonal shaft + sparkle bursts), drawn
+    in-memory via QPainter rather than a bundled asset — self-contained,
+    and recolorable per context (white for button text, cream for tree rows)."""
+    key = (color, size)
+    if key in _WAND_ICON_CACHE:
+        return _WAND_ICON_CACHE[key]
+
+    from PyQt6.QtCore import QPointF
+    from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QPolygonF
+
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    qcolor = QColor(color)
+
+    pen = QPen(qcolor)
+    pen.setWidthF(size * 0.14)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.drawLine(QPointF(size * 0.18, size * 0.86), QPointF(size * 0.62, size * 0.42))
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(qcolor)
+
+    def _sparkle(cx: float, cy: float, r: float) -> None:
+        inner = r * 0.28
+        painter.drawPolygon(QPolygonF([
+            QPointF(cx, cy - r), QPointF(cx + inner, cy - inner),
+            QPointF(cx + r, cy), QPointF(cx + inner, cy + inner),
+            QPointF(cx, cy + r), QPointF(cx - inner, cy + inner),
+            QPointF(cx - r, cy), QPointF(cx - inner, cy - inner),
+        ]))
+
+    _sparkle(size * 0.78, size * 0.22, size * 0.16)
+    _sparkle(size * 0.50, size * 0.10, size * 0.09)
+    _sparkle(size * 0.93, size * 0.44, size * 0.08)
+    painter.end()
+
+    icon = QIcon(pm)
+    _WAND_ICON_CACHE[key] = icon
+    return icon
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +228,17 @@ class CrateItemDelegate(QStyledItemDelegate):
         # Fill entire cell
         painter.fillRect(option.rect, bg)
 
-        # Left bar: orange for selected states, teal for drop-target
-        if state in (self.STATE_B, self.STATE_C, self.STATE_D, self.STATE_E):
+        # Left bar: always-on teal for smart crates (a type marker, not a
+        # selection state — selection on a smart-crate row still shows via
+        # the background color above), orange for other selected states,
+        # teal for drop-target.
+        if _is_smart_crate_key(path):
+            bar_rect = QRect(
+                option.rect.left(), option.rect.top(),
+                self.BAR_WIDTH, option.rect.height()
+            )
+            painter.fillRect(bar_rect, self.BAR_TEAL)
+        elif state in (self.STATE_B, self.STATE_C, self.STATE_D, self.STATE_E):
             bar_color = self.BAR_TEAL if state == self.STATE_E else self.BAR_COLOR
             bar_rect = QRect(
                 option.rect.left(), option.rect.top(),
@@ -164,9 +253,19 @@ class CrateItemDelegate(QStyledItemDelegate):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(option.rect.adjusted(1, 0, -1, -1))
 
-        # Crate name text
+        # Crate name text, with a wand icon prefix for smart crates
         text      = index.data(Qt.ItemDataRole.DisplayRole) or ''
-        text_rect = option.rect.adjusted(self.BAR_WIDTH + 8, 0, -24, 0)
+        text_left = self.BAR_WIDTH + 8
+        if _is_smart_crate_key(path):
+            icon_size = 14
+            icon_rect = QRect(
+                option.rect.left() + text_left,
+                option.rect.top() + (option.rect.height() - icon_size) // 2,
+                icon_size, icon_size,
+            )
+            _wand_icon('#f1e3c8', icon_size).paint(painter, icon_rect)
+            text_left += icon_size + 6
+        text_rect = option.rect.adjusted(text_left, 0, -24, 0)
         painter.setPen(self.TEXT_A)
         painter.drawText(
             text_rect,
@@ -610,6 +709,330 @@ class _NameInputDialog(_CrateSortDialog):
 
 
 # ---------------------------------------------------------------------------
+# Smart Crate rule builder
+# ---------------------------------------------------------------------------
+
+class _SmartCrateRuleDialog(_CrateSortDialog):
+    """Create/edit a Smart Crate's name, match mode, and rule list, with a
+    live match-count preview computed from CrateSort's own scanned inventory."""
+
+    _CONTROL_HEIGHT = 36       # uniform height for field/comparison combos and the value field —
+                               # matches the app-wide 36px control height used by every other
+                               # dialog button in this codebase
+    _MAX_HEIGHT_FRACTION = 0.85
+
+    def __init__(
+        self,
+        inventory: list,
+        existing_names: set[str],
+        parent=None,
+        existing: Optional[SmartCrate] = None,
+    ):
+        super().__init__(parent)
+        self._base_min_height = 560
+        self.setMinimumSize(640, self._base_min_height)
+        self._inventory = inventory
+        self._existing_names = existing_names
+        self._existing_name = existing.name if existing else None
+        self._row_widgets: list[QWidget] = []
+
+        layout = _create_dialog_layout(self)
+        # QComboBox styling (including its arrow) is fully self-contained on
+        # _ArrowComboBox itself — see that class for why.
+        self.setStyleSheet(
+            'QLabel { color: #f1e3c8; font-size: 13px; background: transparent; }'
+            'QLineEdit { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
+            'border: 1px solid #444444; border-radius: 4px; padding: 5px 8px; }'
+            'QCheckBox { color: #f1e3c8; font-size: 13px; background: transparent; spacing: 8px; }'
+            'QCheckBox::indicator { width: 16px; height: 16px; }'
+            f'QCheckBox::indicator:unchecked {{ image: url("{_ICON_UNCHECKED}"); }}'
+            f'QCheckBox::indicator:checked   {{ image: url("{_ICON_CHECKED}");   }}'
+        )
+
+        headline = QLabel('Edit Smart Crate' if existing else 'New Smart Crate')
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
+        )
+        layout.addWidget(headline)
+
+        self._name_edit = QLineEdit(existing.name if existing else '')
+        self._name_edit.setFixedHeight(self._CONTROL_HEIGHT)
+        self._name_edit.setPlaceholderText('Smart crate name…')
+        layout.addWidget(self._name_edit)
+
+        match_row = QHBoxLayout()
+        match_row.setSpacing(8)
+        match_row.addWidget(QLabel('Match'))
+        self._match_combo = _ArrowComboBox()
+        self._match_combo.setFixedHeight(self._CONTROL_HEIGHT)
+        self._match_combo.addItem('all of the following rules', True)
+        self._match_combo.addItem('any of the following rules', False)
+        if existing and not existing.match_all:
+            self._match_combo.setCurrentIndex(1)
+        self._match_combo.currentIndexChanged.connect(self._recompute_preview)
+        match_row.addWidget(self._match_combo, stretch=1)
+        layout.addLayout(match_row)
+
+        # Plain nested layout, not a QScrollArea — rule rows are just part of
+        # the dialog's normal flow. The dialog itself grows to fit them
+        # (see _update_dialog_height) rather than scrolling in a sub-panel.
+        self._rows_container = QVBoxLayout()
+        self._rows_container.setSpacing(12)
+        layout.addLayout(self._rows_container)
+
+        add_row_btn = QPushButton('+ Add Rule')
+        add_row_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_row_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #428175; border: 1px solid #428175; '
+            'border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 600; }'
+            'QPushButton:hover { background: rgba(66, 129, 117, 0.1); }'
+        )
+        add_row_btn.clicked.connect(lambda: self._add_rule_row())
+        layout.addWidget(add_row_btn)
+
+        self._live_update_check = QCheckBox('Live Update — Serato re-evaluates this crate automatically')
+        self._live_update_check.setChecked(existing.live_update if existing else False)
+        layout.addWidget(self._live_update_check)
+
+        self._preview_label = QLabel('Add a rule to see matching tracks')
+        self._preview_label.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent;')
+        layout.addWidget(self._preview_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+        self._cancel_btn = QPushButton('Cancel')
+        self._cancel_btn.setFixedHeight(36)
+        self._cancel_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
+        )
+        self._cancel_btn.clicked.connect(self.reject)
+        self._save_btn = QPushButton('Save Smart Crate')
+        self._save_btn.setFixedHeight(36)
+        self._save_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        self._save_btn.clicked.connect(self._on_accept)
+        btn_row.addWidget(self._cancel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self._save_btn)
+        layout.addLayout(btn_row)
+
+        # resize=False during initial population: calling _update_dialog_height()
+        # repeatedly in this tight loop (once per pre-existing rule, all before
+        # the dialog has ever been shown) left Qt's layout sizeHint stale no
+        # matter how it was invalidated, and rows ended up overlapping instead
+        # of the dialog growing for them (confirmed directly). One resize call
+        # after all initial rows are in place avoids the repeated-calls trigger
+        # entirely rather than fighting the cache into behaving.
+        if existing and existing.rules:
+            for rule in existing.rules:
+                self._add_rule_row(rule, resize=False)
+        else:
+            self._add_rule_row(resize=False)
+        self._update_dialog_height()
+
+    def _max_dialog_height(self) -> int:
+        screen = QApplication.primaryScreen()
+        if screen:
+            return int(screen.availableGeometry().height() * self._MAX_HEIGHT_FRACTION)
+        return 900
+
+    def _update_dialog_height(self) -> None:
+        """Grow (or shrink) the dialog itself to fit the current rule rows —
+        no inner scroll area, so this is the only thing standing between
+        adding a rule and it being clipped off the bottom of the dialog.
+
+        This used to compute the target from `self.sizeHint()`. Abandoned
+        that after confirming — with a minimal reproduction with no dialog
+        involved at all, just a QVBoxLayout of these row widgets in a shown
+        QWidget — that `sizeHint()` simply never updates for this widget
+        combination once shown, no matter how many layouts get invalidate()d
+        or activate()d. Since the only two things that change row-to-row are
+        both fully in our own control (row count, and the fixed per-row
+        height + spacing we set ourselves), this computes the target
+        directly from those instead of asking Qt for a number it can't
+        reliably give back.
+        """
+        n_rows = max(len(self._row_widgets), 1)
+        extra_rows = n_rows - 1
+        rows_growth = extra_rows * (self._CONTROL_HEIGHT + self._rows_container.spacing())
+        target = max(self._base_min_height, min(self._base_min_height + rows_growth, self._max_dialog_height()))
+
+        # Raise (or lower) the actual minimumSize floor to match, not just
+        # the current geometry — _CrateSortDialog.showEvent() (base class,
+        # shared by every dialog) calls adjustSize() before the bounce-in
+        # animation, and adjustSize() always clamps to at least
+        # minimumSize() — so a crate with several existing rules, opened
+        # for editing, needs the floor itself raised before that first
+        # show(), or it gets silently reset back down a moment later
+        # (confirmed directly). Computed from a fixed base
+        # (self._base_min_height), not read back from minimumSize() itself,
+        # so shrinking on row-remove isn't a one-way ratchet.
+        self.setMinimumHeight(target)
+
+        if target == self.height():
+            return
+        if self.isVisible():
+            geo = self.geometry()
+            center_y = geo.y() + geo.height() // 2
+            self.setGeometry(geo.x(), center_y - target // 2, geo.width(), target)
+        else:
+            self.resize(self.width(), target)
+
+    def _add_rule_row(self, rule: Optional[SmartCrateRule] = None, resize: bool = True) -> None:
+        row = QWidget()
+        # A bare QWidget with no stylesheet renders as solid black in this
+        # app (documented gotcha) — without this it shows up as an opaque
+        # black box behind every rule row instead of blending into the dialog.
+        row.setStyleSheet('background: transparent;')
+        row_layout = QHBoxLayout(row)
+        # No left/right margin here — the dialog's own padding already
+        # insets everything (name field, match row, this) consistently; an
+        # extra 8px on top of that made rows look narrower/misaligned
+        # against the rest of the dialog instead of lining up with it. No
+        # top/bottom margin either — _rows_container's own spacing (12px)
+        # is the single source of vertical gap between rows, rather than
+        # splitting it between container spacing and per-row margins.
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+
+        field_combo = _ArrowComboBox()
+        field_combo.setFixedHeight(self._CONTROL_HEIGHT)
+        for f in SUPPORTED_FIELDS:
+            field_combo.addItem(FIELD_LABELS[f], f)
+        comparison_combo = _ArrowComboBox()
+        comparison_combo.setFixedHeight(self._CONTROL_HEIGHT)
+        value_edit = QLineEdit()
+        value_edit.setFixedHeight(self._CONTROL_HEIGHT)
+        value_edit.setPlaceholderText('Value…')
+
+        def _repopulate_comparisons() -> None:
+            rf = field_combo.currentData()
+            comparison_combo.blockSignals(True)
+            comparison_combo.clear()
+            for c in comparisons_for_field(rf):
+                comparison_combo.addItem(COMPARISON_LABELS[c], c)
+            comparison_combo.blockSignals(False)
+
+        field_combo.currentIndexChanged.connect(_repopulate_comparisons)
+        field_combo.currentIndexChanged.connect(self._recompute_preview)
+        comparison_combo.currentIndexChanged.connect(self._recompute_preview)
+        value_edit.textChanged.connect(self._recompute_preview)
+
+        remove_btn = QPushButton('✕')
+        remove_btn.setFixedSize(self._CONTROL_HEIGHT, self._CONTROL_HEIGHT)
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setToolTip('Remove this rule')
+        remove_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #d5c7ad; border: none; '
+            'border-style: none; border-radius: 4px; font-size: 18px; font-weight: 700; padding: 0px; }'
+            'QPushButton:hover { color: #ffffff; background: rgba(199, 91, 91, 0.35); }'
+            'QPushButton:pressed { background: rgba(199, 91, 91, 0.5); }'
+        )
+        remove_btn.clicked.connect(lambda: self._remove_rule_row(row))
+
+        row_layout.addWidget(field_combo, stretch=2, alignment=Qt.AlignmentFlag.AlignVCenter)
+        row_layout.addWidget(comparison_combo, stretch=2, alignment=Qt.AlignmentFlag.AlignVCenter)
+        row_layout.addWidget(value_edit, stretch=3, alignment=Qt.AlignmentFlag.AlignVCenter)
+        row_layout.addWidget(remove_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        _repopulate_comparisons()
+        if rule is not None:
+            idx = field_combo.findData(rule.field)
+            if idx >= 0:
+                field_combo.setCurrentIndex(idx)
+            _repopulate_comparisons()
+            cidx = comparison_combo.findData(rule.comparison)
+            if cidx >= 0:
+                comparison_combo.setCurrentIndex(cidx)
+            value_edit.setText(str(rule.value))
+
+        row._field_combo      = field_combo
+        row._comparison_combo = comparison_combo
+        row._value_edit       = value_edit
+
+        self._rows_container.addWidget(row)
+        self._row_widgets.append(row)
+        self._recompute_preview()
+        if resize:
+            self._update_dialog_height()
+
+    def _remove_rule_row(self, row: QWidget) -> None:
+        if len(self._row_widgets) <= 1:
+            return  # always keep at least one rule row
+        self._row_widgets.remove(row)
+        self._rows_container.removeWidget(row)
+        row.deleteLater()
+        self._recompute_preview()
+        self._update_dialog_height()
+
+    def _collect_rules(self) -> list[SmartCrateRule]:
+        rules: list[SmartCrateRule] = []
+        for row in self._row_widgets:
+            raw_value = row._value_edit.text().strip()
+            if not raw_value:
+                continue
+            rf = row._field_combo.currentData()
+            rc = row._comparison_combo.currentData()
+            if rf is None or rc is None:
+                continue
+            value: object = raw_value
+            if rf == RuleField.BPM:
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    continue
+            elif rf == RuleField.YEAR and rc in (RuleComparison.STR_DATE_BEFORE, RuleComparison.STR_DATE_AFTER):
+                try:
+                    value = int(raw_value)
+                except ValueError:
+                    continue
+            rules.append(SmartCrateRule(field=rf, comparison=rc, value=value))
+        return rules
+
+    def _recompute_preview(self, *_args) -> None:
+        rules = self._collect_rules()
+        if not rules:
+            self._preview_label.setText('Add a rule to see matching tracks')
+            return
+        match_all = bool(self._match_combo.currentData())
+        matched = match_tracks(rules, match_all, self._inventory)
+        n = len(matched)
+        self._preview_label.setText(f'Matches {n:,} track{"s" if n != 1 else ""}')
+
+    def _on_accept(self) -> None:
+        name = self._name_edit.text().strip()
+        if err := _validate_crate_name(name):
+            _ov_alert(self, 'Invalid Smart Crate Name', err)
+            return
+        if name != self._existing_name and name in self._existing_names:
+            _ov_alert(self, 'Smart Crate', f'A smart crate named "{name}" already exists.')
+            return
+        if not self._collect_rules():
+            _ov_alert(self, 'Smart Crate', 'Add at least one rule before saving.')
+            return
+        self._save_btn.setText('Saving…')
+        self._save_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(False)
+        QApplication.processEvents()
+        self.accept()
+
+    def result_data(self) -> tuple[str, list[SmartCrateRule], bool, bool]:
+        name        = self._name_edit.text().strip()
+        rules       = self._collect_rules()
+        match_all   = bool(self._match_combo.currentData())
+        live_update = self._live_update_check.isChecked()
+        return name, rules, match_all, live_update
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -622,6 +1045,24 @@ def _validate_crate_name(name: str) -> Optional[str]:
     if '%' in name:
         return "Crate name cannot contain '%' — it conflicts with Serato's internal path encoding."
     return None
+
+
+_COPY_SUFFIX_RE = re.compile(r'\s*\(Copy(?:\s+\d+)?\)$')
+
+
+def _next_duplicate_name(source_name: str, existing_names) -> str:
+    """Build a duplicate name that increments a '(Copy N)' suffix instead of
+    stacking '(Copy) (Copy)' — strips only that exact trailing bracket
+    pattern, so a real numbered crate name (e.g. 'Hip Hop 1990') is never
+    mistaken for a prior duplicate and mangled."""
+    base = _COPY_SUFFIX_RE.sub('', source_name).rstrip()
+    candidate = f'{base} (Copy)'
+    if candidate not in existing_names:
+        return candidate
+    n = 2
+    while f'{base} (Copy {n})' in existing_names:
+        n += 1
+    return f'{base} (Copy {n})'
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1431,7 @@ class CrateManagerView(QWidget):
         self._inventory_by_path: dict[str, object]      = {}
         self._inventory_by_name: dict[str, object]      = {}
         self._crate_library: Optional[CrateLibrary]     = None
+        self._smart_crate_library: Optional[SmartCrateLibrary] = None
         self._current_crate_path: Optional[str]         = None
         self._edits: dict[str, dict[str, str]]           = {}
         self._session_genre: dict[str, str]              = {}  # artist → classified genre
@@ -1099,6 +1541,7 @@ class CrateManagerView(QWidget):
 
         inv_paths = {rec.path for rec in self._inventory}
         self._crate_library = CrateReader(serato_dir).read(inv_paths)
+        self._smart_crate_library = SmartCrateReader(serato_dir).read(inv_paths)
 
         # First visit: default to All Tracks. Return visit: restore prior selection.
         # Both reset to All Tracks on app restart (in-memory only, not persisted).
@@ -1109,11 +1552,7 @@ class CrateManagerView(QWidget):
         )
 
         # Load tracks for the selected/default crate
-        if restore_sel == _ALL_TRACKS_KEY:
-            self._load_all_tracks()
-        elif self._crate_library and restore_sel in self._crate_library.crates:
-            self._current_crate_path = restore_sel
-            self._load_crate_tracks(restore_sel)
+        self._load_selected_key(restore_sel)
 
         # Restore scroll position after tree is rebuilt
         QTimer.singleShot(0, lambda: self._crate_tree.verticalScrollBar().setValue(self._last_scroll_pos))
@@ -1132,14 +1571,6 @@ class CrateManagerView(QWidget):
 
     def _on_new_crate(self) -> None:
         self._crate_new(parent_path=None)
-
-    def _on_new_smart_crate(self) -> None:
-        _ov_alert(
-            self, 'Smart Crates',
-            'Smart Crates is a Pro feature.\n\n'
-            'Create rule-based dynamic crates that automatically update '
-            'based on metadata filters (e.g. genre, BPM, year).',
-        )
 
     # ── Empty state ───────────────────────────────────────────────────
 
@@ -1261,7 +1692,9 @@ class CrateManagerView(QWidget):
 
         row.addSpacing(16)
 
-        smart_crate_btn = QPushButton('✦ Smart Crate')
+        smart_crate_btn = QPushButton(' New Smart Crate')
+        smart_crate_btn.setIcon(_wand_icon('#ffffff', 18))
+        smart_crate_btn.setIconSize(QSize(18, 18))
         smart_crate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         smart_crate_btn.setFixedHeight(36)
         smart_crate_btn.setStyleSheet(
@@ -1587,15 +2020,25 @@ class CrateManagerView(QWidget):
             serato_dir = self._library_path / '_Serato_'
             inv_paths  = {rec.path for rec in self._inventory}
             self._crate_library = CrateReader(serato_dir).read(inv_paths)
+            self._smart_crate_library = SmartCrateReader(serato_dir).read(inv_paths)
 
         self._rebuild_crate_tree(restore_expanded=expanded, restore_selected=target)
 
         if target:
-            if target == _ALL_TRACKS_KEY:
-                self._load_all_tracks()
-            elif self._crate_library and target in self._crate_library.crates:
-                self._current_crate_path = target
-                self._load_crate_tracks(target)
+            self._load_selected_key(target)
+
+    def _load_selected_key(self, key: str) -> None:
+        """Load tracks for a tree selection key — All Tracks, a smart crate, or a regular crate."""
+        if key == _ALL_TRACKS_KEY:
+            self._load_all_tracks()
+        elif _is_smart_crate_key(key):
+            name = _smart_crate_name_from_key(key)
+            if self._smart_crate_library and name in self._smart_crate_library.crates:
+                self._current_crate_path = key
+                self._load_smart_crate_tracks(name)
+        elif self._crate_library and key in self._crate_library.crates:
+            self._current_crate_path = key
+            self._load_crate_tracks(key)
 
     # ── Crate tree population ──────────────────────────────────────────
 
@@ -1641,6 +2084,13 @@ class CrateManagerView(QWidget):
 
         for full_path in top_level:
             self._add_crate_item(self._crate_tree.invisibleRootItem(), full_path)
+
+        if self._smart_crate_library and self._smart_crate_library.names:
+            for name in self._smart_crate_library.names:
+                smart_crate = self._smart_crate_library.crates[name]
+                item = QTreeWidgetItem(self._crate_tree.invisibleRootItem())
+                item.setText(0, f'{smart_crate.name}  ({len(smart_crate.tracks):,})')
+                item.setData(0, Qt.ItemDataRole.UserRole, _smart_crate_key(name))
 
         if restore_expanded is not None:
             self._restore_tree_state(restore_expanded, restore_selected)
@@ -1772,6 +2222,12 @@ class CrateManagerView(QWidget):
         if key == _ALL_TRACKS_KEY:
             self._track_search.setPlaceholderText('Search all tracks by title, artist, or album…')
             self._load_all_tracks()
+        elif _is_smart_crate_key(key):
+            name = _smart_crate_name_from_key(key)
+            self._track_search.setPlaceholderText(
+                f'Searching "{name}" — select All Tracks to search your full library…'
+            )
+            self._load_smart_crate_tracks(name)
         else:
             name = (
                 self._crate_library.crates[key].name
@@ -2366,7 +2822,7 @@ class CrateManagerView(QWidget):
                     target = self._crate_tree.itemAt(pt)
                     if target:
                         key = target.data(0, Qt.ItemDataRole.UserRole)
-                        if key and key != _ALL_TRACKS_KEY:
+                        if key and key != _ALL_TRACKS_KEY and not _is_smart_crate_key(key):
                             if key != self._track_drop_target_key:
                                 if self._track_drop_target_key:
                                     self._crate_delegate.set_item_state(
@@ -2406,7 +2862,7 @@ class CrateManagerView(QWidget):
                 if event.mimeData().hasFormat(_TRACKS_MIME):
                     if target:
                         key = target.data(0, Qt.ItemDataRole.UserRole)
-                        if key and key != _ALL_TRACKS_KEY:
+                        if key and key != _ALL_TRACKS_KEY and not _is_smart_crate_key(key):
                             raw   = bytes(event.mimeData().data(_TRACKS_MIME)).decode('utf-8')
                             paths = json.loads(raw)
                             self._add_tracks_to_crate(key, paths)
@@ -2423,7 +2879,7 @@ class CrateManagerView(QWidget):
                     item = self._crate_tree.itemAt(event.position().toPoint())
                     if item:
                         key = item.data(0, Qt.ItemDataRole.UserRole)
-                        if key and key != _ALL_TRACKS_KEY:
+                        if key and key != _ALL_TRACKS_KEY and not _is_smart_crate_key(key):
                             self._crate_drag_item   = item
                             self._crate_drag_start  = event.position().toPoint()
                             self._crate_drag_active = False
@@ -2785,15 +3241,36 @@ class CrateManagerView(QWidget):
     def _on_crate_context_menu(self, pos) -> None:
         item = self._crate_tree.itemAt(pos)
         if item is None:
-            menu    = QMenu(self)
-            new_act = menu.addAction('New Crate…')
-            action  = menu.exec(self._crate_tree.viewport().mapToGlobal(pos))
+            menu       = QMenu(self)
+            new_act    = menu.addAction('New Crate…')
+            smart_act  = menu.addAction('New Smart Crate…')
+            action     = menu.exec(self._crate_tree.viewport().mapToGlobal(pos))
             if action == new_act:
                 self._crate_new(parent_path=None)
+            elif action == smart_act:
+                self._on_new_smart_crate()
             return
 
         key = item.data(0, Qt.ItemDataRole.UserRole)
         if key == _ALL_TRACKS_KEY:
+            return
+
+        if _is_smart_crate_key(key):
+            smart_menu = QMenu(self)
+            edit_act    = smart_menu.addAction('Edit Rules…')
+            refresh_act = smart_menu.addAction('Check for New Files')
+            dup_act     = smart_menu.addAction('Duplicate')
+            smart_menu.addSeparator()
+            del_act     = smart_menu.addAction('Delete')
+            action = smart_menu.exec(self._crate_tree.viewport().mapToGlobal(pos))
+            if action == edit_act:
+                self._smart_crate_edit(key)
+            elif action == refresh_act:
+                self._smart_crate_refresh(key)
+            elif action == dup_act:
+                self._smart_crate_duplicate(key)
+            elif action == del_act:
+                self._smart_crate_delete(key)
             return
 
         menu       = QMenu(self)
@@ -2831,6 +3308,253 @@ class CrateManagerView(QWidget):
         if not self._library_path:
             return None
         return CrateWriter(self._library_path / '_Serato_')
+
+    def _smart_writer(self) -> Optional[SmartCrateWriter]:
+        if not self._library_path:
+            return None
+        return SmartCrateWriter(self._library_path / '_Serato_')
+
+    def _smart_crate_key(self, name: str) -> str:
+        return _smart_crate_key(name)
+
+    # ── Smart Crate CRUD operations ──────────────────────────────────────
+
+    def _on_new_smart_crate(self) -> None:
+        existing_names = set(self._smart_crate_library.names) if self._smart_crate_library else set()
+        dlg = _SmartCrateRuleDialog(self._inventory, existing_names, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, rules, match_all, live_update = dlg.result_data()
+        tracks = [str(rec.path) for rec in match_tracks(rules, match_all, self._inventory)]
+
+        writer = self._smart_writer()
+        if not writer:
+            return
+        self._set_status('Creating smart crate…')
+        if self._undo_manager:
+            cmd = CreateSmartCrateCommand(self, name, rules, match_all, live_update, tracks)
+            self._undo_manager.push(cmd)
+            self._set_status(f'Created: {name}', teal=True)
+        else:
+            result = writer.create(name, rules, match_all, live_update, tracks)
+            if not result.success:
+                _ov_alert(self, 'Smart Crate', f'Failed: {result.error}')
+                self._set_status('')
+                return
+            self._refresh(select=_smart_crate_key(name))
+            self._set_status(f'Created: {name}', teal=True)
+
+    def _smart_crate_edit(
+        self, key: str, collapse_into: Optional[DuplicateSmartCrateCommand] = None,
+    ) -> None:
+        if not self._smart_crate_library:
+            return
+        name = _smart_crate_name_from_key(key)
+        crate = self._smart_crate_library.crates.get(name)
+        if not crate:
+            return
+        existing_names = set(self._smart_crate_library.names)
+        dlg = _SmartCrateRuleDialog(self._inventory, existing_names, self, existing=crate)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_name, rules, match_all, live_update = dlg.result_data()
+        new_tracks = [str(rec.path) for rec in match_tracks(rules, match_all, self._inventory)]
+
+        writer = self._smart_writer()
+        if not writer:
+            return
+        self._set_status('Saving smart crate…')
+
+        if collapse_into is not None:
+            # This edit is the immediate follow-up to a fresh Duplicate —
+            # fold the result into that one undo entry instead of stacking
+            # a second command, so a single Undo removes the whole new
+            # crate regardless of what got changed before the first save.
+            if new_name != name:
+                rename_result = writer.rename(name, new_name)
+                if not rename_result.success:
+                    _ov_alert(self, 'Smart Crate', f'Failed: {rename_result.error}')
+                    self._set_status('')
+                    return
+            write_result = writer.update(new_name, rules, match_all, live_update, new_tracks)
+            if not write_result.success:
+                _ov_alert(self, 'Smart Crate', f'Failed: {write_result.error}')
+                self._set_status('')
+                return
+            collapse_into.new_name    = new_name
+            collapse_into.rules       = list(rules)
+            collapse_into.match_all   = match_all
+            collapse_into.live_update = live_update
+            collapse_into.tracks      = list(new_tracks)
+            self._refresh(select=_smart_crate_key(new_name))
+            self._set_status(f'Saved: {new_name}', teal=True)
+            return
+
+        rules_unchanged = (
+            rules == crate.rules and match_all == crate.match_all and live_update == crate.live_update
+        )
+
+        if new_name != name and rules_unchanged:
+            # Pure rename — undoable on its own via RenameSmartCrateCommand.
+            if self._undo_manager:
+                cmd = RenameSmartCrateCommand(self, name, new_name)
+                self._undo_manager.push(cmd)
+                self._set_status(f'Renamed to: {new_name}', teal=True)
+            else:
+                result = writer.rename(name, new_name)
+                if not result.success:
+                    _ov_alert(self, 'Smart Crate', f'Failed: {result.error}')
+                    self._set_status('')
+                    return
+                self._refresh(select=_smart_crate_key(new_name))
+                self._set_status(f'Renamed to: {new_name}', teal=True)
+            return
+
+        if new_name != name:
+            # Renaming and editing rules in the same save is handled as a
+            # direct rename + update rather than a single undo entry.
+            rename_result = writer.rename(name, new_name)
+            if not rename_result.success:
+                _ov_alert(self, 'Smart Crate', f'Failed: {rename_result.error}')
+                self._set_status('')
+                return
+            writer.update(new_name, rules, match_all, live_update, new_tracks)
+            self._refresh(select=_smart_crate_key(new_name))
+            self._set_status(f'Saved: {new_name}', teal=True)
+            return
+
+        if self._undo_manager:
+            cmd = UpdateSmartCrateRulesCommand(
+                self, name,
+                crate.rules, crate.match_all, crate.live_update, crate.tracks,
+                rules, match_all, live_update, new_tracks,
+            )
+            self._undo_manager.push(cmd)
+            self._set_status(f'Saved: {name}', teal=True)
+        else:
+            result = writer.update(name, rules, match_all, live_update, new_tracks)
+            if not result.success:
+                _ov_alert(self, 'Smart Crate', f'Failed: {result.error}')
+                self._set_status('')
+                return
+            self._refresh(select=_smart_crate_key(name))
+            self._set_status(f'Saved: {name}', teal=True)
+
+    def _smart_crate_refresh(self, key: str) -> None:
+        if not self._smart_crate_library:
+            return
+        name = _smart_crate_name_from_key(key)
+        crate = self._smart_crate_library.crates.get(name)
+        if not crate:
+            return
+        new_tracks = [str(rec.path) for rec in match_tracks(crate.rules, crate.match_all, self._inventory)]
+
+        if set(new_tracks) == set(crate.tracks):
+            self._set_status(f"No new files for '{name}'")
+            return
+
+        writer = self._smart_writer()
+        if not writer:
+            return
+        self._set_status('Checking for new files…')
+
+        added   = len(set(new_tracks) - set(crate.tracks))
+        removed = len(set(crate.tracks) - set(new_tracks))
+        parts = []
+        if added:
+            parts.append(f'+{added}')
+        if removed:
+            parts.append(f'-{removed}')
+        summary = ' / '.join(parts)
+
+        if self._undo_manager:
+            cmd = UpdateSmartCrateRulesCommand(
+                self, name,
+                crate.rules, crate.match_all, crate.live_update, crate.tracks,
+                crate.rules, crate.match_all, crate.live_update, new_tracks,
+            )
+            cmd.description = f"Refreshed '{name}' ({summary})"
+            self._undo_manager.push(cmd)
+            self._set_status(f"Refreshed '{name}': {summary}", teal=True)
+        else:
+            result = writer.update(name, crate.rules, crate.match_all, crate.live_update, new_tracks)
+            if not result.success:
+                _ov_alert(self, 'Smart Crate', f'Failed: {result.error}')
+                self._set_status('')
+                return
+            self._refresh(select=_smart_crate_key(name))
+            self._set_status(f"Refreshed '{name}': {summary}", teal=True)
+
+    def _smart_crate_duplicate(self, key: str) -> None:
+        if not self._smart_crate_library:
+            return
+        name = _smart_crate_name_from_key(key)
+        source = self._smart_crate_library.crates.get(name)
+        if not source:
+            return
+        writer = self._smart_writer()
+        if not writer:
+            return
+        dst = _next_duplicate_name(name, self._smart_crate_library.names)
+        self._set_status('Duplicating smart crate…')
+        cmd: Optional[DuplicateSmartCrateCommand] = None
+        if self._undo_manager:
+            cmd = DuplicateSmartCrateCommand(
+                self, name, dst, source.rules, source.match_all, source.live_update, source.tracks,
+            )
+            self._undo_manager.push(cmd)
+        else:
+            result = writer.duplicate(name, dst)
+            if not result.success:
+                _ov_alert(self, 'Duplicate Smart Crate', f'Failed: {result.error}')
+                self._set_status('')
+                return
+            self._refresh(select=_smart_crate_key(dst))
+        self._set_status(f'Duplicated: {name}', teal=True)
+        # Jump straight into the rule editor on the new copy — rename +
+        # tweak the one rule that differs, in a single motion. Whatever
+        # gets saved there folds into the same undo entry (see
+        # collapse_into in _smart_crate_edit) so one Undo removes the
+        # whole new crate, not just the last edit made to it.
+        self._smart_crate_edit(_smart_crate_key(dst), collapse_into=cmd)
+
+    def _smart_crate_delete(self, key: str) -> None:
+        if not self._smart_crate_library:
+            return
+        name = _smart_crate_name_from_key(key)
+        crate = self._smart_crate_library.crates.get(name)
+        if not crate:
+            return
+        if crate.tracks:
+            msg = f'Delete "{name}"? It matches {len(crate.tracks)} tracks. This cannot be undone.'
+        else:
+            msg = f'Delete "{name}"? This cannot be undone.'
+        if not _ov_confirm(self, 'Delete Smart Crate', msg, confirm_text='Delete', confirm_danger=True):
+            return
+        writer = self._smart_writer()
+        if not writer:
+            return
+        self._set_status('Deleting smart crate…')
+        QApplication.processEvents()
+        if self._undo_manager:
+            cmd = DeleteSmartCrateCommand(self, name, crate.rules, crate.match_all, crate.live_update, crate.tracks)
+            self._undo_manager.push(cmd)
+            self._set_status(f'Deleted: {name}', teal=True)
+        else:
+            result = writer.delete(name)
+            if not result.success:
+                _ov_alert(self, 'Delete Smart Crate', f'Failed: {result.error}')
+                self._set_status('')
+                return
+            self._current_crate_path = _ALL_TRACKS_KEY
+            self._refresh(select=_ALL_TRACKS_KEY)
+            self._set_status(f'Deleted: {name}', teal=True)
+
+    def _load_smart_crate_tracks(self, name: str) -> None:
+        if not self._smart_crate_library or name not in self._smart_crate_library.crates:
+            return
+        crate = self._smart_crate_library.crates[name]
+        self._start_load_worker(list(crate.tracks), crate.name)
 
     def _crate_new(self, parent_path: Optional[str]) -> None:
         name = _NameInputDialog(self, 'New Crate', 'Crate name:').get_name()
@@ -2923,15 +3647,21 @@ class CrateManagerView(QWidget):
             return
         crate    = self._crate_library.crates[crate_path]
         parent   = crate.parent
-        base_dst = f'{parent}/{crate.name} (Copy)' if parent else f'{crate.name} (Copy)'
         writer   = self._writer()
         if not writer:
             return
-        dst_path = base_dst
-        suffix   = 1
-        while dst_path in self._crate_library.crates:
-            suffix  += 1
-            dst_path = f'{base_dst} {suffix}'
+
+        def _path_taken(candidate_name: str) -> bool:
+            full = f'{parent}/{candidate_name}' if parent else candidate_name
+            return full in self._crate_library.crates
+
+        base = _COPY_SUFFIX_RE.sub('', crate.name).rstrip()
+        dst_name = f'{base} (Copy)'
+        n = 2
+        while _path_taken(dst_name):
+            dst_name = f'{base} (Copy {n})'
+            n += 1
+        dst_path = f'{parent}/{dst_name}' if parent else dst_name
         self._set_status('Duplicating crate…')
         result = writer.duplicate_crate(crate_path, dst_path)
         if not result.success:
