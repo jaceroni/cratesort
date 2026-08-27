@@ -48,6 +48,15 @@ def parse_duration_from_text(text: str) -> float:
     )
 
 
+def format_elapsed(seconds: float) -> str:
+    """Format a seconds count as 'M:SS' or 'H:MM:SS' for a live 'still working' readout —
+    used when ffmpeg can't report a total Duration up front, so no % is calculable."""
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f'{hours}:{minutes:02d}:{secs:02d}' if hours else f'{minutes}:{secs:02d}'
+
+
 _FRIENDLY_ERRORS = (
     ('already exists', 'A file with that name already exists in the destination folder.'),
     ('permission denied', "CrateSort doesn't have permission to save files in that folder."),

@@ -19,7 +19,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import QAbstractItemView, QCompleter
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog,
+    QCheckBox, QDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QProgressBar,
     QPushButton, QSizePolicy, QSplitter, QStackedWidget,
@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from cratesort.src.core.classifier import PARENT_GENRES
-from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
+from cratesort.src.gui.overlays import _ArrowComboBox, _CrateSortDialog, _create_dialog_layout
 
 # Regex: detect collaboration patterns in artist fields (feat., ft., &, vs., comma-not-sort)
 _COLLAB_RE = re.compile(
@@ -646,11 +646,8 @@ class _ChangeGenreDialog(_CrateSortDialog):
         layout.addWidget(sub)
         layout.addSpacing(4)
 
-        self._combo = QComboBox()
-        self._combo.setStyleSheet(
-            'QComboBox { background-color: #1a1a1a; color: #f1e3c8; font-size: 13px; '
-            'border: 1px solid #444444; border-radius: 4px; padding: 6px 8px; }'
-        )
+        self._combo = _ArrowComboBox()
+        self._combo.setFixedHeight(36)
         for g in ALL_GENRES:
             self._combo.addItem(g)
         self._combo.setCurrentText(current_genre)

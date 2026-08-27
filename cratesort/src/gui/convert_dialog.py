@@ -20,7 +20,7 @@ except ImportError:
 
 from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
 from cratesort.src.utils.ffmpeg_tools import (
-    friendly_ffmpeg_error, get_ffmpeg_path, parse_duration_from_text,
+    format_elapsed, friendly_ffmpeg_error, get_ffmpeg_path, parse_duration_from_text,
 )
 from cratesort.src.utils.metadata_copy import copy_audio_tags, copy_video_tags
 
@@ -82,10 +82,12 @@ def _unique_output_path(src: Path, out_ext: str) -> Path:
 
 
 class _MediaConvertWorker(QThread):
-    progress     = pyqtSignal(int, int, str)   # (current_index, total, filename)
-    file_progress = pyqtSignal(int)            # 0-100 for the file currently converting
-    file_done    = pyqtSignal(str, bool, str, str)  # (filename, success, message, output_path)
-    all_done     = pyqtSignal()
+    progress      = pyqtSignal(int, int, str)   # (current_index, total, filename)
+    file_progress = pyqtSignal(int)             # 0-100 for the file currently converting
+    file_elapsed  = pyqtSignal(str)             # real elapsed time, when ffmpeg can't report a
+                                                 # total duration up front (so no % is calculable)
+    file_done     = pyqtSignal(str, bool, str, str)  # (filename, success, message, output_path)
+    all_done      = pyqtSignal()
 
     def __init__(self, files: list[Path], mode: str, parent=None):
         super().__init__(parent)
@@ -162,13 +164,20 @@ class _MediaConvertWorker(QThread):
                         recent_lines.pop(0)
                 if duration <= 0 and stripped.startswith('Duration:'):
                     duration = parse_duration_from_text(stripped)
-                elif stripped.startswith('out_time_us=') and duration > 0:
+                elif stripped.startswith('out_time_us='):
                     try:
                         us = int(stripped.split('=')[1])
+                    except (ValueError, IndexError):
+                        continue
+                    if duration > 0:
                         pct = int(min(us / (duration * 1_000_000), 1.0) * 100)
                         self.file_progress.emit(pct)
-                    except (ValueError, IndexError):
-                        pass
+                    else:
+                        # Some containers (raw streams, certain MOV/AVI files) never
+                        # report a usable Duration: line, so no % is calculable —
+                        # surface real elapsed processing time instead of leaving
+                        # the progress bar frozen with nothing proving it's alive.
+                        self.file_elapsed.emit(format_elapsed(us / 1_000_000))
             self._proc.wait()
             returncode = self._proc.returncode
         finally:
@@ -430,15 +439,18 @@ class _ConvertDialog(_CrateSortDialog):
         self._worker = _MediaConvertWorker(list(self._queued_files), self._mode, self)
         self._worker.progress.connect(self._on_progress)
         self._worker.file_progress.connect(self._on_file_progress)
+        self._worker.file_elapsed.connect(self._on_file_elapsed)
         self._worker.file_done.connect(self._on_file_done)
         self._worker.all_done.connect(self._on_all_done)
         self._current = 0
         self._total = len(self._queued_files)
+        self._current_filename = ''
         self._worker.start()
 
     def _on_progress(self, current: int, total: int, filename: str) -> None:
         self._current = current
         self._total = total
+        self._current_filename = filename
         self._stage_lbl.setText(f'CONVERTING ({current} OF {total}): {filename.upper()}')
         overall = int(100 * (current - 1) / total) if total else 0
         self._progress_bar.setValue(overall)
@@ -450,6 +462,15 @@ class _ConvertDialog(_CrateSortDialog):
         overall = int(100 * ((self._current - 1) + pct / 100) / self._total)
         self._progress_bar.setValue(overall)
         self._pct_lbl.setText(f'{overall}%')
+
+    def _on_file_elapsed(self, elapsed_text: str) -> None:
+        # No total duration is calculable for this file, so the % readout
+        # can't move — show real elapsed processing time instead so there's
+        # still concrete, ticking proof the conversion hasn't frozen.
+        self._stage_lbl.setText(
+            f'CONVERTING ({self._current} OF {self._total}): '
+            f'{self._current_filename.upper()} — {elapsed_text} PROCESSED'
+        )
 
     def _on_file_done(self, filename: str, success: bool, message: str, output_path: str) -> None:
         self._results.append((filename, success, message, output_path))

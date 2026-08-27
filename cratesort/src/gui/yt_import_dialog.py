@@ -19,8 +19,22 @@ from PyQt6.QtWidgets import (
 )
 
 from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
-from cratesort.src.utils.ffmpeg_tools import get_ffmpeg_path, get_media_duration
+from cratesort.src.utils.ffmpeg_tools import format_elapsed, get_ffmpeg_path, get_media_duration
 from cratesort.src.utils.metadata_copy import embed_artwork
+
+
+# ---------------------------------------------------------------------------
+# Error text cleanup
+# ---------------------------------------------------------------------------
+
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+
+def _strip_ansi(text: str) -> str:
+    """yt-dlp colorizes its own error/log text with raw ANSI escape codes
+    regardless of `quiet`/`no_warnings` — strip them before showing an
+    exception message anywhere in the UI."""
+    return _ANSI_ESCAPE_RE.sub('', text)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +196,7 @@ class _YTWorker(QThread):
             pass
         except Exception as exc:
             if not self._cancelled:
-                self.errored.emit(str(exc))
+                self.errored.emit(_strip_ansi(str(exc)))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -243,13 +257,20 @@ class _YTWorker(QThread):
                 proc.terminate()
                 raise _Cancelled()
             line = raw_line.decode('utf-8', errors='replace').strip()
-            if line.startswith('out_time_us=') and duration > 0:
+            if line.startswith('out_time_us='):
                 try:
                     us = int(line.split('=')[1])
+                except (ValueError, IndexError):
+                    continue
+                if duration > 0:
                     pct = int(70 + min(us / (duration * 1_000_000), 1.0) * 29)
                     self.progress.emit(pct, 'Converting')
-                except (ValueError, IndexError):
-                    pass
+                else:
+                    # Duration couldn't be probed up front for this download
+                    # (rare, but not impossible) — no % is calculable, so
+                    # show real elapsed processing time instead of leaving
+                    # the bar frozen at 70% with no visible movement.
+                    self.progress.emit(70, f'Converting — {format_elapsed(us / 1_000_000)} processed')
         proc.wait()
         if proc.returncode != 0:
             raise RuntimeError(f'ffmpeg failed (exit {proc.returncode})')
