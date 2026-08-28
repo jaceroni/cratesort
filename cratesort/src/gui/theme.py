@@ -121,6 +121,19 @@ C = {
 }
 
 # ---------------------------------------------------------------------------
+# Dimensions
+# Shared layout constants. Track-list widgets in different screens must pull
+# from here so they can't drift apart — the Crates track table and the
+# Library tree fell out of sync on row height, which clipped descenders in
+# the Library inline editor but not the Crates one
+# (rinse-testing-findings-2026-08-27 #3). The double-click-to-edit QLineEdit
+# is given this exact height in both screens: QTableWidget.setCellWidget
+# stretches its editor to the row but QTreeWidget.setItemWidget does not, so
+# neither can rely on the container — both size the editor themselves.
+# ---------------------------------------------------------------------------
+TRACK_ROW_HEIGHT = 36   # track-list row height + inline-editor height (Crates table + Library tree)
+
+# ---------------------------------------------------------------------------
 # Stylesheet
 # Charter is a macOS system font — referenced directly (no WOFF loading needed).
 # Falls back to Georgia then generic serif.

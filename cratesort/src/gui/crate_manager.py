@@ -43,6 +43,9 @@ from cratesort.src.utils.undo_manager import (
 from cratesort.src.gui.overlays import (
     _ArrowComboBox, _CrateSortDialog, _ov_alert, _ov_confirm, _create_dialog_layout,
 )
+from cratesort.src.gui.theme import TRACK_ROW_HEIGHT
+from cratesort.src.gui.inline_edit import make_inline_editor
+from cratesort.src.gui.track_icons import note_icon, play_icon, pause_icon
 
 _ASSETS         = Path(__file__).parent.parent.parent / 'assets'
 _ICON_CHECKED   = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
@@ -290,36 +293,10 @@ class CrateItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-# ---------------------------------------------------------------------------
-# Module-level icon cache
-# ---------------------------------------------------------------------------
-
-_NOTE_ICON: Optional[QIcon] = None
-
-
-def _make_note_icon() -> QIcon:
-    def _pm(color: str) -> QPixmap:
-        pm = QPixmap(9, 14)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
-        f = p.font()
-        f.setPixelSize(12)
-        p.setFont(f)
-        p.setPen(QColor(color))
-        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, '♪')
-        p.end()
-        return pm
-    icon = QIcon()
-    icon.addPixmap(_pm(_MUTED),    QIcon.Mode.Normal)
-    icon.addPixmap(_pm('#2F2F2F'), QIcon.Mode.Selected)
-    return icon
-
-
-def _get_note_icon() -> QIcon:
-    global _NOTE_ICON
-    if _NOTE_ICON is None:
-        _NOTE_ICON = _make_note_icon()
-    return _NOTE_ICON
+# The track-row note / play / pause glyphs are shared with the Library tree —
+# see gui/track_icons.py. `_get_note_icon` stays as a name for the populate
+# paths; hover/now-playing states swap in play_icon()/pause_icon() live.
+_get_note_icon = note_icon
 
 
 # Serato-style isometric crate glyphs shown to the left of every crate name
@@ -1532,6 +1509,7 @@ class CrateManagerView(QWidget):
     album_art_requested = pyqtSignal(str)
     navigate_to_settings = pyqtSignal()   # emitted by "Load Library" on empty-state screen
     launch_serato_requested = pyqtSignal()
+    play_requested      = pyqtSignal(object)  # TrackRecord — row note-icon clicked
 
     def __init__(self, undo_manager: Optional['UndoManager'] = None, parent=None):
         super().__init__(parent)
@@ -1556,6 +1534,13 @@ class CrateManagerView(QWidget):
         self._edit_original: str                 = ''
 
         self._context_rows: list[int] = []
+
+        # Playback affordance on the title-cell note icon (mirrors LibraryBrowserView)
+        self._now_playing_path: Optional[str] = None
+        self._is_playing: bool = False
+        self._hover_play_row: int = -1
+        self._play_icon_press_active: bool = False
+
         self._prev_selected_item: Optional[QTreeWidgetItem] = None
         self._prev_parent_item:   Optional[QTreeWidgetItem] = None
         self._crate_delegate: Optional['CrateItemDelegate'] = None
@@ -1982,9 +1967,9 @@ class CrateManagerView(QWidget):
         _pal.setColor(QPalette.ColorRole.AlternateBase, QColor('#2a2a2a'))
         self._track_table.setPalette(_pal)
 
-        self._track_table.verticalHeader().setDefaultSectionSize(36)
-        self._track_table.verticalHeader().setMinimumSectionSize(36)
-        self._track_table.verticalHeader().setMaximumSectionSize(36)
+        self._track_table.verticalHeader().setDefaultSectionSize(TRACK_ROW_HEIGHT)
+        self._track_table.verticalHeader().setMinimumSectionSize(TRACK_ROW_HEIGHT)
+        self._track_table.verticalHeader().setMaximumSectionSize(TRACK_ROW_HEIGHT)
         self._track_table.horizontalHeader().setFixedHeight(45)
 
         self._track_table.setSortingEnabled(True)
@@ -1994,6 +1979,9 @@ class CrateManagerView(QWidget):
         self._track_table.itemDoubleClicked.connect(self._on_track_double_clicked)
         self._track_table.installEventFilter(self)
         self._track_table.viewport().installEventFilter(self)
+        # Hover the note icon → play glyph; click it → load/pause in the player.
+        self._track_table.setMouseTracking(True)
+        self._track_table.viewport().setMouseTracking(True)
 
         # Fix 5: smooth horizontal scrolling
         self._track_table.setHorizontalScrollMode(
@@ -2498,6 +2486,8 @@ class CrateManagerView(QWidget):
 
         self._track_table.setSortingEnabled(True)
         self._track_table.sortByColumn(self._sort_col, self._sort_order)
+        self._hover_play_row = -1
+        self._refresh_now_playing_marker()
         if not self._settings.value(_SETTINGS_KEY):
             self._size_pos_column(len(rows))
             QTimer.singleShot(100, self._enforce_min_col_widths)
@@ -2553,6 +2543,8 @@ class CrateManagerView(QWidget):
 
         self._track_table.setSortingEnabled(True)
         self._track_table.sortByColumn(self._sort_col, self._sort_order)
+        self._hover_play_row = -1
+        self._refresh_now_playing_marker()
         # Only auto-size columns on first-ever use; once the user has set their
         # preferred widths those are saved and we leave them alone.
         if not self._settings.value(_SETTINGS_KEY):
@@ -2673,6 +2665,109 @@ class CrateManagerView(QWidget):
         self.track_selected.emit(resolved_path)
         self.album_art_requested.emit(resolved_path)
 
+    # ── Row play/pause affordance (Title-cell note icon) ───────────────
+    # Same behaviour as the Library tree: hover the icon → play glyph;
+    # click → load in the bottom player; click again → pause; third → resume.
+    _TITLE_ICON_HIT_WIDTH = 24  # left slice of the Title cell that acts as the button
+
+    def _row_track_path(self, row: int) -> str:
+        it = self._track_table.item(row, TC_PATH)
+        return it.text() if it is not None else ''
+
+    def _row_rec(self, row: int):
+        path = self._row_track_path(row)
+        return self._resolve_track(path) if path else None
+
+    def _row_icon_for(self, path_str: str, *, hovered: bool):
+        if path_str and path_str == self._now_playing_path:
+            return pause_icon() if self._is_playing else play_icon()
+        return play_icon() if hovered else note_icon()
+
+    def _set_title_icon(self, row: int, icon) -> None:
+        cell = self._track_table.item(row, TC_TITLE)
+        if cell is not None:
+            cell.setIcon(icon)
+
+    def _restore_row_icon(self, row: int) -> None:
+        if 0 <= row < self._track_table.rowCount():
+            self._set_title_icon(row, self._row_icon_for(self._row_track_path(row), hovered=False))
+
+    def _hover_row_at(self, pos) -> int:
+        """Row under pos (any column) that resolves to a real track, else -1.
+        Drives the whole-row hover glyph swap, like the Library tree."""
+        idx = self._track_table.indexAt(pos)
+        if not idx.isValid():
+            return -1
+        row = idx.row()
+        return row if self._row_rec(row) is not None else -1
+
+    def _title_icon_row_at(self, pos) -> int:
+        """Row whose Title-cell icon zone contains pos and resolves to a real
+        track, else -1. Narrow — only this zone is clickable to play."""
+        idx = self._track_table.indexAt(pos)
+        if not idx.isValid() or idx.column() != TC_TITLE:
+            return -1
+        rect = self._track_table.visualRect(idx)
+        if pos.x() - rect.left() > self._TITLE_ICON_HIT_WIDTH:
+            return -1
+        row = idx.row()
+        return row if self._row_rec(row) is not None else -1
+
+    def _update_hover_play_icon(self, pos) -> None:
+        row = self._hover_row_at(pos)
+        if row == self._hover_play_row:
+            return
+        if self._hover_play_row >= 0:
+            self._restore_row_icon(self._hover_play_row)
+        if row >= 0:
+            self._set_title_icon(row, self._row_icon_for(self._row_track_path(row), hovered=True))
+        self._hover_play_row = row
+
+    def _clear_hover_play_icon(self) -> None:
+        if self._hover_play_row >= 0:
+            self._restore_row_icon(self._hover_play_row)
+            self._hover_play_row = -1
+
+    def _handle_play_icon_click(self, pos) -> bool:
+        row = self._title_icon_row_at(pos)
+        if row < 0:
+            return False
+        rec = self._row_rec(row)
+        if rec is None:
+            return False
+        self.play_requested.emit(rec)
+        self.track_selected.emit(str(rec.path))
+        self.album_art_requested.emit(str(rec.path))
+        return True
+
+    def _refresh_now_playing_marker(self) -> None:
+        for row in range(self._track_table.rowCount()):
+            self._set_title_icon(
+                row,
+                self._row_icon_for(self._row_track_path(row), hovered=(row == self._hover_play_row)),
+            )
+
+    def set_now_playing(self, path) -> None:
+        """Mark the row whose track is loaded in the playback bar. Called from
+        MainWindow whenever playback starts on a new track."""
+        new = str(path) if path else None
+        if new == self._now_playing_path:
+            return
+        self._now_playing_path = new
+        if new:
+            self._is_playing = True  # only ever arrives from a fresh play()
+        self._refresh_now_playing_marker()
+
+    def set_playing_state(self, playing: bool) -> None:
+        """Sync the loaded row's glyph to the real player state (pause while
+        playing, play while paused). Called from MainWindow on every
+        QMediaPlayer playback-state change."""
+        if playing == self._is_playing:
+            return
+        self._is_playing = playing
+        if self._now_playing_path:
+            self._refresh_now_playing_marker()
+
     # ── Inline editing ─────────────────────────────────────────────────
 
     def _on_track_double_clicked(self, item: QTableWidgetItem) -> None:
@@ -2690,26 +2785,16 @@ class CrateManagerView(QWidget):
         self._commit_editor()
 
         current = item.text()
-        editor  = QLineEdit(current)
-        editor.selectAll()
-        editor.setMinimumHeight(26)
+        editor = make_inline_editor(
+            current,
+            on_commit=self._commit_editor,
+            on_cancel=self._cancel_editor,
+        )
 
         self._edit_widget   = editor
         self._edit_row      = row
         self._edit_col      = col
         self._edit_original = current
-
-        _orig_kp = editor.keyPressEvent
-        def _handle_key(event):
-            if event.key() == Qt.Key.Key_Escape:
-                self._cancel_editor()
-            elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self._commit_editor()
-            else:
-                _orig_kp(event)
-        editor.keyPressEvent = _handle_key  # type: ignore[method-assign]
-
-        editor.editingFinished.connect(self._commit_editor)
 
         self._track_table.setCellWidget(row, col, editor)
         editor.setFocus()
@@ -2888,6 +2973,30 @@ class CrateManagerView(QWidget):
         # If events fire during _build_crate_panel() before that happens, bail out safely.
         if self._track_table is None:
             return super().eventFilter(obj, event)
+
+        # 0. Play/pause affordance on the Title-cell note icon. Mirrors
+        #    LibraryBrowserView: swallow the whole press→release gesture so a
+        #    click on the icon never selects the row or starts a row drag.
+        if obj is self._track_table.viewport():
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if self._handle_play_icon_click(event.position().toPoint()):
+                    self._play_icon_press_active = True
+                    return True
+                self._play_icon_press_active = False
+            elif et == QEvent.Type.MouseButtonRelease:
+                if self._play_icon_press_active:
+                    self._play_icon_press_active = False
+                    return True
+            elif et == QEvent.Type.MouseMove:
+                if self._play_icon_press_active:
+                    if event.buttons() & Qt.MouseButton.LeftButton:
+                        return True
+                    self._play_icon_press_active = False
+                self._update_hover_play_icon(event.position().toPoint())
+            elif et == QEvent.Type.Leave:
+                self._play_icon_press_active = False
+                self._clear_hover_play_icon()
 
         # 1. Click-away editor close (existing — track_table viewport)
         if (event.type() == QEvent.Type.MouseButtonPress

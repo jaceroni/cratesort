@@ -20,6 +20,9 @@ from cratesort.src.utils.undo_manager import (
     UndoManager, LibraryFieldEditCommand, LibraryTagsEditCommand,
     LibraryGenreChangeCommand, LibraryReassignArtistCommand,
 )
+from cratesort.src.gui.theme import TRACK_ROW_HEIGHT
+from cratesort.src.gui.inline_edit import make_inline_editor
+from cratesort.src.gui.track_icons import note_icon, play_icon, pause_icon
 from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 
 try:
@@ -100,51 +103,10 @@ def _make_person_icon():
     return icon
 
 
-def _make_note_icon():
-    """Music note ♪ dual-state: cream normal, dark on selection. 11×14 (tighter gap)."""
-    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
-    def _pm(color: str) -> QPixmap:
-        pm = QPixmap(9, 14)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
-        f = p.font()
-        f.setPixelSize(12)
-        p.setFont(f)
-        p.setPen(QColor(color))
-        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, '♪')
-        p.end()
-        return pm
-    icon = QIcon()
-    icon.addPixmap(_pm(_MUTED),    QIcon.Mode.Normal)
-    icon.addPixmap(_pm('#2F2F2F'), QIcon.Mode.Selected)
-    return icon
-
-
-def _make_play_glyph_icon():
-    """Hover-only play triangle shown in place of the note icon on track
-    rows, signaling the row can be clicked (in this icon's hit zone) to
-    start playback. 9×14 to match _make_note_icon()'s footprint."""
-    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPolygonF
-    from PyQt6.QtCore import QPointF
-    def _pm(color: str) -> QPixmap:
-        pm = QPixmap(9, 14)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(color)))
-        p.drawPolygon(QPolygonF([QPointF(1.5, 2), QPointF(1.5, 12), QPointF(8, 7)]))
-        p.end()
-        return pm
-    icon = QIcon()
-    icon.addPixmap(_pm('#D17D34'), QIcon.Mode.Normal)
-    icon.addPixmap(_pm('#2F2F2F'), QIcon.Mode.Selected)
-    return icon
-
+# Track-row leading glyphs (note / play / pause) are shared with the Crates
+# track table — see gui/track_icons.py.
 
 _ARTIST_ICON = None
-_TRACK_ICON  = None
-_PLAY_GLYPH_ICON = None
 
 
 def _get_artist_icon():
@@ -152,20 +114,6 @@ def _get_artist_icon():
     if _ARTIST_ICON is None:
         _ARTIST_ICON = _make_person_icon()
     return _ARTIST_ICON
-
-
-def _get_track_icon():
-    global _TRACK_ICON
-    if _TRACK_ICON is None:
-        _TRACK_ICON = _make_note_icon()
-    return _TRACK_ICON
-
-
-def _get_play_glyph_icon():
-    global _PLAY_GLYPH_ICON
-    if _PLAY_GLYPH_ICON is None:
-        _PLAY_GLYPH_ICON = _make_play_glyph_icon()
-    return _PLAY_GLYPH_ICON
 
 # Editable track columns (field name for storage).
 # LC_GENRE and LC_ARTIST (as artist) are NOT here — use right-click menus only.
@@ -225,6 +173,25 @@ def _show_in_finder(file_path: str) -> None:
             subprocess.run(['xdg-open', str(Path(file_path).parent)], check=False)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Track tree row-height delegate
+# ---------------------------------------------------------------------------
+
+class _TrackRowHeightDelegate(QStyledItemDelegate):
+    """Locks every row of the Library track tree to TRACK_ROW_HEIGHT.
+
+    The Crates track table gets this for free from its QHeaderView section
+    size; a QTreeWidget has no vertical header, so it needs a delegate. Both
+    screens pull the same constant so the inline editor has identical
+    descender clearance in each (rinse-testing-findings-2026-08-27 #3).
+    """
+
+    def sizeHint(self, option, index) -> QSize:
+        size = super().sizeHint(option, index)
+        size.setHeight(TRACK_ROW_HEIGHT)
+        return size
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +771,9 @@ class LibraryBrowserView(QWidget):
         # keeps the play-triangle icon even when unhovered, so you can see
         # which track is playing. Set via set_now_playing().
         self._now_playing_path: Optional[str] = None
+        # Whether the loaded track is actually playing (vs paused) — drives
+        # play-vs-pause glyph on its row. Kept in sync via set_playing_state().
+        self._is_playing: bool = False
         # True between a consumed hover-play-icon press and its release, so
         # the whole gesture is swallowed (see eventFilter).
         self._play_icon_press_active: bool = False
@@ -979,7 +949,11 @@ class LibraryBrowserView(QWidget):
         self._tree.setPalette(_lb_pal)
         self._tree.setStyleSheet(
             'QTreeWidget { gridline-color: #383838; }'
-            'QTreeWidget::item { padding: 4px 4px 4px 2px; border-radius: 0;'
+            # No vertical padding: the inline editor (setItemWidget) then sits
+            # flush at the row top, like setCellWidget in the Crates table, so
+            # both screens share one editor treatment. Row height comes from the
+            # per-item size hint; text stays centred (padding was symmetric).
+            'QTreeWidget::item { padding: 0px 4px 0px 2px; border-radius: 0;'
             ' border-right: 1px solid #383838; border-bottom: 1px solid #383838; }'
             'QTreeWidget::item:selected { border-right: 1px solid #383838;'
             ' border-bottom: 1px solid #383838; }'
@@ -989,6 +963,12 @@ class LibraryBrowserView(QWidget):
         )
         self._tree.setRootIsDecorated(True)
         self._tree.setIndentation(12)
+        # Lock row height to match the Crates track table so the inline editor
+        # clears descenders here too (rinse-testing-findings-2026-08-27 #3).
+        # Held on self: a delegate that only lives as a C++ child can still be
+        # dropped by PyQt, silently reverting rows to the default height.
+        self._row_height_delegate = _TrackRowHeightDelegate(self._tree)
+        self._tree.setItemDelegate(self._row_height_delegate)
         self._tree.setExpandsOnDoubleClick(False)
         self._tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1536,6 +1516,10 @@ class LibraryBrowserView(QWidget):
 
     def _make_artist_item(self, artist: str, tracks: list, genre: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem()
+        # Pin the row height to match the Crates track table. Set on the item
+        # itself (not just the delegate) — QTreeView always honours an item
+        # size hint; a delegate sizeHint can be silently overridden.
+        item.setSizeHint(LC_ARTIST, QSize(-1, TRACK_ROW_HEIGHT))
         item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, {'artist': artist, 'tracks': tracks})
         item.setData(LC_GENRE,  Qt.ItemDataRole.UserRole + 1, genre)  # for filtering
 
@@ -1615,6 +1599,7 @@ class LibraryBrowserView(QWidget):
 
     def _make_track_child(self, parent: QTreeWidgetItem, rec) -> QTreeWidgetItem:
         child = QTreeWidgetItem(parent)
+        child.setSizeHint(LC_ARTIST, QSize(-1, TRACK_ROW_HEIGHT))  # match Crates row height
         edits = self._edits.get(str(rec.path), {})
 
         title   = edits.get('title',   rec.title   or '')
@@ -1865,12 +1850,19 @@ class LibraryBrowserView(QWidget):
         self.album_art_requested.emit(str(rec.path))
         return True
 
-    def _resting_track_icon(self, path_str: str):
-        """The icon a track row shows when NOT hovered: the play triangle if
-        it's the track currently loaded in the playback bar, else the note."""
+    def _row_icon_for(self, path_str: str, *, hovered: bool):
+        """The leading glyph for a track row given its play state:
+        - the loaded track: pause glyph while playing, play glyph while paused
+        - any other row: play glyph on hover, note glyph at rest"""
         if path_str and path_str == self._now_playing_path:
-            return _get_play_glyph_icon()
-        return _get_track_icon()
+            return pause_icon() if self._is_playing else play_icon()
+        if hovered:
+            return play_icon()
+        return note_icon()
+
+    def _resting_track_icon(self, path_str: str):
+        """The icon a track row shows when NOT hovered."""
+        return self._row_icon_for(path_str, hovered=False)
 
     def _restore_row_icon(self, item: Optional[QTreeWidgetItem]) -> None:
         if item is None:
@@ -1886,8 +1878,24 @@ class LibraryBrowserView(QWidget):
             return
         self._restore_row_icon(self._hover_track_item)
         if target is not None:
-            target.setIcon(LC_ARTIST, _get_play_glyph_icon())
+            rec = target.data(LC_PATH, Qt.ItemDataRole.UserRole)
+            path_str = str(rec.path) if rec is not None and hasattr(rec, 'path') else ''
+            target.setIcon(LC_ARTIST, self._row_icon_for(path_str, hovered=True))
         self._hover_track_item = target
+
+    def set_playing_state(self, playing: bool) -> None:
+        """Sync row glyphs to the real player state so the loaded row shows
+        pause while playing and play while paused. Called from MainWindow on
+        every QMediaPlayer playback-state change."""
+        if playing == self._is_playing:
+            return
+        self._is_playing = playing
+        if not self._now_playing_path:
+            return
+        item = self._find_track_item(self._now_playing_path)
+        if item is not None:
+            hovered = item is self._hover_track_item
+            item.setIcon(LC_ARTIST, self._row_icon_for(self._now_playing_path, hovered=hovered))
 
     def _clear_hover_play_icon(self) -> None:
         if self._hover_track_item is not None:
@@ -1895,14 +1903,18 @@ class LibraryBrowserView(QWidget):
             self._hover_track_item = None
 
     def set_now_playing(self, path) -> None:
-        """Mark the track loaded in the playback bar so its row keeps the
-        play-triangle icon while unhovered. Called whenever playback starts
+        """Mark the track loaded in the playback bar so its row keeps a
+        play/pause glyph while unhovered. Called whenever playback starts
         on a new track."""
         new = str(path) if path else None
         if new == self._now_playing_path:
             return
         prev = self._now_playing_path
         self._now_playing_path = new
+        # A new track only ever arrives here from a fresh play() — assume it's
+        # playing so the row shows pause immediately, no paused-glyph flash.
+        if new:
+            self._is_playing = True
         for p in (prev, new):
             if not p:
                 continue
@@ -2311,28 +2323,16 @@ class LibraryBrowserView(QWidget):
         self._commit_active_editor()
 
         current = item.text(column).lstrip()
-        editor  = QLineEdit(current)
-        editor.selectAll()
-        editor.setMinimumHeight(26)  # prevent descender clipping
+        editor = make_inline_editor(
+            current,
+            on_commit=self._commit_active_editor,
+            on_cancel=self._cancel_active_editor,
+        )
 
-        self._edit_widget  = editor
-        self._edit_item    = item
-        self._edit_col     = column
+        self._edit_widget   = editor
+        self._edit_item     = item
+        self._edit_col      = column
         self._edit_original = current
-
-        # Escape → cancel (patch keyPressEvent on the instance)
-        _orig_kp = editor.keyPressEvent
-        def _handle_key(event):
-            if event.key() == Qt.Key.Key_Escape:
-                self._cancel_active_editor()
-            else:
-                _orig_kp(event)
-        editor.keyPressEvent = _handle_key  # type: ignore[method-assign]
-
-        # Enter → commit+flash
-        editor.returnPressed.connect(self._commit_active_editor)
-        # Focus lost (click-away) → commit+flash; safe if already committed
-        editor.editingFinished.connect(self._commit_active_editor)
 
         self._tree.setItemWidget(item, column, editor)
         editor.setFocus()

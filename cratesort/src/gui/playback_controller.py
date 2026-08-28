@@ -48,6 +48,16 @@ class PlaybackController(QObject):
         self._player.play()
         self.now_playing_changed.emit(rec)
 
+    def play_or_toggle(self, rec) -> None:
+        """Row-icon click behaviour: if this track is already the loaded one,
+        toggle play/pause; otherwise load and play it. So a second click on
+        the same row pauses, a third resumes — never a restart."""
+        cur = self._current_track
+        if cur is not None and str(getattr(cur, 'path', '')) == str(getattr(rec, 'path', '')):
+            self.toggle_play_pause()
+        else:
+            self.play(rec)
+
     def toggle_play_pause(self) -> None:
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()

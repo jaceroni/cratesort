@@ -29,6 +29,24 @@ Link two tracks together with a relationship label so that finding one surfaces 
 
 ---
 
+### Add Tracks by Drag / File-Picker (bring files INTO the library from anywhere)
+**Status: design agreed 2026-08-28, sequenced after 0.1.3-beta ships. Not started.**
+
+Today the only way to add a file to the library is to drop it in the library folder in Finder and re-scan; the "Add Tracks" buttons just `open` that folder, and right-click → Add Tracks on a crate only offers already-scanned tracks. Jace hit this during testing — after consolidating duplicates he wanted to add a brand-new track to a crate and there was no in-app path.
+
+**Core constraint / the fear to design against:** CrateSort works from a directory — a file it doesn't own can't be processed — so any file added from outside has to be **copied into the library root**. The risk is *silent duplication*: a user drags a file off their Desktop, a second copy appears in the library, and they never realize they now have two. The fix is a **mandatory pre-flight modal** on every add (drag or button), never a silent copy.
+
+**Agreed shape:**
+- **Two entry points, one modal:** drag onto the Library screen / onto a crate in the Crates screen, AND a real "Add Tracks" button (replaces the current open-Finder buttons; Library toolbar + Crates screen when a crate is selected). Both route through the same confirmation modal — drag is not "silent" if the drop always surfaces it.
+- **The modal is a per-file pre-flight.** It classifies every dropped/picked file and states exactly what happens: *outside the library* → "a copy will be added to `…/Library/`, the file you dragged will not be changed or removed"; *already in the library folder but unscanned* → "already there, just indexing it, no copy"; *already in the library and scanned* (re-drag) → no-op / add-to-crate only; *audio duplicate of something already there* (run the Rinse detector on ingest) → "looks like a copy of 'X' — Add anyway / Skip". Mixed drops itemize: "3 copied in · 1 already in library · 1 possible duplicate".
+- **Copy, never move.** One explicit opt-in: "Add and remove the source files" — deletes each source only after a verified byte-identical copy. Default OFF.
+- **Placement (recommended):** loose at the library root, modal ends with "Run Organize to sort these into artist/genre folders." Predictable, no tag-guessing, reinforces that Organize is what files the library. (Alternative held as a refinement: auto-file by artist tag when clean, `…/Library/<Artist>/`, like YouTube import.)
+- **Drop-on-crate in v1** of this feature: adds to library if new, then to that crate. Same modal. This is the exact friction Jace hit. Pro-tier 1 (crate management); drop-on-Library-screen is free tier.
+- **Feedback:** dragover highlight; incremental add (no full rescan — reuse the `_new_track_paths` ◆-marker path); toast "Added N · Skipped M"; scroll to new rows.
+- **Interim step (do first, right after 0.1.3 ships):** make the existing "Add Tracks" button a plain native file-picker that copies selected files into the library root + rescans, with a one-time explainer of where they went. Small, safe, kills ~80% of the friction without the full modal.
+
+---
+
 ### Custom Workspace Layouts
 Column order/width in the Library tree is currently a single global OS-level setting (`QSettings`), not tied to any particular library. That's correct default behavior — the app remembers how the DJ likes to work, independent of which library is loaded — but some users may want a named, savable layout (e.g., a "file audit" layout with Path pulled forward, vs. a default "browsing" layout).
 
@@ -46,6 +64,13 @@ When reviewing duplicates, clicking a track row that has `ARTWORK: Yes` should d
 **Use case:** Lets the DJ visually confirm which copy has artwork before deciding which to keep. Useful when one copy has artwork and the other doesn't.
 
 **Implementation note:** Artwork is already detected at scan time (`has_artwork` field on `DuplicateCopy`). The remaining work is reading the actual image data at click time via mutagen, creating a `QPixmap`, and rendering it in the card layout. Needs a click handler on the row and a thumbnail widget (e.g., 64×64px) that appears inline.
+
+### Acoustic Fingerprinting for Duplicate Detection
+`DuplicateDetector` currently groups two files only when their normalized `(artist, title)` strings match *exactly* — audio metrics (duration/bitrate/size) merely tier an already-formed group. This means it cannot catch the same recording when both copies have genuinely different metadata (a rename, a different featuring credit, wrong artist). The 2026-08-27 manual test exposed this: editing one copy's title (`(Bootleg)`) dropped the pair from detection entirely (fixed narrowly by making `normalize_title()` strip any trailing bracket group, but that only covers *suffixes*, not a rewritten core title).
+
+**The real fix:** implement the existing `fingerprint_pass()` stub in `duplicate_detector.py` with `chromaprint` (`fpcalc`) + `pyacoustid` (already a project dependency). Compares actual audio content, so it catches the same song at any bitrate with any/no metadata.
+
+**Cost to weigh:** bundling the `fpcalc` binary into the unsigned macOS DMG (no turnkey pip wheel like `imageio-ffmpeg`), plus a real `%`-progress phase for fingerprinting every track on a large library (slow first pass — cache fingerprints keyed by path + mtime). Feature-scale, not a patch. Overlaps with the **CrateCleaner** sister-tool idea below, which already envisions fingerprinting infra — could be shared.
 
 ---
 

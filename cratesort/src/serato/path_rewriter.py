@@ -28,6 +28,43 @@ def _nfc_posix(s: str) -> str:
 BACKUP_DIR = '_CrateSort_Backups'
 
 
+def _ptrk_of(inner_records: list[tuple[str, Any]]) -> str | None:
+    """The 'ptrk' (track path) value inside one 'otrk' record, or None."""
+    for tag, value in inner_records:
+        if tag == 'ptrk':
+            return value
+    return None
+
+
+def _dedupe_track_refs(
+    data: list[tuple[str, Any]]
+) -> tuple[list[tuple[str, Any]], int]:
+    """
+    Drop repeated 'otrk' entries that resolve to the same track path, keeping
+    the first occurrence in its original position. Non-'otrk' tags (column/sort
+    settings, etc.) are passed through untouched and never reordered.
+
+    Duplicate consolidation can point two rows in a single crate at the same
+    winner file (the crate referenced both a winner and a loser of one group).
+    A crate should never list one resolved file twice; this enforces that on
+    every crate this pass rewrites.
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, Any]] = []
+    dropped = 0
+    for tag, value in data:
+        if tag == 'otrk':
+            ptrk = _ptrk_of(value)
+            if ptrk is not None:
+                key = _nfc_posix(ptrk.replace('', ':'))
+                if key in seen:
+                    dropped += 1
+                    continue
+                seen.add(key)
+        out.append((tag, value))
+    return out, dropped
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -223,6 +260,16 @@ class PathRewriter:
         if not crate_changes:
             result.crates_unchanged += 1
             return
+
+        # The rewrite above can leave a crate holding two rows for one file
+        # (it referenced both a winner and a loser of the same duplicate group).
+        # Collapse those before writing so the crate never lists a file twice.
+        new_data, dup_dropped = _dedupe_track_refs(new_data)
+        if dup_dropped:
+            logger.info(
+                "  %s: collapsed %d duplicate track reference(s) after rewrite",
+                crate_file.name, dup_dropped,
+            )
 
         result.changes_log.extend(crate_changes)
         result.crates_modified += 1

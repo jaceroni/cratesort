@@ -122,6 +122,7 @@ class MainWindow(QMainWindow):
         # be constructed with a live controller reference.
         self._playback_controller = PlaybackController(self)
         self._playback_controller.now_playing_changed.connect(self._on_now_playing_changed)
+        self._playback_controller.playback_state_changed.connect(self._on_playback_state_changed)
         self._video_window: Optional[FloatingVideoWindow] = None
 
         content_row = QWidget()
@@ -162,6 +163,7 @@ class MainWindow(QMainWindow):
         self._crate_manager.album_art_requested.connect(self._update_album_art)
         self._crate_manager.navigate_to_settings.connect(lambda: self._on_nav_by_id('settings'))
         self._crate_manager.launch_serato_requested.connect(self._on_launch_serato_requested)
+        self._crate_manager.play_requested.connect(self._on_play_requested)
         self._content.addWidget(self._crate_manager)
 
         # Organize view — index 3
@@ -196,8 +198,15 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._playback_bar)
 
     def _on_play_requested(self, rec) -> None:
+        # A row's play icon is a play/pause toggle: re-clicking the loaded
+        # track pauses/resumes it rather than restarting. Only do the
+        # art/video swap work when the track actually changes.
+        cur = self._playback_controller.current_track
+        same = cur is not None and str(getattr(cur, 'path', '')) == str(rec.path)
+        self._playback_controller.play_or_toggle(rec)
+        if same:
+            return
         pixmap = _read_album_art(str(rec.path))
-        self._playback_controller.play(rec)
         self._playback_bar.set_now_playing_art(pixmap)
         # Any previously popped-out video window belongs to whatever was
         # playing before — close it so it doesn't linger on the new track.
@@ -209,11 +218,25 @@ class MainWindow(QMainWindow):
             self._inline_video.hide_video()
 
     def _on_now_playing_changed(self, rec) -> None:
-        """Keep the library list's play-triangle marker on whatever track is
+        """Keep both track lists' now-playing marker on whatever track is
         now loaded in the playback bar (covers direct clicks, the hover-play
         icon, and skip next/previous — all route through the controller)."""
-        if rec is not None and hasattr(self, '_library_browser'):
+        if rec is None:
+            return
+        if hasattr(self, '_library_browser'):
             self._library_browser.set_now_playing(str(rec.path))
+        if hasattr(self, '_crate_manager'):
+            self._crate_manager.set_now_playing(str(rec.path))
+
+    def _on_playback_state_changed(self, state) -> None:
+        """Fan the real player play/pause state out to both track lists so a
+        loaded row shows pause while playing and play while paused."""
+        from PyQt6.QtMultimedia import QMediaPlayer
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        if hasattr(self, '_library_browser'):
+            self._library_browser.set_playing_state(playing)
+        if hasattr(self, '_crate_manager'):
+            self._crate_manager.set_playing_state(playing)
 
     def _on_pop_out_requested(self) -> None:
         self._inline_video.hide_video()

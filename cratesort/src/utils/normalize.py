@@ -35,21 +35,17 @@ def normalize_title(title: str) -> str:
     title = title.strip().lower()
     # Strip leading track numbers: "02 Title", "02. Title", "02 - Title"
     title = re.sub(r'^\d{1,3}[\s\.\-]+', '', title)
-    # Strip parenthesized/bracketed version suffixes: "Title (Original Mix)"
-    title = re.sub(
-        r'\s*[\(\[]\s*'
-        r'(?:remaster(?:ed)?(?:\s+\d{4})?'
-        r'|original\s+mix'
-        r'|single\s+version'
-        r'|mono|stereo'
-        r'|bonus\s+track'
-        r'|extended(?:\s+mix)?'
-        r'|radio\s+edit|club\s+mix|instrumental|acapella|a[- ]?cappella'
-        r'|live|acoustic)\s*[\)\]]',
-        '', title, flags=re.I,
-    )
-    # Strip parenthesized years: "Title (1982)", "Title (2023)"
-    title = re.sub(r'\s*[\(\[]\s*\d{4}\s*[\)\]]', '', title)
+    # Strip ALL trailing parenthesized/bracketed groups, whatever they contain:
+    # "(Original Mix)", "(Remaster 2012)", "(1982)", "(Bootleg)", "(VIP)",
+    # "(dave's edit)", "(clean)", chained ones like "(Remastered) (Live)".
+    # Deliberately not an allow-list: for duplicate *bucketing*, an over-merge
+    # still surfaces to the user (tiered as a variant in the review list), but
+    # an under-merge hides the file entirely. When a user tacks a suffix onto
+    # one copy's title to distinguish it, both copies must still bucket together
+    # so Rinse can catch them. Guard against eating the whole title.
+    stripped = re.sub(r'(?:\s*[\(\[][^\(\)\[\]]*[\)\]])+\s*$', '', title).strip()
+    if stripped:
+        title = stripped
     # Strip hyphenated version qualifiers: "Title - Original", "Title - 12 Inch Mix"
     title = re.sub(
         r'\s*[-–]\s*(?:original|remix(?:ed)?|extended|instrumental|'
