@@ -1217,7 +1217,7 @@ Write only what is necessary to accomplish the stated goal. Do not refactor adja
 
 ## Packaging & Distribution
 
-**Status: macOS beta packaging shipped — 0.1.0-beta (2026-07-12), 0.1.1-beta (2026-07-31). Unsigned, no notarization.** Windows/Linux not yet built. No dedicated build script exists yet — every step below (including the DMG staging/icon steps) is run as one-off shell commands each time; worth scripting if this becomes routine. 0.1.1-beta bumped `packaging/CrateSort.spec`'s `info_plist` version fields only — same pipeline, no packaging-process changes.
+**Status: macOS beta packaging shipped — 0.1.0-beta (2026-07-12), 0.1.1-beta (2026-07-31), 0.1.2-beta (2026-08-28). Unsigned, no notarization.** Windows/Linux not yet built. No dedicated build script exists yet — every step below (including the DMG staging/icon steps) is run as one-off shell commands each time; worth scripting if this becomes routine. 0.1.1-beta bumped `packaging/CrateSort.spec`'s `info_plist` version fields only — same pipeline, no packaging-process changes.
 
 **Pipeline**: `packaging/CrateSort.spec` (PyInstaller) builds `dist/CrateSort.app` from `packaging/run_app.py`, an entry point that just calls `cratesort.src.gui.main_window:main`. Bundles `cratesort/assets/` in full. Build from a dedicated venv (`.build-venv/`, gitignored) — never the system Python.
 
