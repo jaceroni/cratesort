@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QProgressBar, QPushButton, QVBoxLayout,
 )
 
-from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
+from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout, _ov_confirm
 from cratesort.src.utils.ffmpeg_tools import format_elapsed, get_ffmpeg_path, get_media_duration
 from cratesort.src.utils.metadata_copy import embed_artwork
 
@@ -709,6 +709,7 @@ class _YTImportDialog(_CrateSortDialog):
             'background: rgba(241, 227, 200, 0.05); }'
         )
         self._cancel_btn.clicked.connect(self._on_cancel)
+        self._cancel_btn.setAutoDefault(False)
 
         self._import_btn = QPushButton('Import')
         self._import_btn.setFixedHeight(36)
@@ -720,6 +721,9 @@ class _YTImportDialog(_CrateSortDialog):
             'QPushButton:disabled { background-color: #2a2a2a; color: #5a5248; }'
         )
         self._import_btn.clicked.connect(self._on_import)
+        self._import_btn.setDefault(True)   # Return anywhere in the form starts the import
+        for _f in (self._f_artist, self._f_title, self._f_album, self._f_year, self._f_genre):
+            _f.returnPressed.connect(self._on_import)
 
         btn_row.addWidget(self._cancel_btn)
         btn_row.addStretch()
@@ -983,12 +987,29 @@ class _YTImportDialog(_CrateSortDialog):
         self._url_input.setEnabled(True)
         self._fields_enabled(True)
 
+    def keyPressEvent(self, event) -> None:
+        # Route Escape through _on_cancel so an in-flight download/lookup is
+        # stopped cleanly (and confirmed) instead of the dialog just closing.
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_cancel()
+            return
+        super().keyPressEvent(event)
+
     def _on_cancel(self) -> None:
-        for w in (self._meta_worker, self._dl_worker, self._mb_worker):
-            if w and w.isRunning():
-                if hasattr(w, 'cancel'):
-                    w.cancel()
-                w.wait(2000)
+        running = [w for w in (self._meta_worker, self._dl_worker, self._mb_worker)
+                   if w and w.isRunning()]
+        if self._dl_worker and self._dl_worker.isRunning():
+            if not _ov_confirm(
+                self, 'Stop the import?',
+                'The download is still running. Nothing will be added to your library '
+                'if you stop now.',
+                confirm_text='Stop', cancel_text='Keep Going', confirm_danger=True,
+            ):
+                return
+        for w in running:
+            if hasattr(w, 'cancel'):
+                w.cancel()
+            w.wait(2000)
         self.reject()
 
     def _set_result(self, text: str, *, error: bool) -> None:

@@ -402,6 +402,7 @@ class _WarningsDetailDialog(_CrateSortDialog):
             f'QPushButton:pressed {{ background-color: #2d6358; }}'
         )
         close_btn.clicked.connect(self.accept)
+        close_btn.setDefault(True)   # Return / Escape both just close
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
 
@@ -446,6 +447,9 @@ class _UnclassifiedWarningDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         go_back_btn.clicked.connect(self.reject)
+        # This is a speed-bump before a bulk file move — Return and Escape
+        # both take the cautious path; Proceed must be a deliberate click.
+        go_back_btn.setDefault(True)
 
         proceed_btn = QPushButton('Proceed')
         proceed_btn.setFixedHeight(36)
@@ -456,6 +460,7 @@ class _UnclassifiedWarningDialog(_CrateSortDialog):
             'QPushButton:pressed { background-color: #7e491c; }'
         )
         proceed_btn.clicked.connect(self.accept)
+        proceed_btn.setAutoDefault(False)
 
         btn_row.addWidget(go_back_btn)
         btn_row.addStretch()

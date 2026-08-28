@@ -20,7 +20,8 @@ from PyQt6.QtGui import (
     QBrush, QColor, QFontMetrics, QLinearGradient, QPainter, QPen, QRadialGradient,
 )
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGraphicsOpacityEffect,
+    QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
+    QGraphicsScene, QGraphicsView,
     QGridLayout, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem,
     QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSplitter,
@@ -29,7 +30,7 @@ from PyQt6.QtWidgets import (
 )
 
 try:
-    from PyQt6.QtSvgWidgets import QSvgWidget
+    from PyQt6.QtSvgWidgets import QSvgWidget, QGraphicsSvgItem
     _SVG_AVAILABLE = True
 except ImportError:
     _SVG_AVAILABLE = False
@@ -117,6 +118,147 @@ class _ClickableLabel(QLabel):
     clicked = pyqtSignal()
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class _MascotView(QGraphicsView):
+    """The dashboard mascot as an animatable graphics item.
+
+      - pulsing=True  → opacity breathes 0.3↔1.0 while a scan is live (the
+        "still working" cue, same read as the old QSvgWidget version).
+      - pulsing=False → settled at full opacity and interactive: hovering
+        does a one-shot "grow and wiggle" (the locked mascot motion — see
+        _LaunchingSeratoDialog for the reference signature), and clicking
+        replays every stat card's count-up at once, the same payoff a
+        single card gives when clicked.
+    """
+
+    clicked = pyqtSignal()
+
+    # Fixed box with headroom so the hover grow + wiggle never clips against
+    # the view edge; the mascot renders at ~84x100 inside it via fitInView.
+    _VIEW_W, _VIEW_H = 108, 122
+    _PAD_FRAC = 0.14
+
+    def __init__(self, svg_path: str, pulsing: bool, parent=None):
+        super().__init__(parent)
+        self._pulsing = pulsing
+        self.setFixedSize(self._VIEW_W, self._VIEW_H)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setStyleSheet('background: transparent; border: none;')
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.viewport().setAutoFillBackground(False)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Purely decorative — never route clicks/scroll to the scene item, so
+        # the view's own mousePressEvent/enterEvent always fire.
+        self.setInteractive(False)
+
+        scene = QGraphicsScene(self)
+        self._scene = scene
+        item = QGraphicsSvgItem(svg_path)
+        self._item = item
+        native = item.boundingRect()
+        item.setTransformOriginPoint(native.center())
+        scene.addItem(item)
+        self.setScene(scene)
+        padded = native.adjusted(
+            -native.width() * self._PAD_FRAC, -native.height() * self._PAD_FRAC,
+            native.width() * self._PAD_FRAC, native.height() * self._PAD_FRAC,
+        )
+        self.fitInView(padded, Qt.AspectRatioMode.KeepAspectRatio)
+
+        self._pulse_anim = None
+        self._scale_anim = None
+        self._wiggle_anim = None
+
+        if pulsing:
+            anim = QPropertyAnimation(item, b'opacity', self)
+            anim.setDuration(1100)
+            anim.setKeyValueAt(0.0, 0.3)
+            anim.setKeyValueAt(0.5, 1.0)
+            anim.setKeyValueAt(1.0, 0.3)
+            anim.setEasingCurve(QEasingCurve(QEasingCurve.Type.InOutSine))
+            anim.setLoopCount(-1)
+            self._pulse_anim = anim
+            anim.start()
+        else:
+            item.setOpacity(1.0)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    # -- settled (interactive) mode -----------------------------------------
+
+    def _animate_scale(self, end: float, duration: int, curve: QEasingCurve) -> None:
+        if self._scale_anim is not None:
+            self._scale_anim.stop()
+        anim = QPropertyAnimation(self._item, b'scale', self)
+        anim.setDuration(duration)
+        anim.setStartValue(self._item.scale())
+        anim.setEndValue(end)
+        anim.setEasingCurve(curve)
+        self._scale_anim = anim
+        anim.start()
+
+    def _play_hover(self, entering: bool) -> None:
+        if self._pulsing:
+            return
+        if entering:
+            grow = QEasingCurve(QEasingCurve.Type.OutBack)
+            grow.setOvershoot(2.0)
+            self._animate_scale(1.12, 260, grow)
+
+            if self._wiggle_anim is not None:
+                self._wiggle_anim.stop()
+            wiggle = QPropertyAnimation(self._item, b'rotation', self)
+            wiggle.setDuration(480)
+            wiggle.setKeyValueAt(0.0, 0.0)
+            wiggle.setKeyValueAt(0.25, -7.0)
+            wiggle.setKeyValueAt(0.55, 7.0)
+            wiggle.setKeyValueAt(0.80, -3.0)
+            wiggle.setKeyValueAt(1.0, 0.0)
+            wiggle.setEasingCurve(QEasingCurve(QEasingCurve.Type.InOutSine))
+            self._wiggle_anim = wiggle
+            wiggle.start()
+        else:
+            self._animate_scale(1.0, 200, QEasingCurve(QEasingCurve.Type.InOutSine))
+            if self._wiggle_anim is not None:
+                self._wiggle_anim.stop()
+            settle = QPropertyAnimation(self._item, b'rotation', self)
+            settle.setDuration(180)
+            settle.setStartValue(self._item.rotation())
+            settle.setEndValue(0.0)
+            settle.setEasingCurve(QEasingCurve(QEasingCurve.Type.InOutSine))
+            self._wiggle_anim = settle
+            settle.start()
+
+    def _play_click_pop(self) -> None:
+        pop = QEasingCurve(QEasingCurve.Type.OutBack)
+        pop.setOvershoot(3.0)
+        end = 1.12 if self.underMouse() else 1.0
+        if self._scale_anim is not None:
+            self._scale_anim.stop()
+        anim = QPropertyAnimation(self._item, b'scale', self)
+        anim.setDuration(440)
+        anim.setKeyValueAt(0.0, self._item.scale())
+        anim.setKeyValueAt(0.30, 1.24)
+        anim.setKeyValueAt(1.0, end)
+        anim.setEasingCurve(pop)
+        self._scale_anim = anim
+        anim.start()
+
+    def enterEvent(self, event):
+        self._play_hover(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._play_hover(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if not self._pulsing and event.button() == Qt.MouseButton.LeftButton:
+            self._play_click_pop()
             self.clicked.emit()
         super().mousePressEvent(event)
 
@@ -510,6 +652,7 @@ class _ChangeReviewDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         self._cancel_btn.clicked.connect(self.reject)
+        self._cancel_btn.setAutoDefault(False)
 
         self._sync_btn = QPushButton('Apply && Continue')
         self._sync_btn.setFixedHeight(36)
@@ -520,6 +663,7 @@ class _ChangeReviewDialog(_CrateSortDialog):
             'QPushButton:pressed { background-color: #7e491c; }'
         )
         self._sync_btn.clicked.connect(self._on_sync)
+        self._sync_btn.setDefault(True)   # Return applies; Escape cancels (non-destructive — banner stays)
 
         btn_row.addWidget(self._cancel_btn)
         btn_row.addStretch()
@@ -1264,33 +1408,22 @@ class DashboardWidget(QWidget):
         if not (_SVG_AVAILABLE and _MASCOT_SVG.exists()):
             return container
 
-        # Mascot SVG's viewBox is 1063.39x1262.43 (not square); QSvgWidget
-        # stretches to fill its box with no aspect-ratio preservation, so
-        # the fixed size must match that ratio or the art looks squashed.
-        mascot = QSvgWidget(str(_MASCOT_SVG))
-        mascot.setFixedSize(84, 100)
-        mascot.setStyleSheet('background: transparent;')
-        mascot.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        effect = QGraphicsOpacityEffect(mascot)
-        mascot.setGraphicsEffect(effect)
+        mascot = _MascotView(str(_MASCOT_SVG), pulsing=pulsing)
         self._mascot = mascot
-
-        if pulsing:
-            curve = QEasingCurve(QEasingCurve.Type.InOutSine)
-            anim = QPropertyAnimation(effect, b'opacity', mascot)
-            anim.setDuration(1100)
-            anim.setKeyValueAt(0.0, 0.3)
-            anim.setKeyValueAt(0.5, 1.0)
-            anim.setKeyValueAt(1.0, 0.3)
-            anim.setEasingCurve(curve)
-            anim.setLoopCount(-1)
-            self._mascot_anim = anim
-            anim.start()
-        else:
-            effect.setOpacity(1.0)
+        self._mascot_anim = mascot._pulse_anim
+        if not pulsing:
+            # Settled mascot: clicking it replays every stat card's count-up,
+            # the same payoff clicking a single card gives.
+            mascot.clicked.connect(self._replay_stat_animations)
 
         col.addWidget(mascot, alignment=Qt.AlignmentFlag.AlignHCenter)
         return container
+
+    def _replay_stat_animations(self) -> None:
+        """Re-run the post-scan summary cards' count-up reveal. Wired to the
+        settled mascot's click — a whole-row echo of the per-card click."""
+        for i, (card, target, duration) in enumerate(getattr(self, '_summary_cards', [])):
+            QTimer.singleShot(i * 90, lambda c=card, t=target, d=duration: c.start_animation(t, d))
 
     def _populate_dashboard(self, scanning: bool = False) -> None:
         layout = self._dashboard_layout
@@ -1409,6 +1542,9 @@ class DashboardWidget(QWidget):
         targets = [total_target, crate_target, artists_target, hours_target]
         durations = [1600, 1400, 1500, 1300]
         cards = [c0, c1, c2, c3]
+        # Kept so the settled mascot's click can replay the whole row — see
+        # _replay_stat_animations.
+        self._summary_cards = list(zip(cards, targets, durations))
         for i, (card, target, duration) in enumerate(zip(cards, targets, durations)):
             QTimer.singleShot(100 + i * 120, lambda c=card, t=target, d=duration: c.start_animation(t, d))
 

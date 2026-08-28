@@ -11,7 +11,7 @@ from typing import Optional
 
 from cratesort.src.core.duplicate_consolidator import read_recent_merges
 
-from PyQt6.QtCore import Qt, QByteArray, QEvent, QRect, QSettings, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QByteArray, QEvent, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal
 
 from cratesort.src.gui.overlays import (
     _CrateSortDialog, _ov_alert, _create_dialog_layout, _AnimatedStatCardWidget,
@@ -27,7 +27,7 @@ try:
 except ImportError:
     pass
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox,
+    QAbstractItemView, QAbstractScrollArea, QApplication, QDialog, QDialogButtonBox,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem,
     QMenu, QProgressBar, QPushButton, QSplitter, QStackedWidget,
@@ -71,6 +71,10 @@ _VALID_GENRES_LOWER: dict[str, str] = {g.lower(): g for g in {
     'House', 'Jazz', 'R&B', 'Reggae', 'Rock', 'Seasonal',
     'Specialty', 'Traditional',
 }}
+
+# The full fixed taxonomy, display order — shown in the "Why Only These
+# Genres?" modal.
+_LIBRARY_GENRES: list[str] = sorted(_VALID_GENRES_LOWER.values())
 
 _SETTINGS_KEY = 'library_browser_header_state'
 
@@ -373,6 +377,7 @@ class _UnsavedChangesDialog(_CrateSortDialog):
             'QPushButton:pressed { background: #973434; }'
         )
         leave_btn.clicked.connect(self.accept)
+        leave_btn.setAutoDefault(False)
 
         stay_btn = QPushButton('Stay && Finish')
         stay_btn.setFixedHeight(36)
@@ -383,11 +388,208 @@ class _UnsavedChangesDialog(_CrateSortDialog):
             'QPushButton:pressed { background-color: #2d6358; }'
         )
         stay_btn.clicked.connect(self.reject)
+        stay_btn.setDefault(True)   # Return keeps you here; Escape does too
 
         btns.addWidget(leave_btn)
         btns.addStretch()
         btns.addWidget(stay_btn)
         layout.addLayout(btns)
+
+
+class _GenreLogicDialog(_CrateSortDialog):
+    """The record-shop rationale behind the fixed genre column: why the list
+    is short, where subgenres go (style tags), and how it feeds the Organize
+    folder tree. Opened from the "Why Only These Genres?" link under the
+    genre sidebar."""
+
+    # Lightened teal for the small section eyebrows + the inline link: the
+    # app's #428175 fails AA at this size on the modal's #2F2F2F surface.
+    # Still the interactive/teal family — not a new hue — just readable.
+    _ACCENT = '#69A79A'
+
+    _HEADLINE_GAP = 30   # headline → first section
+    _SECTION_GAP  = 16   # between whole section groups (and before the button)
+    _EYEBROW_GAP  = 8    # eyebrow → its own paragraph (grouped tight)
+
+    def _eyebrow(self, text: str) -> QLabel:
+        eb = QLabel(text)
+        eb.setStyleSheet(
+            f'color: {self._ACCENT}; font-size: 10px; font-weight: 700; '
+            'letter-spacing: 0.12em; background: transparent; border: none;'
+        )
+        return eb
+
+    def _body(self, html: str) -> QLabel:
+        b = QLabel()
+        b.setTextFormat(Qt.TextFormat.RichText)
+        b.setText(f'<div style="line-height: 148%;">{html}</div>')
+        b.setWordWrap(True)
+        # Pin the wrap width to the real content width. Without this a
+        # word-wrapped QLabel guesses a narrower width for sizeHint(), reports
+        # too many lines, and the dialog's adjustSize() comes out too tall —
+        # then QVBoxLayout spreads the surplus into the gaps between sections
+        # (which is why they kept looking doubled).
+        b.setFixedWidth(self._content_w)
+        b.setStyleSheet(
+            'color: #d5c7ad; font-size: 14px; background: transparent; border: none;'
+        )
+        return b
+
+    def _section(self, eyebrow: str, body_html: str) -> QVBoxLayout:
+        """One eyebrow + paragraph as a tight vertical group. The larger
+        section gap lives on the parent layout, between whole groups."""
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(self._EYEBROW_GAP)
+        box.addWidget(self._eyebrow(eyebrow))
+        box.addWidget(self._body(body_html))
+        return box
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Wide enough that the paragraphs run ~550px — keeps them to 2–3 lines
+        # each so the modal stays short rather than tall-and-narrow.
+        self.setFixedWidth(700)
+
+        layout = _create_dialog_layout(self)
+        self._inner = layout
+        m = layout.contentsMargins()
+        self._content_w = 700 - 2 - m.left() - m.right()   # dialog − frame border − inner margins
+        # Every gap is placed explicitly below — no ambient layout spacing to
+        # compound with them.
+        layout.setSpacing(0)
+
+        headline = QLabel('Why Only These Genres?')
+        headline.setStyleSheet(
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
+        )
+        layout.addWidget(headline)
+        layout.addSpacing(self._HEADLINE_GAP)
+
+        # ── Section 1: record-shop logic + collapsible genre list ──────────
+        self._s1 = self._section(
+            'RECORD SHOP LOGIC',
+            'CrateSort works from a fixed list of genres — similar to how a '
+            'record shop organizes its inventory. '
+            # A stylesheet is active up the ancestry, so Qt ignores the
+            # QPalette Link colour — the brand teal has to live in the markup
+            # (inner <span>) or the link renders default system blue.
+            f'<a href="#toggle" style="text-decoration:none;">'
+            f'<span style="color:{self._ACCENT}; text-decoration:underline;">Click here</span></a> '
+            'to see the full genre list.'
+        )
+        s1_body = self._s1.itemAt(1).widget()
+        s1_body.setOpenExternalLinks(False)
+        s1_body.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        s1_body.setCursor(Qt.CursorShape.PointingHandCursor)
+        s1_body.linkActivated.connect(self._toggle_genre_list)
+
+        self._genre_list_lbl = QLabel('\n'.join(_LIBRARY_GENRES))
+        self._genre_list_lbl.setStyleSheet(
+            'color: #f1e3c8; font-size: 13px; background: transparent; border: none; '
+            'padding: 4px 0 0 18px;'
+        )
+        self._genre_list_lbl.setVisible(False)
+        self._s1.addWidget(self._genre_list_lbl)
+        layout.addLayout(self._s1)
+
+        # ── Sections 2–4 ─────────────────────────────────────────────────
+        for eyebrow, html in (
+            ('OK, BUT WHY SO LIMITED?',
+             'The whole concept here is to get your shit together. And as your '
+             'library grows, the tighter we keep the genre list, the more '
+             'organized your library will be — both as files on your drive and '
+             'virtually in Serato.'),
+            ('LEVERAGE STYLE TAGS',
+             'Add style tags in addition to genre assignments to help organize '
+             'obscure and alternative artists or tracks — “Funk Rock” and “Old '
+             'School”. You can even filter by these tags to build deeper crates.'),
+            ('GENRES BECOME FOLDERS',
+             "When you run CrateSort's organize feature, each of these genres "
+             'will become a top-level directory in your media folder — '
+             'reorganizing folders and their files like a record shop would '
+             'artists and their albums.'),
+        ):
+            layout.addSpacing(self._SECTION_GAP)
+            layout.addLayout(self._section(eyebrow, html))
+
+        layout.addSpacing(self._SECTION_GAP)
+
+        back_btn = QPushButton('Back to Library')
+        back_btn.setFixedHeight(36)
+        back_btn.setMinimumWidth(140)
+        back_btn.setStyleSheet(
+            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 0 20px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #38706a; }'
+            'QPushButton:pressed { background-color: #2d6358; }'
+        )
+        back_btn.clicked.connect(self.accept)
+        back_btn.setDefault(True)   # Return / Escape both just dismiss this
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(back_btn)
+        layout.addLayout(row)
+        # Absorbs the small cushion in _content_h() at the bottom rather than
+        # letting the layout spread it into the section gaps.
+        layout.addStretch(1)
+
+    def _layout_h(self, lay) -> int:
+        """Height of a box layout, summed from each child's OWN sizeHint
+        (reliable for our pieces — fixed-px spacers, single-line eyebrows,
+        fixed-width wrapped bodies, the plain genre list) rather than the
+        layout's own sizeHint, which sticks at a stale value once any child
+        has been shown (pyqt gotcha)."""
+        m = lay.contentsMargins()
+        parts: list[int] = []
+        for i in range(lay.count()):
+            it = lay.itemAt(i)
+            if it.spacerItem() is not None:
+                parts.append(it.spacerItem().sizeHint().height())   # addStretch → 0
+            elif it.widget() is not None:
+                if it.widget().isHidden():
+                    continue
+                parts.append(it.widget().sizeHint().height())
+            elif it.layout() is not None:
+                parts.append(self._layout_h(it.layout()))
+        return (
+            m.top() + m.bottom()
+            + sum(parts)
+            + lay.spacing() * max(0, len(parts) - 1)
+        )
+
+    def _content_h(self) -> int:
+        return self._layout_h(self._inner) + 2 + 4   # + frame border + tiny cushion
+
+    def showEvent(self, event) -> None:
+        self.ensurePolished()
+        for lbl in self.findChildren(QLabel):
+            lbl.ensurePolished()
+        self._apply_height()
+        super().showEvent(event)
+
+    def _apply_height(self) -> None:
+        from PyQt6.QtWidgets import QLayout
+        h = self._content_h()
+        # The layout's minimumSize sticks at its largest-ever value after the
+        # first show() (pyqt gotcha) and would clamp any shrink — drop the
+        # constraint and force the exact height.
+        self._inner.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        self.setMinimumHeight(0)
+        self.setFixedHeight(h)
+
+    def _toggle_genre_list(self, _href: str = '') -> None:
+        self._genre_list_lbl.setVisible(not self._genre_list_lbl.isVisible())
+        self._apply_height()
+        h = self.height()
+        if self._overlay is not None:
+            pw = self._overlay._parent_window
+            origin = pw.mapToGlobal(QPoint(0, 0))
+            self.move(
+                origin.x() + (pw.width() - self.width()) // 2,
+                origin.y() + (pw.height() - h) // 2,
+            )
 
 # ---------------------------------------------------------------------------
 # _AnalyzeLibraryModal — frameless modal shown during first-run classification
@@ -400,7 +602,9 @@ class _AnalyzeLibraryModal(_CrateSortDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(720)
+        # Wide enough for all 5 stat cards to hold their captions on one line
+        # (the cards now refuse to wrap — see _AnimatedStatCardWidget).
+        self.setFixedWidth(860)
 
         # Use standard Teal accent layout (safe action/progress)
         layout = _create_dialog_layout(self)
@@ -596,6 +800,20 @@ class LibraryBrowserView(QWidget):
 
         # Hover-play-icon state (mirrors CrateManagerView._crate_hover_item)
         self._hover_track_item: Optional[QTreeWidgetItem] = None
+        # Path of the track currently loaded in the playback bar — its row
+        # keeps the play-triangle icon even when unhovered, so you can see
+        # which track is playing. Set via set_now_playing().
+        self._now_playing_path: Optional[str] = None
+        # True between a consumed hover-play-icon press and its release, so
+        # the whole gesture is swallowed (see eventFilter).
+        self._play_icon_press_active: bool = False
+        # Session-lived tree state (expanded artists + current selection),
+        # re-applied across tab switches so returning to Library doesn't
+        # collapse everything or lose your place. Mirrors CrateManagerView's
+        # _save_tree_state / _restore_tree_state. Reset only on library change
+        # (and, implicitly, app restart).
+        self._session_expanded_artists: set[str] = set()
+        self._session_selected: Optional[tuple[str, str]] = None
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -621,6 +839,13 @@ class LibraryBrowserView(QWidget):
         classification and navigates here, the same inventory object is reused (same
         id()) but the session file on disk has changed.  Always reload the session.
         """
+        # A genuine library change invalidates the remembered tree state
+        # (artist names won't carry over); a same-library reload (tab switch,
+        # post-classify refresh) keeps it. Gate the save below on this.
+        _lib_changed = (
+            self._library_path is not None and self._library_path != library_path
+        )
+
         self._library_path  = library_path
         self._loaded_inv_id = id(inventory)
         self._inventory     = list(inventory)
@@ -659,8 +884,24 @@ class LibraryBrowserView(QWidget):
 
         self._edits = {}
         self._load_edits()
+
+        # Capture the still-intact tree from the previous visit before it's
+        # torn down, so expansion + selection survive the rebuild. Skip (and
+        # clear) when the library itself changed — stale artist names must not
+        # carry over.
+        if _lib_changed:
+            self._session_expanded_artists = set()
+            self._session_selected = None
+        else:
+            expanded, selected = self._save_tree_state()
+            if expanded:
+                self._session_expanded_artists = expanded
+            if selected:
+                self._session_selected = selected
+
         self._rebuild_tree()
         self._populate_genre_sidebar()
+        self._restore_tree_state(self._session_expanded_artists, self._session_selected)
         self._stack.setCurrentIndex(1)
 
         # Auto-open the classify review banner — no manual button click required —
@@ -1041,9 +1282,36 @@ class LibraryBrowserView(QWidget):
         self._genre_sidebar_list.currentItemChanged.connect(
             self._on_sidebar_genre_changed
         )
-        layout.addWidget(self._genre_sidebar_list, stretch=1)
+        # Size the list to its own content so the link below can sit directly
+        # under the last genre row instead of being pinned to the column
+        # floor; it still scrolls internally if the window is too short.
+        self._genre_sidebar_list.setSizeAdjustPolicy(
+            QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents
+        )
+        layout.addWidget(self._genre_sidebar_list)
+
+        # Link sits right beneath the last genre. The ⓘ marks it as a note
+        # rather than another genre row. At rest it's the same muted beige as
+        # the genre rows above; hovering warms it to teal to signal it's
+        # interactive.
+        logic_link = QPushButton('ⓘ  Why Only These Genres?')
+        logic_link.setObjectName('genre_logic_link')
+        logic_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        logic_link.setStyleSheet(
+            'QPushButton#genre_logic_link { color: #a89b85; font-size: 11px; '
+            'font-weight: 600; letter-spacing: 0.02em; text-align: left; '
+            'padding: 10px 14px; background: transparent; border: none; '
+            'border-top: 1px solid #2a2a2a; }'
+            'QPushButton#genre_logic_link:hover { color: #69A79A; }'
+        )
+        logic_link.clicked.connect(self._show_genre_logic)
+        layout.addWidget(logic_link)
+        layout.addStretch(1)   # leftover space goes below the link, not above it
 
         return frame
+
+    def _show_genre_logic(self) -> None:
+        _GenreLogicDialog(self.window()).exec()
 
     def _populate_genre_sidebar(self) -> None:
         self._genre_sidebar_list.blockSignals(True)
@@ -1361,7 +1629,7 @@ class LibraryBrowserView(QWidget):
 
         is_new = str(rec.path) in self._new_track_paths
         merge_info = self._recent_merges.get(unicodedata.normalize('NFC', str(rec.path)))
-        child.setIcon(LC_ARTIST, _get_track_icon())
+        child.setIcon(LC_ARTIST, self._resting_track_icon(str(rec.path)))
         prefix = '◆ ' if is_new else ('⟳ ' if merge_info else '')
         child.setText(LC_ARTIST, f'  {prefix}{title}')
         child.setText(LC_TRACKS,   '')
@@ -1466,9 +1734,56 @@ class LibraryBrowserView(QWidget):
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
             for rec in data.get('tracks', []):
                 self._make_track_child(item, rec)
-        # Deselect parent on expand to avoid permanent orange
-        if item.isSelected():
-            item.setSelected(False)
+        # Selection is intentionally left alone: an artist you double-click to
+        # expand stays selected (your place marker) until you click elsewhere,
+        # matching the crate tree.
+
+    # ── Tree state (expanded artists + selection) across tab switches ──
+
+    def _save_tree_state(self) -> tuple[set[str], Optional[tuple[str, str]]]:
+        expanded: set[str] = set()
+        selected: Optional[tuple[str, str]] = None
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            artist = data.get('artist')
+            if artist and top.isExpanded():
+                expanded.add(artist)
+        sel = self._tree.selectedItems()
+        if sel:
+            it = sel[0]
+            if it.parent() is None:
+                data = it.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+                if data.get('artist'):
+                    selected = ('artist', data['artist'])
+            else:
+                rec = it.data(LC_PATH, Qt.ItemDataRole.UserRole)
+                if rec is not None and hasattr(rec, 'path'):
+                    selected = ('track', str(rec.path))
+        return expanded, selected
+
+    def _restore_tree_state(
+        self, expanded: set[str], selected: Optional[tuple[str, str]]
+    ) -> None:
+        if not expanded and not selected:
+            return
+        target: Optional[QTreeWidgetItem] = None
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            artist = data.get('artist')
+            if artist and artist in expanded:
+                top.setExpanded(True)  # fires _on_item_expanded → lazy-builds children
+            if selected and selected[0] == 'artist' and artist == selected[1]:
+                target = top
+        if selected and selected[0] == 'track':
+            target = self._find_track_item(selected[1])
+        if target is not None:
+            self._tree.setCurrentItem(target)
+            target.setSelected(True)
+            self._tree.scrollToItem(
+                target, QAbstractItemView.ScrollHint.PositionAtCenter
+            )
 
     # ── Selection + album art ──────────────────────────────────────────
 
@@ -1492,12 +1807,36 @@ class LibraryBrowserView(QWidget):
                 return False
 
         if obj is self._tree.viewport():
-            if event.type() == QEvent.Type.MouseButtonPress:
-                if self._handle_play_icon_click(event.position().toPoint()):
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    # Arm BEFORE dispatching: _handle_play_icon_click emits
+                    # play_requested, whose handler reads album art + primes
+                    # QMediaPlayer and can pump the event queue — a mouse-move
+                    # delivered reentrantly there must already be swallowed.
+                    self._play_icon_press_active = True
+                    if self._handle_play_icon_click(event.position().toPoint()):
+                        # Swallow the WHOLE gesture (press + any drag +
+                        # release). The hover-play icon must never touch the
+                        # tree's selection — letting the move/release through
+                        # after a consumed press lets QTreeView rubber-band
+                        # the selection from its stale press anchor (the
+                        # previously-selected row), highlighting every row in
+                        # between.
+                        return True
+                self._play_icon_press_active = False
+            elif et == QEvent.Type.MouseButtonRelease:
+                if self._play_icon_press_active:
+                    self._play_icon_press_active = False
                     return True
-            elif event.type() == QEvent.Type.MouseMove:
+            elif et == QEvent.Type.MouseMove:
+                if self._play_icon_press_active:
+                    if event.buttons() & Qt.MouseButton.LeftButton:
+                        return True  # still mid-gesture — don't let the tree drag-select
+                    self._play_icon_press_active = False  # button already up: self-heal
                 self._update_hover_play_icon(event.position().toPoint())
-            elif event.type() == QEvent.Type.Leave:
+            elif et == QEvent.Type.Leave:
+                self._play_icon_press_active = False
                 self._clear_hover_play_icon()
 
         return super().eventFilter(obj, event)
@@ -1526,21 +1865,52 @@ class LibraryBrowserView(QWidget):
         self.album_art_requested.emit(str(rec.path))
         return True
 
+    def _resting_track_icon(self, path_str: str):
+        """The icon a track row shows when NOT hovered: the play triangle if
+        it's the track currently loaded in the playback bar, else the note."""
+        if path_str and path_str == self._now_playing_path:
+            return _get_play_glyph_icon()
+        return _get_track_icon()
+
+    def _restore_row_icon(self, item: Optional[QTreeWidgetItem]) -> None:
+        if item is None:
+            return
+        rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
+        path_str = str(rec.path) if rec is not None and hasattr(rec, 'path') else ''
+        item.setIcon(LC_ARTIST, self._resting_track_icon(path_str))
+
     def _update_hover_play_icon(self, pos) -> None:
         item = self._tree.itemAt(pos)
         target = item if (item is not None and item.parent() is not None) else None
         if target is self._hover_track_item:
             return
-        if self._hover_track_item is not None:
-            self._hover_track_item.setIcon(LC_ARTIST, _get_track_icon())
+        self._restore_row_icon(self._hover_track_item)
         if target is not None:
             target.setIcon(LC_ARTIST, _get_play_glyph_icon())
         self._hover_track_item = target
 
     def _clear_hover_play_icon(self) -> None:
         if self._hover_track_item is not None:
-            self._hover_track_item.setIcon(LC_ARTIST, _get_track_icon())
+            self._restore_row_icon(self._hover_track_item)
             self._hover_track_item = None
+
+    def set_now_playing(self, path) -> None:
+        """Mark the track loaded in the playback bar so its row keeps the
+        play-triangle icon while unhovered. Called whenever playback starts
+        on a new track."""
+        new = str(path) if path else None
+        if new == self._now_playing_path:
+            return
+        prev = self._now_playing_path
+        self._now_playing_path = new
+        for p in (prev, new):
+            if not p:
+                continue
+            item = self._find_track_item(p)
+            # The hovered row is owned by the hover logic (already a triangle);
+            # it'll pick up the right resting icon when the cursor leaves.
+            if item is not None and item is not self._hover_track_item:
+                item.setIcon(LC_ARTIST, self._resting_track_icon(p))
 
     # ── Skip next/previous (playback bar) ────────────────────────────────
     # "Next/previous track across the whole currently-filtered library" —

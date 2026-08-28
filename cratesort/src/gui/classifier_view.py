@@ -664,6 +664,7 @@ class _ChangeGenreDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel_btn.clicked.connect(self.reject)
+        cancel_btn.setAutoDefault(False)
         ok_btn = QPushButton('Apply')
         ok_btn.setFixedHeight(36)
         ok_btn.setStyleSheet(
@@ -673,6 +674,8 @@ class _ChangeGenreDialog(_CrateSortDialog):
             'QPushButton:pressed { background-color: #2d6358; }'
         )
         ok_btn.clicked.connect(self.accept)
+        ok_btn.setDefault(True)       # Return applies; Escape cancels
+        ok_btn.setAutoDefault(True)
         btn_row.addWidget(cancel_btn)
         btn_row.addStretch()
         btn_row.addWidget(ok_btn)
@@ -746,6 +749,7 @@ class _ReassignArtistDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel_btn.clicked.connect(self.reject)
+        cancel_btn.setAutoDefault(False)
         ok_btn = QPushButton('Reassign')
         ok_btn.setFixedHeight(36)
         ok_btn.setStyleSheet(
@@ -755,6 +759,9 @@ class _ReassignArtistDialog(_CrateSortDialog):
             'QPushButton:pressed { background-color: #2d6358; }'
         )
         ok_btn.clicked.connect(self.accept)
+        ok_btn.setDefault(True)       # Return reassigns; Escape cancels
+        ok_btn.setAutoDefault(True)
+        self._edit.returnPressed.connect(self.accept)
         btn_row.addWidget(cancel_btn)
         btn_row.addStretch()
         btn_row.addWidget(ok_btn)
@@ -831,6 +838,7 @@ class _EditTagsDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel_btn.clicked.connect(self.reject)
+        cancel_btn.setAutoDefault(False)
         ok_btn = QPushButton('Save Tags')
         ok_btn.setFixedHeight(36)
         ok_btn.setStyleSheet(
@@ -840,6 +848,13 @@ class _EditTagsDialog(_CrateSortDialog):
             'QPushButton:pressed { background-color: #2d6358; }'
         )
         ok_btn.clicked.connect(self._on_accept)
+        # Return commits (runs _on_accept, which reads the field then accepts);
+        # Escape cancels via QDialog's built-in handling. Without this, Enter
+        # in the line edit fires the first autoDefault button (Cancel) and the
+        # typed tags are silently dropped.
+        ok_btn.setDefault(True)
+        ok_btn.setAutoDefault(True)
+        self._tags_edit.returnPressed.connect(self._on_accept)
         btn_row.addWidget(cancel_btn)
         btn_row.addStretch()
         btn_row.addWidget(ok_btn)

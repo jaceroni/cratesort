@@ -12,7 +12,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QDrag, QFontMetrics, QIcon, QPen, QPixmap, QPainter
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QDialog,
+    QAbstractItemView, QApplication, QCheckBox, QCompleter, QDialog,
     QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QFileDialog, QMenu, QProgressBar, QPushButton, QSplitter,
@@ -228,18 +228,14 @@ class CrateItemDelegate(QStyledItemDelegate):
         # Fill entire cell
         painter.fillRect(option.rect, bg)
 
-        # Left bar: always-on teal for smart crates (a type marker, not a
-        # selection state — selection on a smart-crate row still shows via
-        # the background color above), orange for other selected states,
-        # teal for drop-target.
-        if _is_smart_crate_key(path):
-            bar_rect = QRect(
-                option.rect.left(), option.rect.top(),
-                self.BAR_WIDTH, option.rect.height()
-            )
-            painter.fillRect(bar_rect, self.BAR_TEAL)
-        elif state in (self.STATE_B, self.STATE_C, self.STATE_D, self.STATE_E):
-            bar_color = self.BAR_TEAL if state == self.STATE_E else self.BAR_COLOR
+        is_smart = _is_smart_crate_key(path)
+
+        # Left bar: only shown for a selected row (or a drop-target). A smart
+        # crate's type is now carried by its icon, so an unselected smart
+        # crate gets no bar — when it IS selected it takes the teal bar, the
+        # same way a selected regular crate takes the orange one.
+        if state in (self.STATE_B, self.STATE_C, self.STATE_D, self.STATE_E):
+            bar_color = self.BAR_TEAL if (state == self.STATE_E or is_smart) else self.BAR_COLOR
             bar_rect = QRect(
                 option.rect.left(), option.rect.top(),
                 self.BAR_WIDTH, option.rect.height()
@@ -253,18 +249,20 @@ class CrateItemDelegate(QStyledItemDelegate):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(option.rect.adjusted(1, 0, -1, -1))
 
-        # Crate name text, with a wand icon prefix for smart crates
+        # Crate name text, preceded by the Serato-style crate icon — teal
+        # isometric crate for smart crates, orange for regular ones. The
+        # "All Tracks" row isn't a crate, so it gets no icon.
         text      = index.data(Qt.ItemDataRole.DisplayRole) or ''
         text_left = self.BAR_WIDTH + 8
-        if _is_smart_crate_key(path):
-            icon_size = 14
+        if path and path != _ALL_TRACKS_KEY:
+            icon_size = 18
             icon_rect = QRect(
                 option.rect.left() + text_left,
                 option.rect.top() + (option.rect.height() - icon_size) // 2,
                 icon_size, icon_size,
             )
-            _wand_icon('#f1e3c8', icon_size).paint(painter, icon_rect)
-            text_left += icon_size + 6
+            _crate_icon(is_smart).paint(painter, icon_rect)
+            text_left += icon_size + 8
         text_rect = option.rect.adjusted(text_left, 0, -24, 0)
         painter.setPen(self.TEXT_A)
         painter.drawText(
@@ -322,6 +320,19 @@ def _get_note_icon() -> QIcon:
     if _NOTE_ICON is None:
         _NOTE_ICON = _make_note_icon()
     return _NOTE_ICON
+
+
+# Serato-style isometric crate glyphs shown to the left of every crate name
+# in the tree — teal crate for smart crates, orange for regular ones. The
+# SVGs already carry their own palette, so no recolor pass is needed.
+_CRATE_ICONS: dict[bool, QIcon] = {}
+
+
+def _crate_icon(smart: bool) -> QIcon:
+    if smart not in _CRATE_ICONS:
+        name = 'icon-crate-smart.svg' if smart else 'icon-crate.svg'
+        _CRATE_ICONS[smart] = QIcon(str(_ASSETS / 'icons' / name))
+    return _CRATE_ICONS[smart]
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +610,9 @@ class _AddTracksDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         self._cancel_btn.clicked.connect(self.reject)
+        self._cancel_btn.setAutoDefault(False)
         self._add_btn = QPushButton('Add Selected')
+        self._add_btn.setDefault(True)   # Return adds; Escape cancels
         self._add_btn.setFixedHeight(36)
         self._add_btn.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
@@ -687,8 +700,11 @@ class _NameInputDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         cancel.clicked.connect(self.reject)
+        cancel.setAutoDefault(False)
+        self._edit.returnPressed.connect(self.accept)   # Return commits the name
         ok = QPushButton('OK')
         ok.setDefault(True)
+        ok.setAutoDefault(True)
         ok.setFixedHeight(36)
         ok.setStyleSheet(
             'QPushButton { background-color: #428175; color: #ffffff; border: none; '
@@ -735,6 +751,9 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
         self._existing_names = existing_names
         self._existing_name = existing.name if existing else None
         self._row_widgets: list[QWidget] = []
+        # field → sorted unique values from the scanned library, lazily built,
+        # used to autocomplete the value field for text rules (genre/artist/…).
+        self._completion_cache: dict = {}
 
         layout = _create_dialog_layout(self)
         # QComboBox styling (including its arrow) is fully self-contained on
@@ -795,7 +814,7 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
         self._live_update_check.setChecked(existing.live_update if existing else False)
         layout.addWidget(self._live_update_check)
 
-        self._preview_label = QLabel('Add a rule to see matching tracks')
+        self._preview_label = QLabel('Add a rule to see how many files this crate will contain')
         self._preview_label.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent;')
         layout.addWidget(self._preview_label)
 
@@ -810,6 +829,7 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
             'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
         )
         self._cancel_btn.clicked.connect(self.reject)
+        self._cancel_btn.setAutoDefault(False)
         self._save_btn = QPushButton('Save Smart Crate')
         self._save_btn.setFixedHeight(36)
         self._save_btn.setStyleSheet(
@@ -819,6 +839,12 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
             'QPushButton:pressed { background-color: #2d6358; }'
         )
         self._save_btn.clicked.connect(self._on_accept)
+        # Return attempts a save from anywhere in the form — _on_accept
+        # validates and keeps the dialog open (with an alert) on bad input,
+        # so this can't silently lose work. Escape → reject() (guarded below).
+        self._save_btn.setDefault(True)
+        self._save_btn.setAutoDefault(True)
+        self._name_edit.returnPressed.connect(self._on_accept)
         btn_row.addWidget(self._cancel_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._save_btn)
@@ -921,7 +947,23 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
                 comparison_combo.addItem(COMPARISON_LABELS[c], c)
             comparison_combo.blockSignals(False)
 
+        def _refresh_completer() -> None:
+            # Autocomplete the value field from the library's own values for
+            # the text fields we actually scan (genre/artist/title/album), so
+            # a rule can't silently miss everything over a typo. Fields with
+            # no meaningful value set (BPM, Year, …) get no completer.
+            values = self._completion_values(field_combo.currentData())
+            if values:
+                comp = QCompleter(values, value_edit)
+                comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+                comp.setFilterMode(Qt.MatchFlag.MatchContains)
+                comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+                value_edit.setCompleter(comp)
+            else:
+                value_edit.setCompleter(None)
+
         field_combo.currentIndexChanged.connect(_repopulate_comparisons)
+        field_combo.currentIndexChanged.connect(_refresh_completer)
         field_combo.currentIndexChanged.connect(self._recompute_preview)
         comparison_combo.currentIndexChanged.connect(self._recompute_preview)
         value_edit.textChanged.connect(self._recompute_preview)
@@ -953,6 +995,21 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
             if cidx >= 0:
                 comparison_combo.setCurrentIndex(cidx)
             value_edit.setText(str(rule.value))
+        elif self._row_widgets:
+            # New rule added by the user: inherit the previous row's field +
+            # comparison (value left blank). Building a decade/era crate means
+            # two "Year" rules back to back — this saves re-picking the field
+            # every time. The user can still change it.
+            prev = self._row_widgets[-1]
+            fidx = field_combo.findData(prev._field_combo.currentData())
+            if fidx >= 0:
+                field_combo.setCurrentIndex(fidx)
+            _repopulate_comparisons()
+            cidx = comparison_combo.findData(prev._comparison_combo.currentData())
+            if cidx >= 0:
+                comparison_combo.setCurrentIndex(cidx)
+
+        _refresh_completer()
 
         row._field_combo      = field_combo
         row._comparison_combo = comparison_combo
@@ -972,6 +1029,32 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
         row.deleteLater()
         self._recompute_preview()
         self._update_dialog_height()
+
+    # Fields whose value field is worth autocompleting, mapped to the
+    # TrackRecord attribute the completion list is drawn from. Numeric /
+    # free-form fields (BPM, Year, Comment, Filename) are deliberately absent.
+    _COMPLETION_ATTRS: dict = {
+        RuleField.GENRE:  'genre',
+        RuleField.ARTIST: 'artist',
+        RuleField.SONG:   'title',
+        RuleField.ALBUM:  'album',
+    }
+
+    def _completion_values(self, rf) -> list[str]:
+        if rf in self._completion_cache:
+            return self._completion_cache[rf]
+        attr = self._COMPLETION_ATTRS.get(rf)
+        if not attr:
+            self._completion_cache[rf] = []
+            return []
+        seen: dict[str, str] = {}
+        for rec in self._inventory:
+            val = (getattr(rec, attr, '') or '').strip()
+            if val:
+                seen.setdefault(val.lower(), val)  # first-seen casing wins
+        values = sorted(seen.values(), key=str.lower)
+        self._completion_cache[rf] = values
+        return values
 
     def _collect_rules(self) -> list[SmartCrateRule]:
         rules: list[SmartCrateRule] = []
@@ -1000,12 +1083,12 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
     def _recompute_preview(self, *_args) -> None:
         rules = self._collect_rules()
         if not rules:
-            self._preview_label.setText('Add a rule to see matching tracks')
+            self._preview_label.setText('Add a rule to see how many files this crate will contain')
             return
         match_all = bool(self._match_combo.currentData())
         matched = match_tracks(rules, match_all, self._inventory)
         n = len(matched)
-        self._preview_label.setText(f'Matches {n:,} track{"s" if n != 1 else ""}')
+        self._preview_label.setText(f'This smart crate will contain {n:,} file{"s" if n != 1 else ""}.')
 
     def _on_accept(self) -> None:
         name = self._name_edit.text().strip()
@@ -1023,6 +1106,24 @@ class _SmartCrateRuleDialog(_CrateSortDialog):
         self._cancel_btn.setEnabled(False)
         QApplication.processEvents()
         self.accept()
+
+    def _has_unsaved_input(self) -> bool:
+        if self._name_edit.text().strip():
+            return True
+        return any(r._value_edit.text().strip() for r in self._row_widgets)
+
+    def reject(self) -> None:
+        # Escape / Cancel on a NEW crate the user has started building →
+        # confirm before throwing the rules away. Editing an existing crate
+        # is exempt: bailing there just means "no change", and it's undoable.
+        if (self._existing_name is None and self._has_unsaved_input()
+                and not _ov_confirm(
+                    self, 'Discard this smart crate?',
+                    "You haven't saved it yet — the rules you've built will be lost.",
+                    confirm_text='Discard', cancel_text='Keep Editing',
+                    confirm_danger=True)):
+            return
+        super().reject()
 
     def result_data(self) -> tuple[str, list[SmartCrateRule], bool, bool]:
         name        = self._name_edit.text().strip()
@@ -1387,6 +1488,15 @@ class _ExportProgressDialog(_CrateSortDialog):
         self._bar.setValue(done)
         self._count_lbl.setText(f'{done:,} of {total:,}')
 
+    def keyPressEvent(self, event) -> None:
+        # Escape must go through _on_cancel (which signals the worker to stop),
+        # not QDialog's bare reject() that just hides the dialog and leaves the
+        # export running.
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_cancel()
+            return
+        super().keyPressEvent(event)
+
     def _on_cancel(self) -> None:
         self.cancelled.emit()
         self.close()
@@ -1400,9 +1510,9 @@ class _ExportProgressDialog(_CrateSortDialog):
 
 class _LaunchSeratoButton(QPushButton):
 
-    _ONE_LINE  = 'Save Crates && Launch Serato  ↗'
+    _ONE_LINE  = 'Save Crates && Launch Serato'
     _LINE_ONE  = 'Save Crates &&'
-    _LINE_TWO  = 'Launch Serato  ↗'
+    _LINE_TWO  = 'Launch Serato'
     _H_PADDING = 24  # matches the 12px/side CSS padding in its stylesheet
 
     def __init__(self, parent=None):

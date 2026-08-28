@@ -121,6 +121,7 @@ class MainWindow(QMainWindow):
         # Created before the sidebar so the sidebar's inline video panel can
         # be constructed with a live controller reference.
         self._playback_controller = PlaybackController(self)
+        self._playback_controller.now_playing_changed.connect(self._on_now_playing_changed)
         self._video_window: Optional[FloatingVideoWindow] = None
 
         content_row = QWidget()
@@ -206,6 +207,13 @@ class MainWindow(QMainWindow):
             self._inline_video.show_video()
         else:
             self._inline_video.hide_video()
+
+    def _on_now_playing_changed(self, rec) -> None:
+        """Keep the library list's play-triangle marker on whatever track is
+        now loaded in the playback bar (covers direct clicks, the hover-play
+        icon, and skip next/previous — all route through the controller)."""
+        if rec is not None and hasattr(self, '_library_browser'):
+            self._library_browser.set_now_playing(str(rec.path))
 
     def _on_pop_out_requested(self) -> None:
         self._inline_video.hide_video()

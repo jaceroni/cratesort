@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRect, QRectF, QPropertyAnimation, QEasingCurve, QTimer
-from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPen, QPolygonF
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QDialog, QLayout, QVBoxLayout, QFrame, QLabel, QPushButton, QHBoxLayout,
     QComboBox, QGraphicsScene, QGraphicsView,
@@ -105,12 +105,25 @@ class _AnimatedStatCardWidget(QFrame):
         self._title_label = QLabel(title)
         self._title_label.setProperty('role', 'stat_label')
         self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_label.setWordWrap(True)
+        # The caption must never wrap: a two-line caption pushes this card's
+        # number down a line relative to its siblings in the same row, so the
+        # numbers stop sharing a baseline. Instead the card demands enough
+        # width for the full caption; the stat rows hand out equal stretch, so
+        # every card widens to the longest caption and the numbers stay level.
+        self._title_label.setWordWrap(False)
         self._title_label.setStyleSheet(
             'font-size: 10px; color: #a89b85; letter-spacing: 0.06em; '
             'background: transparent; border: none;'
         )
         layout.addWidget(self._title_label)
+
+        _cap_font = QFont()
+        _cap_font.setPixelSize(10)
+        _cap_w = QFontMetrics(_cap_font).horizontalAdvance(title)
+        # horizontalAdvance() doesn't know about the 0.06em QSS letter-spacing
+        # (~0.6px per glyph at 10px); add it back, plus the 12px l/r content
+        # margins and a few px of slack.
+        self.setMinimumWidth(_cap_w + int(len(title) * 0.6) + 24 + 10)
 
         self._timer = QTimer(self)
         self._timer.setInterval(16)
@@ -480,6 +493,7 @@ def _ov_alert(parent: QWidget, title: str, body: str) -> None:
         'QPushButton:pressed { background-color: #2d6358; }'
     )
     ok_btn.clicked.connect(dlg.accept)
+    ok_btn.setDefault(True)   # Return dismisses; Escape does too (QDialog built-in)
     btn_row = QHBoxLayout()
     btn_row.addStretch()
     btn_row.addWidget(ok_btn)
@@ -549,6 +563,16 @@ def _ov_confirm(
         'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
     )
     no_btn.clicked.connect(dlg.reject)
+
+    # Return triggers the primary action; Escape always cancels (QDialog
+    # built-in → reject). For a destructive confirm the SAFE choice takes the
+    # default instead — Return must never be a shortcut to a delete.
+    if confirm_danger:
+        no_btn.setDefault(True)
+        yes_btn.setAutoDefault(False)
+    else:
+        yes_btn.setDefault(True)
+        no_btn.setAutoDefault(False)
 
     btn_row = QHBoxLayout()
     btn_row.setSpacing(12)

@@ -18,7 +18,7 @@ try:
 except ImportError:
     _SVG_AVAILABLE = False
 
-from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
+from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout, _ov_confirm
 from cratesort.src.utils.ffmpeg_tools import (
     format_elapsed, friendly_ffmpeg_error, get_ffmpeg_path, parse_duration_from_text,
 )
@@ -354,12 +354,14 @@ class _ConvertDialog(_CrateSortDialog):
             'background: rgba(241, 227, 200, 0.05); }'
         )
         self._cancel_btn.clicked.connect(self._on_cancel)
+        self._cancel_btn.setAutoDefault(False)
 
         self._convert_btn = QPushButton('Convert')
         self._convert_btn.setFixedHeight(36)
         self._convert_btn.setStyleSheet(self._primary_btn_style())
         self._convert_btn.setEnabled(False)
         self._convert_btn.clicked.connect(self._on_convert)
+        self._convert_btn.setDefault(True)   # Return starts the conversion
 
         btn_row.addWidget(self._cancel_btn)
         btn_row.addStretch()
@@ -533,8 +535,23 @@ class _ConvertDialog(_CrateSortDialog):
 
     # ── Cancel ───────────────────────────────────────────────────────────────
 
+    def keyPressEvent(self, event) -> None:
+        # Route Escape through _on_cancel so a running conversion is stopped
+        # cleanly (and confirmed) rather than the dialog just vanishing.
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_cancel()
+            return
+        super().keyPressEvent(event)
+
     def _on_cancel(self) -> None:
         if self._worker and self._worker.isRunning():
+            if not _ov_confirm(
+                self, 'Stop converting?',
+                'A conversion is still running. Files already finished are kept; '
+                'the rest will be skipped.',
+                confirm_text='Stop', cancel_text='Keep Going', confirm_danger=True,
+            ):
+                return
             self._worker.cancel()
             self._worker.wait(2000)
         if self._mascot is not None:
