@@ -56,6 +56,15 @@ Column order/width in the Library tree is currently a single global OS-level set
 
 ---
 
+### Multi-location library (separate `_Serato_` + media-drive paths) — CONSIDERED AND DECLINED 2026-08-28
+Idea: let the read-only features (scan / Rinse / metadata / artist reassignment) accept a `_Serato_` folder in one place and media in another (e.g. `~/Music/_Serato_` on the laptop + music on an external), keeping the single-folder requirement only for Organize.
+
+**Why it's a fair idea:** Serato is genuinely multi-database — it keeps a `_Serato_` folder per drive and merges them at launch, so every gigging DJ with an external already has two. `LibraryScanner(*root_dirs)` (`cratesort/src/core/scanner.py`) is already variadic; the single-folder limit is only in the UI / `_ScanWorker` layer.
+
+**Why declined:** Real build cost — per-root scan-cache keying, a multi-path watcher, saved state as a list, and especially **write-back routing for crates that span two `_Serato_` databases** (Serato routes each track to the database for the drive it lives on; `crate_writer` / `path_rewriter` would need the same). Decision: keep the single-folder model and sell its benefit in the launch-screen copy instead. Latent gap worth an empirical check: Smart Crates + laptop-local-track crates live in `~/Music/_Serato_`, which CrateSort may not read when the user points at an external drive root.
+
+---
+
 ## Rinse (Duplicate Detection)
 
 ### Artwork Thumbnail on Click in Rinse Review Screen

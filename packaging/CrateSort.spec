@@ -72,8 +72,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'CrateSort',
         'CFBundleDisplayName': 'CrateSort',
-        'CFBundleShortVersionString': '0.1.3',
-        'CFBundleVersion': '0.1.3',
+        'CFBundleShortVersionString': '0.1.4',
+        'CFBundleVersion': '0.1.4',
         'NSHumanReadableCopyright': 'Copyright © 2026 JWBC, LLC. All rights reserved.',
         'NSHighResolutionCapable': True,
     },

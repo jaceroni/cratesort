@@ -133,12 +133,15 @@ After reorg or rollback completes, `OrganizeView.reorg_completed` fires → `Mai
 
 The launch screen is a context-aware single screen — no popup dialog. It lives in `DashboardWidget._build_welcome()` as stack index 0.
 
-### First launch (no saved library path), copy updated 2026-07-30:
+### First launch (no saved library path), copy updated 2026-08-28:
 - Shows `cs-logo-mascot-stacked.svg` logo, tagline
-- Heading (14px, weight 600, cream): "Point CrateSort to your `_Serato_` folder and media files."
-- Subtext (12px, muted `#a89b85`): "If they're in different locations you'll need to move them into the same folder to enable crate management and export features."
-- Button: "Select Your Serato & Media Folder" (no ellipsis — a longer label here visibly crowded the button)
-- This wording deliberately implies the ideal folder structure (one folder containing both media and `_Serato_` as siblings) without hard-requiring it — see Nav state rules above for what happens when `_Serato_` isn't found at the picked location (only Crates gets gated, not the whole app)
+- Heading (14px, weight 600, cream, +1px line leading): "Point CrateSort to your `_Serato_` folder and media."
+- Second line (12px, muted `#a89b85`, +3px line leading, +3px bottom margin for button separation): "They must be in the same location for the app to function — this is usually the root of your media drive."
+- Button: "Select `_Serato_` Folder & Media Location" (no ellipsis — a longer label here visibly crowded the button)
+- Disclaimer (11px, muted, +1px line leading): "⚠ Beta build — back up your library before organizing."
+- This wording deliberately implies the ideal folder structure (one folder containing both media and `_Serato_` as siblings) without hard-requiring it — see Nav state rules above for what happens when `_Serato_` isn't found at the picked location (only Crates gets gated, not the whole app). Multi-location selection (separate `_Serato_` + media-drive paths) was considered and **declined** 2026-08-28 — sell the single-folder benefit in copy instead.
+
+**Launch-card layout hardening (2026-08-28):** the welcome column lives in a `QScrollArea` (`setWidgetResizable(True)`, no frame, h-scrollbar off) so a short window scrolls instead of crushing/overlapping the card copy. The fixed-size logo (`QSvgWidget`, 240×254) is scaled down toward half size by `_fit_welcome_logo()` on every `resizeEvent` when vertical space runs out — guarded by `_logo_anim_active` so it doesn't fight the grow-in / scan-exit animations. Card copy uses the local `_leaded(text, px, color, *, bold, extra)` helper: QLabel/QSS has no line-height, so each label is rich text with an explicit fixed `line-height: (QFontMetrics.lineSpacing() + extra)px`, and **`font-size` stays in the stylesheet string** — a bare `setFont()` is overridden by QSS once `setStyleSheet()` is called (this silently inflated the disclaimer once). Text never clips: `_fit_welcome_text()` floors every wrapped label's `minimumHeight` to its real `heightForWidth()` on show and on resize, because the height-for-width chain from the scroll area down is unreliable. The card is centred by a stretch `QHBoxLayout` row, **not** `addWidget(card, alignment=…)` — the alignment flag severs height-for-width and the labels clip.
 
 ### Returning user (saved library path exists):
 - Same logo and tagline
@@ -1217,7 +1220,7 @@ Write only what is necessary to accomplish the stated goal. Do not refactor adja
 
 ## Packaging & Distribution
 
-**Status: macOS beta packaging shipped — 0.1.0-beta (2026-07-12), 0.1.1-beta (2026-07-31), 0.1.2-beta (2026-08-28), 0.1.3-beta (2026-08-28). Unsigned, no notarization.** Windows/Linux not yet built. 0.1.3-beta ships the Rinse manual-test fixes (`normalize_title` bracket-strip, `PathRewriter` crate-ref dedup, shared `TRACK_ROW_HEIGHT` + `gui/inline_edit.py`) and the track-row playback normalization (`gui/track_icons.py`, `PlaybackController.play_or_toggle`, play/pause toggle + whole-row hover in both Library and Crates) — version bumped in `packaging/CrateSort.spec` `info_plist` only, same pipeline. No dedicated build script exists yet — every step below (including the DMG staging/icon steps) is run as one-off shell commands each time; worth scripting if this becomes routine. 0.1.1-beta bumped `packaging/CrateSort.spec`'s `info_plist` version fields only — same pipeline, no packaging-process changes.
+**Status: macOS beta packaging shipped — 0.1.0-beta (2026-07-12), 0.1.1-beta (2026-07-31), 0.1.2-beta (2026-08-28), 0.1.3-beta (2026-08-28), 0.1.4-beta (2026-08-28). Unsigned, no notarization.** Windows/Linux not yet built. 0.1.4-beta ships the launch-screen copy + layout pass: new first-run wording ("Point CrateSort to your `_Serato_` folder and media." / "They must be in the same location for the app to function — this is usually the root of your media drive." / button "Select `_Serato_` Folder & Media Location"), `_leaded()` rich-text line-leading helper, and the launch-card layout hardening (scroll-area wrapper, responsive logo via `_fit_welcome_logo()`, anti-clip `_fit_welcome_text()`, stretch-row centring instead of an alignment flag) — see Launch Screen Architecture above. Version bumped in `packaging/CrateSort.spec` `info_plist` only, same pipeline. No dedicated build script exists yet — every step below (including the DMG staging/icon steps) is run as one-off shell commands each time; worth scripting if this becomes routine. 0.1.1-beta bumped `packaging/CrateSort.spec`'s `info_plist` version fields only — same pipeline, no packaging-process changes.
 
 **Pipeline**: `packaging/CrateSort.spec` (PyInstaller) builds `dist/CrateSort.app` from `packaging/run_app.py`, an entry point that just calls `cratesort.src.gui.main_window:main`. Bundles `cratesort/assets/` in full. Build from a dedicated venv (`.build-venv/`, gitignored) — never the system Python.
 

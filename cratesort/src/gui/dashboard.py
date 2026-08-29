@@ -17,7 +17,7 @@ from PyQt6.QtCore import (
     QSettings, QThread, QTimer, QVariantAnimation, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QFontMetrics, QLinearGradient, QPainter, QPen, QRadialGradient,
+    QBrush, QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen, QRadialGradient,
 )
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
@@ -1052,6 +1052,7 @@ class DashboardWidget(QWidget):
         )
         anim.finished.connect(on_finished)
         self._logo_exit_anim = anim
+        self._logo_anim_active = True
         anim.start()
 
     def _start_scan_now(self, library_path: Path) -> None:
@@ -1071,9 +1072,15 @@ class DashboardWidget(QWidget):
     def _build_welcome(self, saved_path: Path | None = None) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # No layout-level AlignCenter: inside a resizable QScrollArea it stops the
+        # column from filling the viewport, and word-wrap QLabels then get handed
+        # less height than heightForWidth() needs and clip their last line. Center
+        # with stretches instead — they collapse to 0 when space is tight and the
+        # scroll area takes over cleanly.
         layout.setSpacing(20)
-        layout.setContentsMargins(60, 60, 60, 100) # bottom headroom for media player
+        layout.setContentsMargins(60, 28, 60, 96) # bottom headroom for media player
+        self._welcome_col_layout = layout
+        layout.addStretch(1)
 
         if _SVG_AVAILABLE and _LOGO_SVG.exists():
             logo = QSvgWidget(str(_LOGO_SVG))
@@ -1096,6 +1103,8 @@ class DashboardWidget(QWidget):
             self._logo_grow_anim.valueChanged.connect(
                 lambda factor: logo.setFixedSize(int(self._LOGO_W * factor), int(self._LOGO_H * factor))
             )
+            self._logo_anim_active = True
+            self._logo_grow_anim.finished.connect(self._on_logo_anim_done)
             self._logo_grow_anim.start()
         else:
             lbl = QLabel('CrateSort')
@@ -1123,6 +1132,7 @@ class DashboardWidget(QWidget):
         welcome_card = QFrame()
         welcome_card.setObjectName('welcome_card')
         welcome_card.setFixedWidth(440)
+        self._welcome_card = welcome_card
         welcome_card.setStyleSheet(
             'QFrame#welcome_card { background-color: #2F2F2F; border: 1px solid #444444; border-radius: 12px; }'
         )
@@ -1130,29 +1140,54 @@ class DashboardWidget(QWidget):
         card_layout.setContentsMargins(28, 24, 28, 24)
         card_layout.setSpacing(16)
 
+        # welcome_card is fixed at 440px, card_layout insets 28px each side.
+        # Every word-wrap label below is pinned to this exact width so its
+        # heightForWidth() is exact, and _fit_welcome_text() then floors its
+        # minimum height to that so a wrapped line can never clip.
+        _CARD_INNER_W = 440 - 28 * 2
+
+        def _leaded(text: str, px: int, color: str, *, bold: bool = False,
+                    extra: int = 1) -> QLabel:
+            """Card copy with `extra` px of added line leading (Jace's spec).
+            QLabel/QSS has no line-height, so this goes through rich text with an
+            explicit fixed line-height of (natural line spacing + extra px). The
+            font size stays in the stylesheet — a bare setFont() gets overridden
+            by QSS once setStyleSheet() is called, which silently bumped the size.
+            Width is pinned; _fit_welcome_text() guards the wrapped height."""
+            probe = QFont()
+            probe.setPixelSize(px)
+            if bold:
+                probe.setWeight(QFont.Weight.DemiBold)
+            line_px = QFontMetrics(probe).lineSpacing() + extra
+            lab = QLabel(f'<div style="line-height:{line_px}px;">{text}</div>')
+            lab.setTextFormat(Qt.TextFormat.RichText)
+            lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lab.setWordWrap(True)
+            lab.setFixedWidth(_CARD_INNER_W)
+            weight = 'font-weight: 600; ' if bold else ''
+            lab.setStyleSheet(
+                f'color: {color}; font-size: {px}px; {weight}'
+                'background: transparent; border: none;'
+            )
+            return lab
+
         if saved_path is None:
-            heading = QLabel('Point CrateSort to your _Serato_ folder and media files.')
-            heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            heading.setWordWrap(True)
-            heading.setStyleSheet(
-                'color: #f1e3c8; font-size: 14px; font-weight: 600; background: transparent; border: none;'
+            heading = _leaded(
+                'Point CrateSort to your _Serato_ folder and media.',
+                14, '#f1e3c8', bold=True,
             )
             card_layout.addWidget(heading)
 
-            subtext = QLabel()
-            subtext.setTextFormat(Qt.TextFormat.RichText)
-            subtext.setText(
-                '<div style="line-height: 125%;">'
-                "If they're in different locations you'll need to move them into the "
-                'same folder to enable crate management and export features.'
-                '</div>'
+            subtext = _leaded(
+                'They must be in the same location for the app to function — '
+                'this is usually the root of your media drive.',
+                12, '#a89b85', extra=3,
             )
-            subtext.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            subtext.setWordWrap(True)
-            subtext.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
+            # +3px of clear space above the button, on top of the 16px row gap.
+            subtext.setContentsMargins(0, 0, 0, 3)
             card_layout.addWidget(subtext)
 
-            btn = QPushButton('Select Your Serato && Media Folder')
+            btn = QPushButton('Select _Serato_ Folder && Media Location')
             btn.setMinimumHeight(42)
             btn.setStyleSheet(
                 'QPushButton { background-color: #aa6326; color: #ffffff; border: none; '
@@ -1254,16 +1289,112 @@ class DashboardWidget(QWidget):
         sep.setStyleSheet('background: #383838; border: none; max-height: 1px;')
         card_layout.addWidget(sep)
 
-        backup_warning = QLabel('⚠  Beta build — back up your library before scanning.')
-        backup_warning.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        backup_warning.setWordWrap(True)
-        backup_warning.setStyleSheet(
-            'color: #a89b85; font-size: 11px; background: transparent; border: none;'
+        backup_warning = _leaded(
+            '⚠  Beta build — back up your library before organizing.',
+            11, '#a89b85',
         )
         card_layout.addWidget(backup_warning)
 
-        layout.addWidget(welcome_card, alignment=Qt.AlignmentFlag.AlignCenter)
-        return w
+        # Centre the fixed-width card with a stretch row rather than an
+        # alignment flag on addWidget(): the flag severs Qt's height-for-width
+        # chain, so the outer layout would hand the card only its (wrong,
+        # one-line-guess) sizeHint height and the wrapped labels clip. A plain
+        # nested layout keeps the chain intact.
+        card_row = QHBoxLayout()
+        card_row.setContentsMargins(0, 0, 0, 0)
+        card_row.addStretch(1)
+        card_row.addWidget(welcome_card)
+        card_row.addStretch(1)
+        layout.addLayout(card_row)
+        layout.addStretch(1)
+
+        # The logo is a fixed-size QSvgWidget and won't surrender height on a
+        # short window, so the column would crush its own labels into each other
+        # (rich-text QLabels overlap once the layout squeezes them below their
+        # sizeHint). Two guards: this scroll area scrolls instead of overlapping,
+        # and resizeEvent -> _fit_welcome_logo() shrinks the logo toward
+        # half-size as vertical space runs out so scrolling is rarely needed.
+        scroller = QScrollArea()
+        scroller.setWidget(w)
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroller.setStyleSheet(
+            'QScrollArea { background: transparent; border: none; }'
+            'QScrollArea > QWidget > QWidget { background: transparent; }'
+        )
+        self._welcome_scroll = scroller
+        QTimer.singleShot(0, self._finalize_welcome)
+        return scroller
+
+    def _finalize_welcome(self) -> None:
+        self._fit_welcome_text()
+        self._fit_welcome_logo()
+
+    def _fit_welcome_text(self) -> None:
+        """Text must never clip. The height-for-width chain from the scroll area
+        down to these labels is unreliable (alignment flags, QScrollArea), so
+        stop trusting it: pin every wrapped label's minimum height to the real
+        heightForWidth() at its own width. A label then physically cannot be
+        given less room than its wrapped text needs. Idempotent."""
+        card = getattr(self, '_welcome_card', None)
+        if card is None:
+            return
+        for lbl in card.findChildren(QLabel):
+            if not lbl.wordWrap():
+                continue
+            try:
+                lbl.ensurePolished()
+                w = lbl.maximumWidth()
+                if w <= 0 or w >= 16777215:
+                    w = lbl.width() or (card.width() - 56)
+                h = lbl.heightForWidth(w)
+            except RuntimeError:
+                continue
+            if h and h > 0 and lbl.minimumHeight() != h:
+                lbl.setMinimumHeight(h)
+        card.updateGeometry()
+
+    def _on_logo_anim_done(self) -> None:
+        self._logo_anim_active = False
+        self._fit_welcome_logo()
+
+    def _fit_welcome_logo(self) -> None:
+        """Scale the welcome logo down (to at most half size) when the window is
+        too short to hold the whole column at rest — otherwise the fixed-size
+        SVG crushes the card copy into itself. No-op while a logo animation is
+        running or when the welcome screen isn't showing."""
+        logo = getattr(self, '_welcome_logo', None)
+        lay  = getattr(self, '_welcome_col_layout', None)
+        stack = getattr(self, '_stack', None)
+        if logo is None or lay is None or stack is None:
+            return
+        if getattr(self, '_logo_anim_active', False) or stack.currentIndex() != 0:
+            return
+        scroll = getattr(self, '_welcome_scroll', None)
+        vh = scroll.viewport().height() if scroll is not None else self.height()
+        m = lay.contentsMargins()
+        other = m.top() + m.bottom()
+        count = lay.count()
+        for i in range(count):
+            it = lay.itemAt(i)
+            if it.spacerItem() is not None:
+                other += it.spacerItem().sizeHint().height()
+            elif it.widget() is not None and it.widget() is not logo:
+                other += it.widget().sizeHint().height()
+            elif it.layout() is not None:
+                other += it.layout().sizeHint().height()
+        other += lay.spacing() * max(0, count - 1)
+        lo = round(self._LOGO_H * 0.5)
+        h  = max(lo, min(self._LOGO_H, vh - other))
+        wd = round(self._LOGO_W * (h / self._LOGO_H))
+        if (logo.width(), logo.height()) != (wd, h):
+            logo.setFixedSize(wd, h)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_welcome_text()
+        self._fit_welcome_logo()
 
     # ── Scanning banner (shown inline in the dashboard while a scan runs) ──
 
@@ -1986,7 +2117,9 @@ class DashboardWidget(QWidget):
         logo = getattr(self, '_welcome_logo', None)
         if logo is not None:
             logo.setFixedSize(self._LOGO_W, self._LOGO_H)
+        self._logo_anim_active = False
         self._stack.setCurrentIndex(0)
+        self._fit_welcome_logo()
         self.status_message.emit('', '')
 
     def _on_scan_progress(self, count: int, dir_name: str) -> None:
