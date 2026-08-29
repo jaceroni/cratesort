@@ -1187,15 +1187,14 @@ class _CrateLoadWorker(QThread):
             key = str(self._library_path / track_path)
             if key in self._inventory_by_path:
                 return self._inventory_by_path[key]
+        # Name-only match, but only when the basename is unambiguous in the
+        # library (a None value means 2+ files share it). The old fuzzy
+        # substring-stem fallback was removed — it could bind a crate
+        # reference to an unrelated same-ish file (e.g. a straggler that
+        # lives outside the library).
         rec = self._inventory_by_name.get(Path(track_path).name)
         if rec:
             return rec
-        stem = Path(track_path).stem.lower()
-        if len(stem) >= 5:
-            for candidate in self._inventory_by_name.values():
-                cs = Path(candidate.filename).stem.lower()
-                if cs == stem or stem in cs or cs in stem:
-                    return candidate
         return None
 
     def run(self) -> None:
@@ -1383,15 +1382,14 @@ class _ExportCrateWorker(QThread):
             key = str(self._library_path / track_path)
             if key in self._inventory_by_path:
                 return self._inventory_by_path[key]
+        # Name-only match, but only when the basename is unambiguous in the
+        # library (a None value means 2+ files share it). The old fuzzy
+        # substring-stem fallback was removed — it could bind a crate
+        # reference to an unrelated same-ish file (e.g. a straggler that
+        # lives outside the library).
         rec = self._inventory_by_name.get(Path(track_path).name)
         if rec:
             return rec
-        stem = Path(track_path).stem.lower()
-        if len(stem) >= 5:
-            for candidate in self._inventory_by_name.values():
-                cs = Path(candidate.filename).stem.lower()
-                if cs == stem or stem in cs or cs in stem:
-                    return candidate
         return None
 
     @staticmethod
@@ -1597,7 +1595,12 @@ class CrateManagerView(QWidget):
         self._inventory_by_name = {}
         for rec in self._inventory:
             self._inventory_by_path[str(rec.path)] = rec
-            self._inventory_by_name[rec.filename]  = rec
+            # None marks an ambiguous basename (2+ files share it) so name-only
+            # resolution refuses to guess — see _resolve().
+            if rec.filename in self._inventory_by_name:
+                self._inventory_by_name[rec.filename] = None
+            else:
+                self._inventory_by_name[rec.filename] = rec
 
         self._edits = {}
         self._load_edits()
@@ -2109,8 +2112,16 @@ class CrateManagerView(QWidget):
 
     # ── Refresh helper ─────────────────────────────────────────────────
 
-    def _refresh(self, select: Optional[str] = None) -> None:
-        """Reload crate library from disk, preserving tree expand state."""
+    def _refresh(self, select: Optional[str] = None, reload_tracks: bool = True) -> None:
+        """Reload crate library from disk, preserving tree expand state.
+
+        reload_tracks=False rebuilds the crate tree (so counts update) but
+        leaves the track table exactly as-is. Used when tracks are added to a
+        crate other than the one being viewed while All Tracks is selected —
+        the All Tracks set is unchanged, so repopulating it would only reshuffle
+        rows (All Tracks is ordered by first-containing-crate) and jump the
+        scroll position for no real change.
+        """
         expanded, currently_selected = self._save_tree_state()
         target = select if select is not None else currently_selected
 
@@ -2122,7 +2133,7 @@ class CrateManagerView(QWidget):
 
         self._rebuild_crate_tree(restore_expanded=expanded, restore_selected=target)
 
-        if target:
+        if target and reload_tracks:
             self._load_selected_key(target)
 
     def _load_selected_key(self, key: str) -> None:
@@ -3442,16 +3453,14 @@ class CrateManagerView(QWidget):
             if key in self._inventory_by_path:
                 return self._inventory_by_path[key]
 
+        # Name-only match, but only when the basename is unambiguous in the
+        # library (a None value means 2+ files share it). The old fuzzy
+        # substring-stem fallback was removed — it could bind a crate
+        # reference to an unrelated same-ish file (e.g. a straggler that
+        # lives outside the library).
         rec = self._inventory_by_name.get(Path(track_path).name)
         if rec:
             return rec
-
-        stem = Path(track_path).stem.lower()
-        if len(stem) >= 5:
-            for candidate in self._inventory_by_name.values():
-                cs = Path(candidate.filename).stem.lower()
-                if cs == stem or stem in cs or cs in stem:
-                    return candidate
 
         return None
 
@@ -4350,10 +4359,20 @@ class CrateManagerView(QWidget):
             return
         if not self._writer():
             return
+        # Dropping onto a crate other than the one on screen, while All Tracks is
+        # selected, never changes the All Tracks set — every dragged track is
+        # already in it. Leave that table untouched so its rows don't reshuffle
+        # (All Tracks is ordered by first-containing-crate) and the scroll
+        # position holds.
+        keep_view = (
+            self._current_crate_path == _ALL_TRACKS_KEY
+            and crate_path != _ALL_TRACKS_KEY
+        )
         if self._undo_manager:
             cmd = AddTracksCommand(
                 self, crate_path, new_paths, crate.name,
                 stay_on_crate=self._current_crate_path,
+                reload_tracks=not keep_view,
             )
             self._undo_manager.push(cmd)
         else:
@@ -4361,7 +4380,7 @@ class CrateManagerView(QWidget):
             if not result.success:
                 _ov_alert(self, 'Add Tracks', f'Failed: {result.error}')
                 return
-            self._refresh(select=self._current_crate_path)
+            self._refresh(select=self._current_crate_path, reload_tracks=not keep_view)
         if skip_count:
             self._set_status(
                 f'Added {len(new_paths)} track(s) to "{crate.name}" '

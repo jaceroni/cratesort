@@ -85,7 +85,112 @@ When reviewing duplicates, clicking a track row that has `ARTWORK: Yes` should d
 
 ## Crates
 
-*(nothing tabled yet)*
+### Detect & gather "straggler" tracks — crate files that live outside the scanned library
+**Status: FIRST VERSION SHIPPED 2026-08-28.** Dashboard banner → pre-flight
+dialog (per-source-folder checkboxes) → move (copy + sha256 verify + delete
+original) into `<library>/Media/` loose → `PathRewriter` re-points every crate
+ref → rollback log in Organize's format (rollback works from the Organize
+history). New: `core/straggler_detector.py`, `gui/straggler_dialog.py`; wiring in
+`dashboard.py`. Resolver wrong-match fuzzy fallback removed in `crate_manager.py`
++ `crate_reader.py` at the same time. Full detail in `CLAUDE-CS.md` → "Locked
+decision — August 28 2026 (Straggler gather)".
+
+**Fast-follows still open:** per-file review UI (currently groups by source
+folder only), cross-`/Volumes` straggler location (only `/` + volume-root of the
+library are searched today), a Cancel button on the gather progress dialog.
+
+Original design notes below (kept for rationale):
+
+**The gap.** CrateSort scans exactly one folder tree (the library root the user
+points at). Serato does not — it stores every crate track as a path relative to
+the *volume* root and resolves it wherever it lives, so a working DJ's crates
+routinely reference files in `~/Downloads`, `~/Music`, the Desktop, `~/Documents`,
+etc. — files they dragged straight into Serato and never filed. Those references
+are perfectly healthy in Serato and will always resolve there.
+
+In CrateSort they don't. [`_CrateLoadWorker._resolve()`](../cratesort/src/gui/crate_manager.py)
+matches each crate track against the **scanned inventory**; anything outside the
+root fails the exact-path and `root / rel` checks, falls through to a **filename
+match** and then a **fuzzy stem match** (`stem in cs or cs in stem`), and only
+then renders as a greyed *"Not found in library"* row with an `X resolved,
+Y unresolved` count in the crate status bar.
+
+**Two problems, not one:**
+1. **The visible one:** a free-tier user (Library / Rinse / metadata only, no
+   Organize) opens the Crates tab and sees a pile of "Not found in library"
+   rows even though Serato opens the same crates cleanly. Reads as "CrateSort
+   lost my tracks." There is no path out today — Organize also skips files
+   outside the root ([`_is_under_root`](../cratesort/src/core/file_organizer.py)),
+   so neither tier can currently ingest an out-of-root straggler. The only
+   workaround is manually dragging files into the library folder in Finder.
+2. **The hidden one:** the filename + fuzzy-stem fallback in `_resolve()` can
+   silently bind a straggler (`Intro.mp3` in Downloads) to a *different*
+   same-named file inside the library. Playback, metadata edits, and Export
+   then act on the wrong file, and a later Organize could rewrite that crate
+   pointer to the wrong file permanently. **Fix this regardless of the feature
+   below** — drop the fuzzy fallback, or mark low-confidence matches visibly
+   distinct so "not found" stays honest.
+
+**Agreed shape:**
+- **Detect on scan.** After the initial library scan, read the crates and count
+  track references whose resolved location falls outside the library root. If
+  it's non-trivial, raise a **Dashboard banner**: *"N tracks in your crates
+  live outside your library folder — CrateSort can only manage files kept
+  inside it. [Show me] [Bring into library]."* Converts a silent gap into a
+  guided step.
+- **Free one-click "bring into library."** Move just the out-of-root,
+  crate-referenced files into the library, then re-point those crate refs with
+  the existing `PathRewriter` (in place, backup + rollback log). This is a
+  narrow, safe Organize that only ever touches files the user already trusts
+  (they're in crates). Arguably *should* be free — it's the on-ramp that makes
+  the free features actually cover the user's whole library.
+- **Destination: loose at the root of `Media/`** — NOT a named holding folder.
+  Rationale confirmed against the code: Organize runs `_remove_empty_dirs(
+  library_root)` after every execution and deletes any now-empty directory
+  under the root (even one holding only `.DS_Store`). A `Media/_Imported/`
+  bucket would therefore be auto-deleted the instant Organize sweeps its files
+  out to `Media/<genre>/<artist>/` — i.e. the app would create a folder and
+  silently destroy it one step later. `Media/` itself never hits that path
+  (it always still contains `Media/<genre>/<artist>/…`), so it's created once
+  and stays forever. A loose file in `Media/` is also semantically identical
+  to "an unsorted library file" — Organize already gives loose files under the
+  root a real `Media/<genre>/<artist>/` destination with no special-casing.
+  The "these came from outside" identity lives in the Dashboard banner +
+  activity feed + a one-time summary toast, never in a folder that pretends to
+  be permanent and then disappears.
+- **Move semantics:** copy → verify byte-identical → delete original, written
+  to a rollback log, reversible after quit — same contract as Organize / Rinse.
+  The confirm modal must name the source locations explicitly ("moves N files
+  out of Downloads, Desktop, ~/Music…"). Consider an opt-out "copy instead of
+  move" for the cautious, though that reintroduces the duplicate Rinse would
+  later flag.
+- **Collisions:** two stragglers named `foo.mp3`, or one clashing with an
+  existing `Media/foo.mp3` → ` (2)` suffix (Organize's existing rule).
+- **Cross-volume stragglers** (file on the internal disk, library on an
+  external) = a genuine cross-volume copy, slower — surface it in the progress
+  UI, otherwise no different.
+
+**Free user who never runs Organize:** the gathered files simply live loose in
+`Media/` as normal unsorted library content. Acceptable — same end state as any
+file they'd drag in themselves.
+
+**Relationship to other entries:**
+- Overlaps heavily with **"Add Tracks by Drag / File-Picker"** above — same core
+  constraint (a file outside the directory must be brought in), same
+  pre-flight-modal discipline, same "loose at root, Organize files it" placement
+  call. The straggler feature is the *automatic, crate-driven* version of that
+  manual flow; they should share the ingest + confirm code.
+- The **declined multi-location entry** below names this same gap from the other
+  side. If detect-and-gather proves insufficient in testing (e.g. users who
+  genuinely can't consolidate onto one drive), the lighter fallback is an
+  **auto multi-root scan** — `LibraryScanner(*root_dirs)` is already variadic;
+  derive extra *read-only* roots from the crates' own out-of-root references so
+  Crates/Library display them correctly even if nothing moves. No new setup
+  dialog; it's inferred from the crates, not chosen by the user.
+
+**Test signal needed (Jace's large-library run, 2026-08-28 evening):** after the
+scan, open Crates and note which crates show `unresolved` counts and roughly how
+many. That's the empirical read on how common stragglers actually are.
 
 ---
 
@@ -166,4 +271,4 @@ A lightweight standalone companion app positioned as a free lead-gen piece for C
 
 ---
 
-*Last updated: August 7, 2026*
+*Last updated: August 28, 2026*

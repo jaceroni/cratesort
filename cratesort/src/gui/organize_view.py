@@ -683,6 +683,7 @@ class OrganizeView(QWidget):
             moves          = log_data.get('moves', [])
             moved_count    = sum(1 for m in moves if m.get('status') == 'completed')
             rolled_back_at = log_data.get('rolled_back_at')
+            is_gather      = log_data.get('kind') == 'straggler_gather'
 
             try:
                 dt  = datetime.fromisoformat(executed_at)
@@ -710,6 +711,8 @@ class OrganizeView(QWidget):
             info.addWidget(date_lbl)
 
             count_lbl = QLabel(
+                f'{moved_count:,} track{"s" if moved_count != 1 else ""} moved into library'
+                if is_gather else
                 f'{moved_count:,} file{"s" if moved_count != 1 else ""} moved'
             )
             count_lbl.setStyleSheet(

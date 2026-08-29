@@ -145,6 +145,33 @@ reshuffle surprise); editing crates and track order; "Save Crates & Launch
 Serato"; the `.crate` files are the source of truth and Serato re-reads them on
 every launch.)*
 
+### "Not found in library" tracks — files your crates point to that live outside your library folder
+
+CrateSort only knows about files **inside the folder you pointed it at**. Serato
+is looser — it can play a track from anywhere on the drive, so a lot of DJs have
+crate tracks sitting in Downloads, the Desktop, a loose `~/Music` folder, etc.
+Those still play fine in Serato. In CrateSort's Crates tab they show up greyed
+out as *"Not found in library,"* with a `resolved / unresolved` count on the
+crate.
+
+Nothing is broken — CrateSort just can't clean, tag, de-dupe, or organize a file
+it can't see.
+
+**Moving them in.** After a scan, if any crate tracks live outside your
+library folder, the Dashboard shows a **"N Tracks In Your Crates Have Been Found
+Outside of Your Library"** banner. Click **Move Them In** to open the "Move
+Tracks Into Library" dialog, which shows every out-of-library file grouped
+by which folder it's in (Downloads, Desktop, ~/Music…). Choose which folders to
+move and confirm: each file is copied into your library's `Media/` folder,
+verified, and the original is removed from its old location; every crate that
+referenced it is re-pointed automatically. The files are now normal managed
+tracks — Classify, Rinse, and Organize can all see them. If you run Organize
+later, they get filed into `Media/<genre>/<artist>/` like everything else.
+
+The move is logged and reversible from the Organize tab's history (Rollback puts
+the files back and restores the crates). "Don't ask me to move these files
+again" hides a straggler you deliberately want to leave where it is.
+
 ## 8. Metadata editing
 
 *(stub — free tier; edits write straight to disk immediately (no separate save
@@ -195,4 +222,10 @@ testing + support):
   deleted.** → Crate is fine, repointed to the winner. See section 4.
 - **The winning file is buried in a weird folder. Will Organize find it later?**
   → Yes. Organize re-reads current state from disk. See section 4.
+- **My crate shows tracks as "Not found in library" but they play fine in
+  Serato.** → Those files live outside the folder you pointed CrateSort at.
+  Serato plays from anywhere; CrateSort only manages what's inside your library
+  folder. Use the Dashboard's "…Found Outside of Your Library" banner → **Move
+  Them In** to move them into `Media/` and re-point the crates automatically.
+  See section 7.
 - *(add as they come up)*

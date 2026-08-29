@@ -184,9 +184,9 @@ class CrateReader:
         inventory_paths: Optional[set[Path]],
     ) -> bool:
         """
-        Check whether a track path resolves to a local file.
-        Tries: (1) as an absolute path, (2) relative to library root,
-        (3) match by filename against inventory.
+        Check whether a track path resolves to a local file inside the library.
+        Tries: (1) relative to library root, (2) as an absolute path,
+        (3) an *unambiguous* filename match against the inventory.
         """
         # Try relative to library root (most common case)
         candidate = self._library_root / track_path
@@ -197,21 +197,14 @@ class CrateReader:
         if Path(track_path).exists():
             return True
 
-        # Try matching just the filename against the provided inventory
+        # Filename match against the local inventory — only when exactly one
+        # file has that basename. The fuzzy substring-stem fallback was
+        # removed: it reported unrelated files as "resolved" (e.g. a
+        # straggler outside the library matching a same-ish in-library name).
         if inventory_paths:
             fname = Path(track_path).name
-            for p in inventory_paths:
-                if p.name == fname:
-                    return True
-
-        # Stem-based fallback for renamed files (e.g. "Track - 12in Mix.mp3" → "track.mp3")
-        if inventory_paths:
-            stem = Path(track_path).stem.lower()
-            if len(stem) >= 5:
-                for p in inventory_paths:
-                    ps = p.stem.lower()
-                    if ps == stem or stem in ps or ps in stem:
-                        return True
+            if sum(1 for p in inventory_paths if p.name == fname) == 1:
+                return True
 
         return False
 

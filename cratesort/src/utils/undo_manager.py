@@ -69,24 +69,35 @@ class AddTracksCommand(Command):
         track_paths: list[str],
         crate_name: str,
         stay_on_crate: Optional[str] = None,
+        reload_tracks: bool = True,
     ):
         self.view          = view
         self.crate_path    = crate_path
         self.track_paths   = list(track_paths)
         self.stay_on_crate = stay_on_crate  # if set, execute() keeps this crate selected
+        # False when the visible track list can't have changed (added to a crate
+        # other than the one on screen while All Tracks is selected) — skip the
+        # table repopulate so its rows don't reshuffle.
+        self.reload_tracks = reload_tracks
         self.description   = f'Added {len(track_paths)} track(s) to {crate_name}'
 
     def execute(self) -> None:
         w = self.view._writer()
         if w:
             w.add_tracks(self.crate_path, self.track_paths)
-        self.view._refresh(select=self.stay_on_crate or self.crate_path)
+        self.view._refresh(
+            select=self.stay_on_crate or self.crate_path,
+            reload_tracks=self.reload_tracks,
+        )
 
     def undo(self) -> None:
         w = self.view._writer()
         if w:
             w.remove_tracks(self.crate_path, self.track_paths)
-        self.view._refresh(select=self.crate_path)
+        self.view._refresh(
+            select=self.stay_on_crate or self.crate_path,
+            reload_tracks=self.reload_tracks,
+        )
 
 
 class RemoveTracksCommand(Command):

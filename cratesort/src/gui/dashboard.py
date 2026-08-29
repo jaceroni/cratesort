@@ -429,7 +429,7 @@ class _WorkflowCard(QFrame):
             self.icon_dim   = self._ICON_DIM
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setMinimumHeight(230)
+        self.setMinimumHeight(184)   # 20% shorter than the previous 230
         self.setStyleSheet(self.style_rest)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -472,6 +472,9 @@ class _WorkflowCard(QFrame):
                 self._icon_svg.setStyleSheet('background: transparent;')
                 self._icon_svg.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
                 self._load_icon_color(self.icon_dim)
+                # Gutter between the description text and the icon: narrows the
+                # text container ~10% and stops the copy running under the icon.
+                row.addSpacing(18)
                 row.addWidget(self._icon_svg, alignment=Qt.AlignmentFlag.AlignTop)
             except Exception:
                 pass
@@ -993,6 +996,7 @@ class DashboardWidget(QWidget):
         self._dup_groups: list = []
         self._dup_summary = None
         self._dup_banner_widget = None
+        self._straggler_list: list = []
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -1021,6 +1025,7 @@ class DashboardWidget(QWidget):
     def refresh(self) -> None:
         if self._library_path and self._summary is not None:
             self._run_duplicate_detection()
+            self._detect_stragglers()
             self._populate_dashboard()
 
     def set_library_path(self, path: Path) -> None:
@@ -1590,6 +1595,8 @@ class DashboardWidget(QWidget):
             layout.addWidget(self._dup_banner_widget)
         else:
             self._dup_banner_widget = None
+        if self._straggler_list:
+            layout.addWidget(self._build_straggler_banner())
         layout.addWidget(self._make_divider())
         layout.addWidget(self._build_action_cards_section())
         layout.addWidget(self._make_divider())
@@ -1695,20 +1702,16 @@ class DashboardWidget(QWidget):
         row.setContentsMargins(20, 14, 20, 14)
 
         txt_col = QVBoxLayout()
-        title = QLabel(f'{n:,} Potential Duplicate{"s" if n != 1 else ""} Found')
+        title = QLabel(
+            f'{n:,} Potential Duplicate{"s" if n != 1 else ""} Found in Your Library'
+        )
         title.setStyleSheet('color: #D17D34; font-size: 14px; font-weight: 700; background: transparent; border: none;')
         txt_col.addWidget(title)
 
-        sub_parts = []
-        if space:
-            sub_parts.append(f'{space} could be reclaimed')
-        if summary and summary.skipped_count > 0:
-            s = summary.skipped_count
-            sub_parts.append(
-                f'{s:,} track{"s" if s != 1 else ""} skipped — no metadata'
-            )
-        sub_parts.append('Review before you classify.')
-        sub = QLabel('  ·  '.join(sub_parts))
+        lead = f'{space} of space could be reclaimed' if space else 'Space could be reclaimed'
+        sub = QLabel(
+            f'{lead} if you consolidate the duplicates  •  This will not affect your crates.'
+        )
         sub.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
         txt_col.addWidget(sub)
 
@@ -1736,6 +1739,96 @@ class DashboardWidget(QWidget):
             self._dup_banner_widget.deleteLater()
             self._dup_banner_widget = None
 
+    def _build_straggler_banner(self) -> QFrame:
+        stragglers = self._straggler_list
+        n = len(stragglers)
+
+        banner = QFrame()
+        banner.setStyleSheet(
+            'QFrame { background: #2a1a00; border: 1px solid #D17D34; border-radius: 8px; }'
+        )
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(20, 14, 20, 14)
+
+        txt_col = QVBoxLayout()
+        verb = 'Has' if n == 1 else 'Have'
+        title = QLabel(
+            f'{n:,} Track{"s" if n != 1 else ""} In Your Crates {verb} Been Found '
+            f'Outside of Your Library'
+        )
+        title.setStyleSheet('color: #D17D34; font-size: 14px; font-weight: 700; background: transparent; border: none;')
+        txt_col.addWidget(title)
+
+        sub = QLabel(
+            'CrateSort can only manage files in the directory selected on startup  •  '
+            'Bring them in to manage them.'
+        )
+        sub.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
+        txt_col.addWidget(sub)
+        row.addLayout(txt_col, stretch=1)
+
+        btn = QPushButton('Move Them In')
+        btn.setFixedHeight(36)
+        btn.setStyleSheet(
+            'QPushButton { background: #aa6326; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 0 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background: #925521; }'
+            'QPushButton:pressed { background: #7e491c; }'
+        )
+        btn.clicked.connect(self._open_straggler_gather)
+        row.addWidget(btn)
+        return banner
+
+    def _open_straggler_gather(self) -> None:
+        if not self._straggler_list or not self._library_path:
+            return
+        serato_dir = self._library_path / '_Serato_'
+        if not serato_dir.exists():
+            return
+        from cratesort.src.gui.straggler_dialog import (
+            _GatherProgressDialog, _GatherStragglersDialog, _GatherWorker,
+        )
+
+        dlg = _GatherStragglersDialog(self._straggler_list, self._library_path, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # Dismiss-list may have changed — re-detect so a "don't ask again"
+            # choice takes effect without a full re-scan.
+            self._detect_stragglers()
+            self._populate_dashboard()
+            return
+
+        selected = dlg.selected_stragglers
+        if not selected:
+            return
+
+        progress = _GatherProgressDialog(len(selected), self)
+        worker = _GatherWorker(
+            selected, self._library_path, serato_dir, self._current_crates, self,
+        )
+        self._straggler_worker = worker  # keep a reference alive
+
+        def _on_finished(payload: dict) -> None:
+            progress.show_result(
+                payload.get('moved', 0),
+                payload.get('crates_modified', 0),
+                payload.get('failed', []),
+            )
+
+        def _on_error(msg: str) -> None:
+            logging.getLogger(__name__).error('[Straggler] Gather failed: %s', msg)
+            progress.show_result(0, 0, [msg.splitlines()[0] if msg else 'unknown error'])
+
+        worker.progress.connect(progress.update_progress)
+        worker.finished.connect(_on_finished)
+        worker.errored.connect(_on_error)
+        worker.start()
+        progress.exec()   # blocks until the user clicks Close on the result screen
+        worker.wait(2000)
+        self._straggler_worker = None
+        # Re-scan — refreshes the inventory, the Crates view, nav state, and
+        # clears the banner now that the files live in the library.
+        self.start_scan(self._library_path)
+
     def _build_action_cards_section(self, scanning: bool = False) -> QWidget:
         outer = QWidget()
         vbox = QVBoxLayout(outer)
@@ -1753,7 +1846,7 @@ class DashboardWidget(QWidget):
             ('03', 'Organize Media', 'Consolidate duplicates and reorganize all of your media '
                                       'files without affecting your Serato crates.',
              self.organize_requested.emit, _icons / 'icon-organize.svg',
-             'CrateSort’s Organization Logic:<br>Your Library Folder > Media > Genre > Artist > Files'),
+             'CrateSort’s Organization Logic:<br>Your Directory Selected on Startup > Media > Genre > Artist > Files'),
         ]
 
         goto_widget = QWidget()
@@ -1920,12 +2013,18 @@ class DashboardWidget(QWidget):
                     if not exec_str:
                         continue
                     dt = datetime.fromisoformat(exec_str)
+                    is_gather = log.get('kind') == 'straggler_gather'
                     if dt >= cutoff:
                         moved = sum(1 for m in log.get('moves', []) if m.get('status') == 'completed')
                         time_str = 'Today' if dt.date() == now.date() else dt.strftime('%b %d')
+                        text = (
+                            f'{moved:,} track{"s" if moved != 1 else ""} moved into library'
+                            if is_gather else
+                            f'Library Reorganized — {moved:,} file{"s" if moved != 1 else ""} moved'
+                        )
                         items.append({
                             'dot_color': self._TEAL,
-                            'text': f'Library Reorganized — {moved:,} file{"s" if moved != 1 else ""} moved',
+                            'text': text,
                             'time_str': time_str,
                             '_dt': dt,
                         })
@@ -1935,9 +2034,14 @@ class DashboardWidget(QWidget):
                         if dt_rb >= cutoff:
                             moved = sum(1 for m in log.get('moves', []) if m.get('status') == 'completed')
                             time_str_rb = 'Today' if dt_rb.date() == now.date() else dt_rb.strftime('%b %d')
+                            text_rb = (
+                                f'Straggler Gather Rolled Back — {moved:,} file{"s" if moved != 1 else ""} restored'
+                                if is_gather else
+                                f'Reorganization Rolled Back — {moved:,} file{"s" if moved != 1 else ""} restored'
+                            )
                             items.append({
                                 'dot_color': self._ORANGE,
-                                'text': f'Reorganization Rolled Back — {moved:,} file{"s" if moved != 1 else ""} restored',
+                                'text': text_rb,
                                 'time_str': time_str_rb,
                                 '_dt': dt_rb,
                             })
@@ -2351,12 +2455,34 @@ class DashboardWidget(QWidget):
             self._dup_groups  = []
             self._dup_summary = None
 
+    def _detect_stragglers(self) -> None:
+        """Find crate tracks whose real files live outside the library folder.
+        Reuses self._current_crates (populated by _check_serato_sync, which runs
+        first in _show_dashboard)."""
+        self._straggler_list = []
+        if not self._library_path or not self._current_crates:
+            return
+        serato_dir = self._library_path / '_Serato_'
+        if not serato_dir.exists():
+            return
+        try:
+            from cratesort.src.core.straggler_detector import detect_stragglers
+            self._straggler_list = detect_stragglers(
+                self._current_crates, self._library_path, serato_dir,
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                '[Straggler] Detection failed: %s', exc, exc_info=True,
+            )
+            self._straggler_list = []
+
     def _show_dashboard(self) -> None:
         try:
             if self._scan_cancelled or self._summary is None:
                 return
             self._check_serato_sync()
             self._run_duplicate_detection()
+            self._detect_stragglers()
             self._populate_dashboard(scanning=False)
             self.scan_finished.emit()
             if self._sync_pending:
