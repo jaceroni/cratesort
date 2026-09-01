@@ -11,14 +11,16 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QStringListModel, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QSettings, QStringListModel, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QCompleter, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QProgressBar, QPushButton, QVBoxLayout,
 )
 
-from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout, _ov_confirm
+from cratesort.src.gui.overlays import (
+    _ArrowComboBox, _CrateSortDialog, _create_dialog_layout, _ov_confirm,
+)
 from cratesort.src.utils.ffmpeg_tools import format_elapsed, get_ffmpeg_path, get_media_duration
 from cratesort.src.utils.metadata_copy import embed_artwork
 
@@ -35,6 +37,68 @@ def _strip_ansi(text: str) -> str:
     regardless of `quiet`/`no_warnings` — strip them before showing an
     exception message anywhere in the UI."""
     return _ANSI_ESCAPE_RE.sub('', text)
+
+
+# ---------------------------------------------------------------------------
+# YouTube sign-in (cookies)
+# ---------------------------------------------------------------------------
+#
+# YouTube increasingly serves a "confirm you're not a bot" challenge instead
+# of the media for unauthenticated requests. yt-dlp clears it when handed
+# cookies from a browser the user is signed in to YouTube with. Label → the
+# browser key yt-dlp's `cookiesfrombrowser` expects.
+
+_COOKIE_BROWSERS: list[tuple[str, str]] = [
+    ("Don't use a login", ''),
+    ('Safari',        'safari'),
+    ('Chrome',        'chrome'),
+    ('Firefox',       'firefox'),
+    ('Edge',          'edge'),
+    ('Brave',         'brave'),
+    ('Chromium',      'chromium'),
+]
+_COOKIE_FILE_LABEL = 'Cookie file…'
+
+# Quality combo — index 0 is the default (fastest, single android request).
+_QUALITY_LABELS = ['Fast — about 360p', 'Best available (slower)']
+_QUALITY_VALUES = ['fast', 'best']
+
+
+def _humanize_yt_error(text: str) -> str:
+    """Translate the common YouTube failure walls into a short, actionable
+    line that points at this dialog's own controls. Anything unrecognised
+    passes through unchanged (ANSI already stripped by the caller)."""
+    low = text.lower()
+    if 'cookies' in low and any(k in low for k in (
+        'database', 'could not', 'unable to', 'failed to', 'permission',
+        'no such file', 'not found',
+    )):
+        return (
+            "CrateSort couldn't read the login from that browser. Try a "
+            "different one under YOUTUBE LOGIN, or choose \"Cookie file…\" "
+            "and load a cookies.txt you exported yourself."
+        )
+    if ('inappropriate for some users' in low
+            or 'confirm your age' in low
+            or 'age-restricted' in low or 'age restricted' in low):
+        return (
+            "This video is age-restricted, and YouTube only serves it to a "
+            "signed-in adult account. Set YOUTUBE LOGIN above to a browser "
+            "where you're signed in to YouTube (18+) and try again — if that "
+            "still fails, YouTube won't let CrateSort fetch it."
+        )
+    if ('not a bot' in low or 'sign in to confirm' in low
+            or 'page needs to be reloaded' in low
+            or 'requested format is not available' in low
+            or 'failed to extract any player response' in low):
+        return (
+            "YouTube blocked every way CrateSort can fetch this video right "
+            "now. This usually means YouTube has rate-limited your connection "
+            "after several tries — wait a few hours or switch networks (a "
+            "phone hotspot works). Setting YOUTUBE LOGIN above can sometimes "
+            "help. Age- or region-restricted videos can't be fetched at all."
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -73,14 +137,16 @@ class _MetadataFetchWorker(QThread):
     fetched = pyqtSignal(dict)
     failed  = pyqtSignal(str)
 
-    def __init__(self, url: str, parent=None):
+    def __init__(self, url: str, cookie_opts: dict | None = None, parent=None):
         super().__init__(parent)
         self._url = url
+        self._cookie_opts = cookie_opts or {}
 
     def run(self) -> None:
         try:
             import yt_dlp
-            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            opts = {'quiet': True, 'no_warnings': True, **self._cookie_opts}
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self._url, download=False) or {}
             self.fetched.emit({
                 'title':    info.get('title', ''),
@@ -88,7 +154,7 @@ class _MetadataFetchWorker(QThread):
                 'year':     str(info.get('upload_date', ''))[:4],
             })
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_strip_ansi(str(exc)))
 
 
 class _MusicBrainzWorker(QThread):
@@ -175,15 +241,91 @@ class _YTWorker(QThread):
     finished = pyqtSignal(str)
     errored  = pyqtSignal(str)
 
-    def __init__(self, url: str, fmt: str, dest_dir: Path, parent=None):
+    def __init__(self, url: str, fmt: str, dest_dir: Path,
+                 cookie_opts: dict | None = None, quality: str = 'fast',
+                 parent=None):
         super().__init__(parent)
-        self._url       = url
-        self._fmt       = fmt
-        self._dest      = dest_dir
-        self._cancelled = False
+        self._url         = url
+        self._fmt         = fmt
+        self._dest        = dest_dir
+        self._cookie_opts = cookie_opts or {}
+        self._quality     = quality          # 'fast' (android only) or 'best'
+        self._cancelled   = False
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    # ── yt-dlp download with client fallback ─────────────────────────────────
+    #
+    # YouTube now gates its normal (`web`/`tv`) player responses behind a
+    # "PO token" that yt-dlp can't mint on its own — an unauthenticated
+    # request hits "Sign in to confirm you're not a bot", and a
+    # cookie-authenticated one hits "The page needs to be reloaded". The one
+    # client that still returns a usable stream without a token is `android`,
+    # but it rejects the request outright if cookies are attached.
+    #
+    # `quality == 'fast'` (the default): go straight to the `android` client —
+    # ~360p, but one request, no waiting on the HD attempts that almost always
+    # fail. `quality == 'best'`: try the site default first (best quality when
+    # it works, honouring the user's cookies), then `web_embedded` (age-gate
+    # bypass), then fall back to `android`.
+
+    _ANDROID_STRATEGY = (
+        'android',
+        {'extractor_args': {'youtube': {'player_client': ['android']}}},
+        False,
+    )
+
+    def _download_with_fallback(self, yt_dlp, tmpdir: str, base_opts: dict) -> None:
+        if self._quality == 'best':
+            strategies = [
+                ('default', {}, True),
+                # web_embedded honours an age-verified account's cookies and is
+                # the usual way past "this video may be inappropriate" — a
+                # no-op for normal videos, so it just falls through.
+                ('web_embedded',
+                 {'extractor_args': {'youtube': {'player_client': ['web_embedded']}}},
+                 True),
+                self._ANDROID_STRATEGY,
+            ]
+        else:
+            strategies = [self._ANDROID_STRATEGY]
+        last_exc: Optional[Exception] = None
+        for i, (label, extra, use_cookies) in enumerate(strategies):
+            if self._cancelled:
+                raise _Cancelled()
+            # Clear anything a previous failed attempt left in the temp dir.
+            for p in Path(tmpdir).glob('*'):
+                if p.is_file():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            opts = dict(base_opts)
+            opts.update({'quiet': True, 'no_warnings': True})
+            if use_cookies and self._cookie_opts:
+                opts.update(self._cookie_opts)
+            opts.update(extra)
+            if i > 0:
+                self.progress.emit(0, 'Retrying'
+                                   if i < len(strategies) - 1
+                                   else 'Retrying at lower quality')
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([self._url])
+            except _Cancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 — try the next strategy
+                if self._cancelled:      # hook cancellation yt-dlp wrapped
+                    raise _Cancelled()
+                last_exc = exc
+                continue
+            if any(p.is_file() and not p.name.endswith('.part')
+                   for p in Path(tmpdir).glob('*')):
+                return
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError('yt-dlp produced no output file')
 
     def run(self) -> None:
         tmpdir = tempfile.mkdtemp(prefix='ytcv_')
@@ -196,7 +338,7 @@ class _YTWorker(QThread):
             pass
         except Exception as exc:
             if not self._cancelled:
-                self.errored.emit(_strip_ansi(str(exc)))
+                self.errored.emit(_humanize_yt_error(_strip_ansi(str(exc))))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -213,22 +355,21 @@ class _YTWorker(QThread):
                 except (ValueError, TypeError):
                     pass
 
-        ydl_opts = {
+        base_opts = {
             'format': (
                 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]'
-                '/bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+                '/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
             ),
             'outtmpl': os.path.join(tmpdir, '%(title)s.%(ext)s'),
             'progress_hooks': [hook],
-            'quiet': True, 'no_warnings': True,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([self._url])
+        self._download_with_fallback(yt_dlp, tmpdir, base_opts)
 
         if self._cancelled:
             raise _Cancelled()
 
-        files = [p for p in Path(tmpdir).iterdir() if p.is_file()]
+        files = [p for p in Path(tmpdir).iterdir()
+                 if p.is_file() and not p.name.endswith('.part')]
         if not files:
             raise RuntimeError('yt-dlp produced no output file')
 
@@ -298,16 +439,14 @@ class _YTWorker(QThread):
             elif d['status'] == 'finished':
                 self.progress.emit(87, 'Converting')
 
-        ydl_opts = {
+        base_opts = {
             'format': 'bestaudio/best',
             'outtmpl': os.path.join(tmpdir, '%(title)s.%(ext)s'),
             'progress_hooks': [hook],
             'postprocessors': [{'key': 'FFmpegExtractAudio',
                                 'preferredcodec': 'mp3', 'preferredquality': '0'}],
-            'quiet': True, 'no_warnings': True,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([self._url])
+        self._download_with_fallback(yt_dlp, tmpdir, base_opts)
 
         if self._cancelled:
             raise _Cancelled()
@@ -402,18 +541,38 @@ _EYEBROW_STYLE = (
     'color: #5a5a5a; font-size: 10px; letter-spacing: 0.1em; '
     'background: transparent; border: none;'
 )
+_IMPORT_BTN_STYLE = (
+    'QPushButton { background-color: #428175; color: #ffffff; border: none; '
+    'border-radius: 6px; padding: 8px 24px; font-size: 13px; font-weight: 600; }'
+    'QPushButton:hover { background-color: #38706a; }'
+    'QPushButton:pressed { background-color: #2d6358; }'
+    'QPushButton:disabled { background-color: #2a2a2a; color: #5a5248; }'
+)
+_PASSIVE_BTN_STYLE = (
+    'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+    'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+    'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; '
+    'background: rgba(241, 227, 200, 0.05); }'
+)
 
 
 class _YTImportDialog(_CrateSortDialog):
     """
-    Import a YouTube video as MP4 (1080p, H.264/AAC) or MP3 (VBR best).
+    Import a YouTube video as MP4 (H.264/AAC) or MP3.
+
+    The QUALITY combo picks how hard the download tries: 'Fast' (default) goes
+    straight to the `android` client for a ~360p copy in one request; 'Best
+    available' runs the full client cascade first. See
+    `_YTWorker._download_with_fallback`.
 
     Flow:
       1. Paste URL → auto-fetch YouTube metadata → pre-populate fields
-      2. User reviews / edits Artist, Title, Album, Year, Genre
+      2. User reviews / edits Artist, Title, Album, Year, Genre; picks QUALITY
       3. Import → download + convert (real-time % progress)
       4. MusicBrainz lookup → show suggestion if confident match found
       5. User accepts / skips → tags written → file saved
+      6. Nothing locks after a save — paste another URL to go again (keeps the
+         destination + sign-in choice), or press Done / Escape to close
     """
 
     def __init__(self, fmt: str, library_path: Optional[Path],
@@ -423,10 +582,20 @@ class _YTImportDialog(_CrateSortDialog):
         self._fmt         = fmt
         self._library_path = library_path
         self._output_path: Optional[str] = None
+        self._save_complete = False
         self._meta_worker:  Optional[_MetadataFetchWorker] = None
         self._dl_worker:    Optional[_YTWorker]            = None
         self._mb_worker:    Optional[_MusicBrainzWorker]   = None
         self._artwork_path: Optional[Path] = None
+
+        # YOUTUBE LOGIN — always starts at "Don't use a login". It is NOT
+        # persisted: a remembered browser choice quietly re-triggers a macOS
+        # keychain / "access data from other apps" prompt (and a cookie read)
+        # on every metadata fetch, for a control that rarely helps anyway.
+        self._settings = QSettings('JWBC', 'CrateSort')
+        self._settings.remove('yt_cookies_browser')   # purge value from older builds
+        self._cookie_browser: str = ''
+        self._cookie_file: Optional[str] = None
 
         is_mp4 = fmt == 'mp4'
         self.setMinimumWidth(520)
@@ -442,9 +611,9 @@ class _YTImportDialog(_CrateSortDialog):
         layout.addWidget(title_lbl)
 
         mode_lbl = QLabel(
-            'Video · MP4  ·  1080p max  ·  H.264 / AAC 192k'
+            'Video · MP4  ·  H.264 / AAC'
             if is_mp4 else
-            'Audio · MP3  ·  VBR best quality'
+            'Audio · MP3'
         )
         mode_lbl.setStyleSheet(
             'color: #a89b85; font-size: 12px; background: transparent; border: none;'
@@ -574,7 +743,13 @@ class _YTImportDialog(_CrateSortDialog):
         dest_row = QHBoxLayout()
         dest_row.setSpacing(8)
 
-        self._dest_path = library_path or Path.home() / 'Downloads'
+        # Last folder the user browsed to persists across dialog opens, so a
+        # second import doesn't start by re-picking the destination.
+        _saved_dest = self._settings.value('yt_dest_dir', '', type=str)
+        if _saved_dest and Path(_saved_dest).is_dir():
+            self._dest_path = Path(_saved_dest)
+        else:
+            self._dest_path = library_path or Path.home() / 'Downloads'
         self._dest_lbl  = QLabel(str(self._dest_path))
         self._dest_lbl.setStyleSheet(
             'color: #c9b89a; font-size: 12px; background: #222222; '
@@ -601,6 +776,49 @@ class _YTImportDialog(_CrateSortDialog):
         )
         media_hint.setWordWrap(True)
         layout.addWidget(media_hint)
+        layout.addSpacing(14)
+
+        # ── Quality ──────────────────────────────────────────────────────────
+        layout.addWidget(self._eyebrow('QUALITY'))
+
+        self._quality_combo = _ArrowComboBox(bg='#383838')
+        for _q in _QUALITY_LABELS:
+            self._quality_combo.addItem(_q)
+        self._quality_combo.setCurrentIndex(0)   # default: fastest, no HD wait
+        layout.addWidget(self._quality_combo)
+
+        quality_hint = QLabel(
+            'Fast grabs a ~360p copy in one request. Best tries for higher '
+            'quality first — slower, and often still lands at ~360p.'
+        )
+        quality_hint.setStyleSheet(
+            'color: #5a5248; font-size: 11px; background: transparent; border: none;'
+        )
+        quality_hint.setWordWrap(True)
+        layout.addWidget(quality_hint)
+        layout.addSpacing(14)
+
+        # ── YouTube login (reuses a browser's existing session) ──────────────
+        layout.addWidget(self._eyebrow('YOUTUBE LOGIN'))
+
+        self._cookie_combo = _ArrowComboBox(bg='#383838')
+        for label, _key in _COOKIE_BROWSERS:
+            self._cookie_combo.addItem(label)
+        self._cookie_combo.addItem(_COOKIE_FILE_LABEL)
+        self._restore_cookie_combo_selection()
+        self._cookie_combo.currentIndexChanged.connect(self._on_cookie_source_changed)
+        layout.addWidget(self._cookie_combo)
+
+        cookie_hint = QLabel(
+            "This doesn't sign you in — it reuses the YouTube login from a "
+            "browser you're already signed into. Can help with blocked or "
+            "age-restricted videos; leave it off otherwise."
+        )
+        cookie_hint.setStyleSheet(
+            'color: #5a5248; font-size: 11px; background: transparent; border: none;'
+        )
+        cookie_hint.setWordWrap(True)
+        layout.addWidget(cookie_hint)
         layout.addSpacing(14)
 
         # ── Progress ─────────────────────────────────────────────────────────
@@ -702,24 +920,13 @@ class _YTImportDialog(_CrateSortDialog):
 
         self._cancel_btn = QPushButton('Cancel')
         self._cancel_btn.setFixedHeight(36)
-        self._cancel_btn.setStyleSheet(
-            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
-            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
-            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; '
-            'background: rgba(241, 227, 200, 0.05); }'
-        )
+        self._cancel_btn.setStyleSheet(_PASSIVE_BTN_STYLE)
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._cancel_btn.setAutoDefault(False)
 
         self._import_btn = QPushButton('Import')
         self._import_btn.setFixedHeight(36)
-        self._import_btn.setStyleSheet(
-            'QPushButton { background-color: #428175; color: #ffffff; border: none; '
-            'border-radius: 6px; padding: 8px 24px; font-size: 13px; font-weight: 600; }'
-            'QPushButton:hover { background-color: #38706a; }'
-            'QPushButton:pressed { background-color: #2d6358; }'
-            'QPushButton:disabled { background-color: #2a2a2a; color: #5a5248; }'
-        )
+        self._import_btn.setStyleSheet(_IMPORT_BTN_STYLE)
         self._import_btn.clicked.connect(self._on_import)
         self._import_btn.setDefault(True)   # Return anywhere in the form starts the import
         for _f in (self._f_artist, self._f_title, self._f_album, self._f_year, self._f_genre):
@@ -771,9 +978,59 @@ class _YTImportDialog(_CrateSortDialog):
             'genre':  self._f_genre.text().strip(),
         }
 
+    # ── YouTube sign-in (cookies) ────────────────────────────────────────────
+
+    def _cookie_opts(self) -> dict:
+        """yt-dlp option fragment for the chosen YouTube sign-in source."""
+        if self._cookie_file:
+            return {'cookiefile': self._cookie_file}
+        if self._cookie_browser:
+            return {'cookiesfrombrowser': (self._cookie_browser,)}
+        return {}
+
+    def _restore_cookie_combo_selection(self) -> None:
+        """Point the combo at whatever source is currently active, without
+        firing currentIndexChanged."""
+        target = 0
+        if self._cookie_file:
+            target = self._cookie_combo.count() - 1          # the "Cookie file…" row
+        elif self._cookie_browser:
+            for i, (_label, key) in enumerate(_COOKIE_BROWSERS):
+                if key == self._cookie_browser:
+                    target = i
+                    break
+        self._cookie_combo.blockSignals(True)
+        self._cookie_combo.setCurrentIndex(target)
+        self._cookie_combo.blockSignals(False)
+
+    def _on_cookie_source_changed(self, index: int) -> None:
+        file_row = self._cookie_combo.count() - 1
+        if index == file_row:
+            path, _ = QFileDialog.getOpenFileName(
+                self, 'Choose a cookies.txt file', str(Path.home()),
+                'Cookie files (*.txt);;All files (*)',
+            )
+            if not path:
+                self._restore_cookie_combo_selection()      # cancelled — revert
+                return
+            self._cookie_file = path
+            self._cookie_browser = ''
+            self._cookie_combo.setItemText(file_row, f'Cookie file: {Path(path).name}')
+        else:
+            self._cookie_file = None
+            self._cookie_browser = _COOKIE_BROWSERS[index][1]
+            self._cookie_combo.setItemText(file_row, _COOKIE_FILE_LABEL)
+
+        # Now that we can authenticate, retry the metadata auto-fill if a
+        # valid URL is already entered.
+        if _YT_RE.match(self._url_input.text().strip()):
+            self._fetch_metadata()
+
     # ── URL auto-fetch ────────────────────────────────────────────────────────
 
     def _on_url_changed(self, text: str) -> None:
+        if self._save_complete:
+            self._clear_after_save()
         self._meta_timer.stop()
         self._meta_status.hide()
         if _YT_RE.match(text.strip()):
@@ -790,7 +1047,7 @@ class _YTImportDialog(_CrateSortDialog):
         self._meta_status.show()
         self._fields_enabled(False)
 
-        self._meta_worker = _MetadataFetchWorker(url, self)
+        self._meta_worker = _MetadataFetchWorker(url, self._cookie_opts(), self)
         self._meta_worker.fetched.connect(self._on_metadata_fetched)
         self._meta_worker.failed.connect(self._on_metadata_failed)
         self._meta_worker.start()
@@ -803,9 +1060,16 @@ class _YTImportDialog(_CrateSortDialog):
         self._f_year.setText(info.get('year', ''))
         self._fields_enabled(True)
 
-    def _on_metadata_failed(self, _: str) -> None:
-        self._meta_status.hide()
+    def _on_metadata_failed(self, msg: str) -> None:
         self._fields_enabled(True)
+        low = msg.lower()
+        if 'not a bot' in low or 'sign in to confirm' in low:
+            # Non-fatal here (fields can be typed by hand) but tell the user
+            # why nothing auto-filled and where the fix is.
+            self._meta_status.setText('Needs a YouTube login to auto-fill')
+            self._meta_status.show()
+        else:
+            self._meta_status.hide()
 
     # ── Artwork ───────────────────────────────────────────────────────────────
 
@@ -840,6 +1104,7 @@ class _YTImportDialog(_CrateSortDialog):
         if path:
             self._dest_path = Path(path)
             self._dest_lbl.setText(str(self._dest_path))
+            self._settings.setValue('yt_dest_dir', str(self._dest_path))
 
     # ── Import ────────────────────────────────────────────────────────────────
 
@@ -852,6 +1117,8 @@ class _YTImportDialog(_CrateSortDialog):
             self._set_result('That doesn\'t look like a YouTube URL.', error=True)
             return
 
+        self._save_complete = False
+        self._cancel_btn.setText('Cancel')
         self._import_btn.setEnabled(False)
         self._url_input.setEnabled(False)
         self._fields_enabled(False)
@@ -862,7 +1129,10 @@ class _YTImportDialog(_CrateSortDialog):
         self._progress_bar.show()
         self._pct_lbl.show()
 
-        self._dl_worker = _YTWorker(url, self._fmt, self._dest_path, self)
+        quality = _QUALITY_VALUES[self._quality_combo.currentIndex()]
+        self._dl_worker = _YTWorker(
+            url, self._fmt, self._dest_path, self._cookie_opts(), quality, self,
+        )
         self._dl_worker.progress.connect(self._on_progress)
         self._dl_worker.finished.connect(self._on_download_finished)
         self._dl_worker.errored.connect(self._on_error)
@@ -968,16 +1238,36 @@ class _YTImportDialog(_CrateSortDialog):
                 self._set_result(f'Artwork could not be embedded: {exc}', error=True)
 
         self._set_result(f'Saved: {self._output_path}', error=False)
-        self._import_btn.setText('Close')
+
+        # Nothing is locked after a save. The user can paste another URL and
+        # go (typing a new URL clears this result + the old metadata — see
+        # `_clear_after_save`), or press Done / Escape to leave.
+        self._save_complete = True
+        self._url_input.setEnabled(True)
+        self._fields_enabled(True)
         self._import_btn.setEnabled(True)
-        self._import_btn.setStyleSheet(
-            'QPushButton { background-color: #6B9E78; color: #ffffff; border: none; '
-            'border-radius: 6px; padding: 8px 24px; font-size: 13px; font-weight: 600; }'
-            'QPushButton:hover { background-color: #5a8e67; }'
-        )
-        self._import_btn.clicked.disconnect()
-        self._import_btn.clicked.connect(self.accept)
-        self._cancel_btn.hide()
+        self._stage_lbl.hide()
+        self._progress_bar.hide()
+        self._pct_lbl.hide()
+        self._cancel_btn.setText('Done')
+
+    def _clear_after_save(self) -> None:
+        """Called when the user starts a new URL after a completed import —
+        wipes the previous result and its now-stale metadata / artwork so the
+        next auto-fetch fills in cleanly. Destination folder and the sign-in
+        selection are deliberately left as-is."""
+        self._save_complete = False
+        self._output_path    = None
+        self._mb_suggestion  = None
+        for f in (self._f_artist, self._f_title, self._f_album,
+                  self._f_year, self._f_genre):
+            f.clear()
+        self._on_clear_artwork()
+        self._result_lbl.hide()
+        self._mb_strip.hide()
+        self._progress_bar.setValue(0)
+        self._pct_lbl.setText('0%')
+        self._cancel_btn.setText('Cancel')
 
     # ── Error / cancel ────────────────────────────────────────────────────────
 

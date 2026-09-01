@@ -224,6 +224,27 @@ Right now `GenreClassifier` (`classifier.py`) is purely local and has zero knowl
 
 ## General / UX
 
+### YouTube import — make it more robust (PO-token provider + related options)
+As of 2026-08-31 YouTube gates its normal (`web`/`tv`) player responses behind a **PO token** (proof-of-origin) that yt-dlp cannot generate on its own: an unauthenticated request gets "Sign in to confirm you're not a bot", and a cookie-authenticated one gets "The page needs to be reloaded". `yt_import_dialog.py` falls back to the `android` client (no cookies), which still returns a stream — but often only a low-quality progressive one (e.g. 360p / ~96 kbps AAC for gated videos). The dialog now has a QUALITY combo (default Fast = single `android` pass) and a `web_embedded` age-gate pass; copy and `_download_with_fallback()` reflect all this.
+
+Separately, on 2026-08-31 heavy testing got the dev IP **soft-blocked**: videos that had worked hours earlier returned zero playable formats on *every* client. That's a volume-based rate limit on the IP, not a code issue — clears in hours→~1 day, or use a fresh IP. This is the recurring pain the options below are meant to reduce.
+
+**Option A — PO-token provider (`bgutil-ytdlp-pot-provider`). The real ceiling-raiser.**
+This *is* a token system: the PO token is the credential that makes the `web`/`tv` clients work and return full adaptive formats (1080p, 160 kbps opus). Requests carrying a valid token + a logged-in session also look legitimate, so YouTube soft-blocks far less aggressively — it doesn't grant immunity from volume limits, but it's the single biggest improvement. Needs a JavaScript runtime: a bundled Node.js binary (`nodejs-wheel` / `nodejs-bin`, ~50 MB added to the `.app`) that the app spawns as a local provider, or its Docker image (not viable for a shipped desktop app). Cost: the dependency + a managed subprocess + maintenance when bgutil/YouTube shift. ~1 day plus packaging verification on a clean machine.
+
+**Option B — pair A with the existing browser-cookie support (`YOUTUBE LOGIN` combo).**
+Already built. Authenticated requests get materially higher rate limits than anonymous ones. Weak on its own (hits the PO wall), strong *combined* with Option A. No extra work beyond A.
+
+**Option C — throttle CrateSort's own request pattern. Cheap hygiene.**
+The metadata auto-fetch fires on every debounce pause while typing a URL; the `best` cascade fires up to 3 requests per import. Fetch metadata only on paste/blur/explicit action, add small inter-request delays, cap retries. No dependencies, small gain, reduces how fast the heuristic trips.
+
+**Rejected — not worth it for a shipped desktop utility:**
+- **Rotating / residential proxies** — would defeat IP rate-limiting directly, but it's a paid subscription (~$3–15/GB), ToS-grey, and CrateSort would either ship credentials (bad) or make every user configure their own.
+- **A CrateSort-hosted relay** (users get API tokens against our server that runs yt-dlp with PO tokens + rotating IPs + caching) — this is how commercial YouTube-to-MP3 sites work, and it's a business, not a feature: ongoing hosting bill, *we* become the IP YouTube blocks and DMCAs, real legal exposure as the redistributing party, plus scaling. 
+- **Official YouTube Data API** — generous free quota, needs an API key, but returns metadata only, never stream URLs. Could make the title/artist auto-fill bulletproof (no bot-gating on that step); can't download anything, so yt-dlp is still needed for media.
+
+**Recommendation:** when YouTube import matters enough, do **A + B**, optionally **C** alongside. Skip proxies and a relay. Revisit sooner if yt-dlp ships native PO-token handling. Tested 2026-08-31: yt-dlp nightly (2026.08.30) does **not** fix the PO wall; 2026.8.19 is the latest stable.
+
 ### Animated right-click context menus (Library, Crates, Tracks)
 Right-click menus throughout the app ("Approve", "Change Genre", "Mark for Review", etc. in Library; equivalent menus in Crates/Tracks) are plain `QMenu` instances — confirmed and requested to get the same elastic/spring motion signature as dialogs and page transitions ("more fun," "more brand essence").
 
@@ -271,4 +292,4 @@ A lightweight standalone companion app positioned as a free lead-gen piece for C
 
 ---
 
-*Last updated: August 28, 2026*
+*Last updated: August 31, 2026*
