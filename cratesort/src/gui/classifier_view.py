@@ -474,6 +474,14 @@ class _ClassifyWorker(QThread):
             for i, artist in enumerate(artists):
                 if self._cancelled:
                     return
+                # This loop is pure-Python and CPU-bound; without periodically
+                # yielding the GIL it holds the interpreter for its whole
+                # ~seconds-long run and the main thread can't repaint, so the
+                # "Preparing associations…" screen freezes and its progress
+                # bar never moves. A sub-ms yield every 20 artists is <1% of
+                # total runtime and keeps the UI live.
+                if i % 20 == 0:
+                    self.usleep(200)
                 tracks   = artist_tracks[artist]
                 results  = classifier.classify_all(tracks, style_tags_by_path=style_tags_by_path)
 

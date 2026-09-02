@@ -23,6 +23,10 @@ a = Analysis(
         'PyQt6.QtSvg',
         'PyQt6.QtMultimedia',
         'PyQt6.QtMultimediaWidgets',
+        # Spawned by the library scan in a separate process — make sure the
+        # worker entry point and its deps are in the bundle.
+        'cratesort.src.core.parallel_tag_reader',
+        'cratesort.src.core.scan_worker_proc',
     ],
     hookspath=[],
     hooksconfig={},

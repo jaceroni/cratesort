@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -7,6 +8,20 @@ import sys
 import time
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _timed(label: str):
+    """Log how long a post-scan main-thread step takes — these are what make
+    the window sit unresponsive between 'scan done' and the dashboard showing.
+    Lands in _CrateSort/logs/scan.log alongside the scan's own timing."""
+    _t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("[timing] %s: %.0f ms", label, (time.perf_counter() - _t0) * 1000)
+
+
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -267,8 +282,49 @@ class _MascotView(QGraphicsView):
 # Background worker
 # ---------------------------------------------------------------------------
 
+class _ElidingLabel(QLabel):
+    """QLabel that elides each line of its text to the current width instead of
+    wrapping or clipping. Used for the scan status line. `elide` picks which end
+    is dropped — ElideRight keeps a leading count intact and trims the filename
+    tail; ElideMiddle keeps both ends of a path. Embedded newlines are elided
+    line by line."""
+
+    def __init__(self, text: str = '', parent=None,
+                 elide: Qt.TextElideMode = Qt.TextElideMode.ElideMiddle):
+        super().__init__(parent)
+        self._full = text or ''
+        self._elide = elide
+        self.setFixedHeight(32)
+        super().setText(self._full)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
+        self._full = text or ''
+        self._relayout()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        fm = self.fontMetrics()
+        # contentsRect honours setContentsMargins, so callers can inset the
+        # label to line its text up with a grid edge and the elide width
+        # stays correct.
+        avail = max(0, self.contentsRect().width())
+        elided = '\n'.join(
+            fm.elidedText(line, self._elide, avail)
+            for line in self._full.split('\n')
+        )
+        super().setText(elided)
+
+
 class _ScanWorker(QThread):
-    progress = pyqtSignal(int, str)    # (files_found, current_dir_name)
+    # (done, total, label). total is -1 while still discovering files; label is
+    # either "Finding files — <dir>" or the name of the file being read.
+    progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(object, object)  # (inventory, summary)
     errored  = pyqtSignal(str)
 
@@ -286,6 +342,7 @@ class _ScanWorker(QThread):
             scanner = LibraryScanner(
                 self._path,
                 progress_callback=self._on_progress,
+                is_cancelled=lambda: self._cancelled,
             )
             inventory, summary = scanner.scan()
             if not self._cancelled:
@@ -294,9 +351,32 @@ class _ScanWorker(QThread):
             if not self._cancelled:
                 self.errored.emit(str(exc))
 
-    def _on_progress(self, count: int, dir_name: str) -> None:
+    def _on_progress(self, done: int, total: int, label: str) -> None:
         if not self._cancelled:
-            self.progress.emit(count, dir_name)
+            self.progress.emit(done, total, label)
+
+
+class _BgSteps(QThread):
+    """Runs a short list of no-Qt callables off the main thread, then emits
+    done(). Used for the post-scan analysis (Serato overlay, sync check, dupe
+    + straggler detection) so the scanning screen's mascot pulse and comet keep
+    moving instead of the whole window locking for ~1s. Each step is timed into
+    scan.log; a step that raises is logged and the rest still run."""
+
+    done = pyqtSignal()
+
+    def __init__(self, parent, steps: list[tuple[str, object]]):
+        super().__init__(parent)
+        self._steps = steps
+
+    def run(self) -> None:
+        for label, fn in self._steps:
+            try:
+                with _timed(label):
+                    fn()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[bg] %s failed: %s", label, exc, exc_info=True)
+        self.done.emit()
 
 
 _SVG_VIEWBOX_RE = re.compile(r'viewBox="[\d.\-]+\s+[\d.\-]+\s+([\d.]+)\s+([\d.]+)"')
@@ -990,6 +1070,8 @@ class DashboardWidget(QWidget):
         self._classify_tally = None
         self._classify_start_ms = 0
         self._classifying = False
+        self._bg_overlay = None  # _BgSteps — off-thread post-scan analysis
+        self._bg_post = None
         self._sync_pending = False
         self._detected_changes = []
         self._current_crates = {}
@@ -997,6 +1079,7 @@ class DashboardWidget(QWidget):
         self._dup_summary = None
         self._dup_banner_widget = None
         self._straggler_list: list = []
+        self._unreadable: list = []  # [(Path, reason)] from the last scan
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -1422,11 +1505,6 @@ class DashboardWidget(QWidget):
         panel_v.setContentsMargins(18, 16, 18, 17)
         panel_v.setSpacing(10)
 
-        # Left column is fixed-width so the mascot (top) and status text
-        # (bottom) share one column, and the cards/beam/cancel column to its
-        # right stays aligned across both rows regardless of mascot presence.
-        LEFT_COL_WIDTH = self._MASCOT_COL_WIDTH
-
         top_row = QHBoxLayout()
         top_row.setSpacing(14)
 
@@ -1460,24 +1538,29 @@ class DashboardWidget(QWidget):
         top_row.addLayout(cards_row, stretch=1)
         panel_v.addLayout(top_row)
 
-        # Bottom row: status text sits under the mascot, then the comet beam
-        # picks up at the same left edge as the first stat card and runs to
-        # the Cancel button, which lines up with the last card's right edge.
+        # One row, everything on the same line: the status text (left-aligned
+        # with the mascot art), the comet beam filling the middle, then Cancel.
+        # The 28px left inset lands the text on the drawn crate's left edge; the
+        # 24px trailing inset lands Cancel's right edge on the last stat card's
+        # (cards_row reserves the same 24px).
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(14)
+        bottom_row.setContentsMargins(28, 0, 24, 0)
 
-        status_container = QWidget()
-        status_container.setFixedWidth(LEFT_COL_WIDTH)
-        status_container.setStyleSheet('background: transparent;')
-        status_v = QVBoxLayout(status_container)
-        status_v.setContentsMargins(0, 0, 0, 0)
-        self._scan_count = QLabel('Discovering files…')
-        self._scan_count.setWordWrap(True)
-        self._scan_count.setStyleSheet(
-            'font-size: 11px; color: #7a6a55; letter-spacing: 0.02em; background: transparent; border: none;'
+        # Fixed width, elide from the right so the "N of M" count always stays
+        # readable and only the filename tail gets trimmed; a long name never
+        # pushes the beam.
+        self._scan_count = _ElidingLabel(
+            'Discovering files…', elide=Qt.TextElideMode.ElideRight)
+        self._scan_count.setFixedWidth(360)
+        self._scan_count.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
-        status_v.addWidget(self._scan_count)
-        bottom_row.addWidget(status_container)
+        self._scan_count.setStyleSheet(
+            'font-size: 11px; color: #7a6a55; letter-spacing: 0.02em; '
+            'background: transparent; border: none;'
+        )
+        bottom_row.addWidget(self._scan_count)
 
         self._scan_beam = _ScanActivityBeam()
         bottom_row.addWidget(self._scan_beam, stretch=1)
@@ -1597,6 +1680,8 @@ class DashboardWidget(QWidget):
             self._dup_banner_widget = None
         if self._straggler_list:
             layout.addWidget(self._build_straggler_banner())
+        if self._unreadable:
+            layout.addWidget(self._build_unreadable_banner())
         layout.addWidget(self._make_divider())
         layout.addWidget(self._build_action_cards_section())
         layout.addWidget(self._make_divider())
@@ -1778,6 +1863,50 @@ class DashboardWidget(QWidget):
         btn.clicked.connect(self._open_straggler_gather)
         row.addWidget(btn)
         return banner
+
+    def _build_unreadable_banner(self) -> QFrame:
+        n = len(self._unreadable)
+
+        banner = QFrame()
+        banner.setStyleSheet(
+            'QFrame { background: #2a1a00; border: 1px solid #D17D34; border-radius: 8px; }'
+        )
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(20, 14, 20, 14)
+
+        txt_col = QVBoxLayout()
+        title = QLabel(
+            f'{n:,} File{"s" if n != 1 else ""} Could Not Be Read During the Scan'
+        )
+        title.setStyleSheet('color: #D17D34; font-size: 14px; font-weight: 700; background: transparent; border: none;')
+        txt_col.addWidget(title)
+
+        sub = QLabel(
+            'Usually a damaged file, or the drive / cable / OS filesystem driver '
+            'stalling on it  •  These tracks were skipped, not added.'
+        )
+        sub.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
+        txt_col.addWidget(sub)
+        row.addLayout(txt_col, stretch=1)
+
+        btn = QPushButton('Show List')
+        btn.setFixedHeight(36)
+        btn.setStyleSheet(
+            'QPushButton { background: #aa6326; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 0 18px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background: #925521; }'
+            'QPushButton:pressed { background: #7e491c; }'
+        )
+        btn.clicked.connect(self._open_unreadable_list)
+        row.addWidget(btn)
+        return banner
+
+    def _open_unreadable_list(self) -> None:
+        """Show the skipped files in a styled in-app panel."""
+        if not self._unreadable:
+            return
+        from cratesort.src.gui.unreadable_dialog import _UnreadableFilesDialog
+        _UnreadableFilesDialog(self._unreadable, self).exec()
 
     def _open_straggler_gather(self) -> None:
         if not self._straggler_list or not self._library_path:
@@ -2209,6 +2338,14 @@ class DashboardWidget(QWidget):
             except Exception:
                 pass
             self._classify_worker.wait(3000)
+        for bg_attr in ('_bg_overlay', '_bg_post'):
+            bg = getattr(self, bg_attr, None)
+            if bg is not None and bg.isRunning():
+                try:
+                    bg.done.disconnect()
+                except Exception:
+                    pass
+                bg.wait(3000)
         self._classifying = False
         if getattr(self, '_mascot_anim', None) is not None:
             self._mascot_anim.stop()
@@ -2226,16 +2363,39 @@ class DashboardWidget(QWidget):
         self._fit_welcome_logo()
         self.status_message.emit('', '')
 
-    def _on_scan_progress(self, count: int, dir_name: str) -> None:
-        self._scan_card_analyzed.update_target(count)
-        self._scan_count.setText(f'Scanning “{dir_name}”…')
+    def _on_scan_progress(self, done: int, total: int, label: str) -> None:
+        # total == -1 → still walking the tree; the count has no denominator
+        # yet, so leave the numeric card alone and just show what we're doing.
+        if total >= 0:
+            self._scan_card_analyzed.update_target(done)
+        if total > 0:
+            self._scan_count.setText(f'Reading tags — {done:,} of {total:,}  ·  {label}')
+        else:
+            self._scan_count.setText(label)
 
     def _on_scan_finished(self, inventory, summary) -> None:
         if self._scan_cancelled:
             return
-        self._apply_serato_overlay(inventory)
         self._inventory = inventory
         self._summary   = summary
+        # Surfaced as a persistent dashboard banner in _populate_dashboard(),
+        # alongside the duplicates / stragglers banners.
+        self._unreadable = list(getattr(summary, 'read_errors', []))
+
+        # Serato BPM/comment overlay reads a binary DB and rewrites fields on
+        # every track — ~0.5s that would otherwise freeze the scan screen the
+        # instant the bar hits 100%. Run it off-thread; classification waits
+        # for it because it reads rec.comment.
+        self._scan_count.setText('Reading Serato edits…')
+        self._bg_overlay = _BgSteps(self, [
+            ("apply_serato_overlay", lambda: self._apply_serato_overlay(inventory)),
+        ])
+        self._bg_overlay.done.connect(self._after_overlay)
+        self._bg_overlay.start()
+
+    def _after_overlay(self) -> None:
+        if self._scan_cancelled:
+            return
         elapsed_ms = int(time.time() * 1000) - self._scan_start_ms
         delay = max(0, _MIN_SCAN_DISPLAY_MS - elapsed_ms)
         QTimer.singleShot(delay, self._start_classification_phase)
@@ -2260,6 +2420,17 @@ class DashboardWidget(QWidget):
             return
         from cratesort.src.gui.classifier_view import ClassifyProgressTally, _ClassifyWorker
 
+        # Reuse the previous run's proposals if the library hasn't changed —
+        # classification is a ~5s pure-Python pass that otherwise holds the GIL
+        # and freezes the window on every launch. The session file on disk is
+        # what the Library tab reads anyway, and it's already valid here, so
+        # there's nothing to load, re-run, or re-save: go straight through.
+        if self._classification_is_current():
+            logger.info("[timing] classification phase: skipped (session current)")
+            self._classifying = False
+            QTimer.singleShot(0, self._show_dashboard)
+            return
+
         # Files Analyzed is frozen at its final scan total rather than fed
         # from the classifier's own tally: both converge to the same number
         # (every scanned track), but the classifier counts it by accumulating
@@ -2280,6 +2451,35 @@ class DashboardWidget(QWidget):
         self._classify_worker.errored.connect(self._on_classify_phase_error)
         self._classify_worker.start()
 
+    def _classification_is_current(self) -> bool:
+        """True when classification_session.json can be reused as-is: it exists,
+        it's newer than any staged style-tag edits (which feed the classifier),
+        and it covers exactly the current set of track paths. Any add/remove/
+        move, or an edits change, forces a fresh classification pass."""
+        if not self._library_path or not self._inventory:
+            return False
+        cs = self._library_path / '_CrateSort'
+        session_file = cs / 'classification_session.json'
+        if not session_file.exists():
+            return False
+        try:
+            edits_file = cs / 'library_edits.json'
+            if edits_file.exists() and (
+                edits_file.stat().st_mtime > session_file.stat().st_mtime
+            ):
+                return False
+            data = json.loads(session_file.read_text(encoding='utf-8'))
+        except Exception:
+            return False
+        saved = {
+            t.get('path')
+            for e in data.get('entries', [])
+            for t in e.get('tracks', [])
+        }
+        saved.discard(None)
+        current = {str(r.path) for r in self._inventory}
+        return bool(saved) and saved == current
+
     def _on_classify_progress(self, done: int, total: int, info: dict) -> None:
         if self._scan_cancelled or self._classify_tally is None:
             return
@@ -2293,9 +2493,15 @@ class DashboardWidget(QWidget):
         self._classifying = False
         if self._scan_cancelled:
             return
+        logger.info(
+            "[timing] classification phase (start->finished): %d ms",
+            int(time.time() * 1000) - self._classify_start_ms,
+        )
         try:
-            session.save()
-            session.apply_library_edits()
+            with _timed("classify session.save"):
+                session.save()
+            with _timed("classify session.apply_library_edits"):
+                session.apply_library_edits()
         except Exception as exc:
             logger.warning('[Classify] Failed to save dashboard-phase session: %s', exc)
         elapsed_ms = int(time.time() * 1000) - self._classify_start_ms
@@ -2467,8 +2673,10 @@ class DashboardWidget(QWidget):
             return
         try:
             from cratesort.src.core.straggler_detector import detect_stragglers
+            known = {str(r.path) for r in self._inventory} if self._inventory else set()
             self._straggler_list = detect_stragglers(
                 self._current_crates, self._library_path, serato_dir,
+                known_library_paths=known,
             )
         except Exception as exc:
             logging.getLogger(__name__).warning(
@@ -2477,13 +2685,28 @@ class DashboardWidget(QWidget):
             self._straggler_list = []
 
     def _show_dashboard(self) -> None:
+        if self._scan_cancelled or self._summary is None:
+            return
+        # The Serato sync check + dupe + straggler passes total ~1s of pure
+        # compute/IO. Run them off the main thread so the scanning screen's
+        # mascot keeps pulsing and the comet keeps moving — a synchronous
+        # block here stops every animation dead and reads as a lock-up. The
+        # dashboard is built (fast, widget work) once they return.
+        self._scan_count.setText('Checking crates & duplicates…')
+        self._bg_post = _BgSteps(self, [
+            ("check_serato_sync", self._check_serato_sync),
+            ("run_duplicate_detection", self._run_duplicate_detection),
+            ("detect_stragglers", self._detect_stragglers),
+        ])
+        self._bg_post.done.connect(self._after_post_scan_analysis)
+        self._bg_post.start()
+
+    def _after_post_scan_analysis(self) -> None:
+        if self._scan_cancelled or self._summary is None:
+            return
         try:
-            if self._scan_cancelled or self._summary is None:
-                return
-            self._check_serato_sync()
-            self._run_duplicate_detection()
-            self._detect_stragglers()
-            self._populate_dashboard(scanning=False)
+            with _timed("populate_dashboard"):
+                self._populate_dashboard(scanning=False)
             self.scan_finished.emit()
             if self._sync_pending:
                 self.status_message.emit('Serato library changes detected. Review required.', 'amber')

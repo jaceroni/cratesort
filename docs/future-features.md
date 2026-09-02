@@ -218,7 +218,15 @@ Right now `GenreClassifier` (`classifier.py`) is purely local and has zero knowl
 
 ## Organize
 
-*(nothing tabled yet)*
+### Per-file timeout on the move step (for a truly wedged FSKit read)
+`FileOrganizer.execute()`'s per-file `shutil.copy2` has no timeout — if a single file's read wedges in uninterruptible I/O on a flaky exFAT/USB drive, the reorg stalls on that file until the kernel gives up (or forever). It's threaded so the app stays responsive, Cancel takes effect once the op returns, and the per-file rollback log makes force-quit safe — but there's no true skip. A real fix would run each copy via a killable `cp` subprocess with a timeout (like the scanner's `ParallelTagReader`). Judged not worth it 2026-09-02; revisit if a real reorg actually hangs. See `[[project-scan-process-isolation]]` §7.
+
+---
+
+## Logging
+
+### Move scan.log / unreadable-files.txt off the library drive
+Both currently write to `<library>/_CrateSort/logs/` — i.e. the same drive whose stalls we're trying to diagnose. If that drive is the problem, writing the diagnostic there can itself hang. Candidate: `~/Library/Logs/CrateSort/`. Also `DashboardWidget.refresh()` still runs dup + straggler detection synchronously on the main thread (fast now, ~0.4s, but inconsistent with `_show_dashboard`'s `_BgSteps` threading).
 
 ---
 
@@ -292,4 +300,4 @@ A lightweight standalone companion app positioned as a free lead-gen piece for C
 
 ---
 
-*Last updated: August 31, 2026*
+*Last updated: September 2, 2026*

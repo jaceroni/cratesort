@@ -1362,6 +1362,12 @@ class _InlineVideoPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # The library scan spawns worker processes (see ParallelTagReader). In a
+    # PyInstaller build every such worker re-execs this bundle, so without
+    # freeze_support() each one would relaunch the whole GUI. No-op unfrozen.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     import traceback
     def _exception_hook(exc_type, exc_value, exc_tb):
         traceback.print_exception(exc_type, exc_value, exc_tb)
