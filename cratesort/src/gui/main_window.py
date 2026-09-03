@@ -442,6 +442,10 @@ class MainWindow(QMainWindow):
         sb = QStatusBar()
         self.setStatusBar(sb)
 
+        # Footer-left shows the connected library path by default, and swaps to
+        # the selected track's full path while one is selected in a media view.
+        self._status_showing_file = False
+
         self._status_library = QLabel()
         # Explicit left margin so the path text has breathing room matching the right side
         self._status_library.setStyleSheet(
@@ -611,6 +615,7 @@ class MainWindow(QMainWindow):
             self._settings_view.load(lib)
         if index not in (1, 2):  # Clear art when leaving media views
             self._art_panel.clear()
+            self._restore_status_library_path()
 
     def _on_nav_by_id(self, nav_id: str) -> None:
         for i, (nid, _, _) in enumerate(_NAV_ITEMS):
@@ -621,6 +626,7 @@ class MainWindow(QMainWindow):
 
     def _on_library_changed(self, path: Path) -> None:
         self._settings.setValue('library_path', str(path))
+        self._status_showing_file = False
         self._status_library.setText(str(path))
         self._undo_manager.clear()
         self._apply_nav_state(self._get_app_state())
@@ -768,12 +774,21 @@ class MainWindow(QMainWindow):
             self._status_state.clear()
 
         saved_path = self._settings.value('library_path', None)
-        if saved_path:
+        if saved_path and not self._status_showing_file:
             self._status_library.setText(str(saved_path))
 
     def _update_album_art(self, file_path: str) -> None:
         """Read embedded album art and display in the sidebar panel."""
         self._art_panel.set_track(file_path)
+        if file_path:
+            self._status_showing_file = True
+            self._status_library.setText(file_path)
+
+    def _restore_status_library_path(self) -> None:
+        """Footer-left back to the connected library path (nothing selected)."""
+        self._status_showing_file = False
+        saved_path = self._settings.value('library_path', None)
+        self._status_library.setText(str(saved_path) if saved_path else '')
 
     def _show_about(self) -> None:
         _ov_alert(
