@@ -598,6 +598,28 @@ Every ffmpeg `Popen` call must include `stdin=subprocess.DEVNULL` and `-nostdin`
 
 There is no format/file-type dropdown and no "Add Tracks to Library" button — both were removed. The dropdown (`_format_cb`) was cut because native-macOS Qt style ignores the QSS box model for `QComboBox` (wrong rendered height regardless of `setFixedHeight`, plus its own native arrow instead of the QSS-defined one) — rather than keep working around a native-widget quirk for one dropdown, it was removed outright. "Add Tracks to Library" (a file-picker dialog + background scanner worker, `_AddTracksPickerDialog`/`_AddTracksWorker` in `main_window.py`) was removed because it was redundant: `_ScanWorker` already does a full folder walk on every library load, so files dropped straight into the library folder are picked up automatically next time it's opened — exactly the assumption already baked into the Organize tab's "Open Library Folder" button, which is the surviving, simpler pattern for adding tracks.
 
+### Tab-switch load caching (2026-09-02)
+
+`_on_nav` calls `library_browser.load()` / `crate_manager.load()` on **every** visit, each
+rebuilding the whole tree — which also janked the screen-slide animation running alongside it.
+Both `load()` methods now take a disk-state signature (`_library_load_signature` /
+`_crate_load_signature` — inventory identity + `len` + mtimes of the classification session,
+`library_edits.json`, `.crate`/`.scrate` files, `neworder.pref`, consolidation logs) and
+early-return when it's unchanged and the tree is already populated. Any classify run, inline
+edit, crate reorder, smart-crate change, Rinse consolidation, or rescan (new inventory object)
+bumps the signature, so real changes still reload. library_browser's deliberate no-early-return
+behaviour is preserved by including the session-file mtime.
+
+### Footer path (status bar left slot)
+
+`main_window._status_library` shows the connected library path by default, and swaps to the
+**selected track's full path** while a track is selected in Library or Crates (via the existing
+`album_art_requested` / `_update_album_art` hook, guarded by `_status_showing_file` so status
+messages don't clobber it). Reverts on leaving those tabs, on library change, and on selecting
+a non-track row — `LibraryBrowserView.track_deselected` / `CrateManagerView.track_deselected`
+→ `_restore_status_library_path`. The Library tree's first column header is **"Artist / Title"**
+(expanded artist rows show track titles there).
+
 ---
 
 ## Crate Manager — Current Architecture
@@ -635,6 +657,50 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 - Ghost drag pixmap: teal pill showing track title (single) or "N tracks" (multi), built in `startDrag()` using `QFontMetrics` + `QPainter`.
 - Multi-track drag: `startDrag()` collects all selected rows by `{idx.row() for idx in self.selectedIndexes()}`.
 
+### Track table — virtualized (QTableView + `_TrackTableModel`, 2026-09-03)
+
+The track table was migrated from `QTableWidget` to a virtualized `QTableView` backed by
+`_TrackTableModel(QAbstractTableModel)`. Reason: on a ~20k-track library the old widget
+materialized ~13 cols × 20k `QTableWidgetItem`s synchronously on the main thread (the "All
+Tracks" default view) — a 5–7s beachball. The model just holds the row dicts the
+`_CrateLoadWorker` already produces off-thread; `set_rows()` is a `beginResetModel`/
+`endResetModel` (~5ms).
+
+- `_ReorderableTable` is now a `QTableView` subclass. Its drag-reorder / cross-widget drag /
+  hand-drawn teal drop-line are unchanged; they read row order from `model.index(r,c).data(role)`
+  instead of cells. `_ORIG_PATH_ROLE` = the crate's stored track-reference string; `UserRole` =
+  the resolved absolute path.
+- Sorting is in the model (`_TrackTableModel.sort` — reorders `_rows`, remaps persistent
+  indexes so selection survives; numeric keys for `#`, BPM, Year, Bitrate, Duration, Date).
+  `setSortingEnabled(True)` stays on the view; `_on_header_clicked` → `_persist_current_sort`
+  unchanged.
+- Search filter still uses `QTableView.setRowHidden` (per-row-index). **`set_rows()` does NOT
+  clear those flags the way `setRowCount(0)` used to** — every (re)load must call
+  `_clear_row_hidden()` or a prior crate's filter leaks by index into the next crate.
+- Inline edit: `setIndexWidget` instead of `setCellWidget` (`_set_cell_editor`). Now-playing /
+  hover-play icons are a `DecorationRole` on the model, driven by `set_now_playing` /
+  `set_hover_row`. The post-edit row "flash" is a transient `ForegroundRole` (`set_flash` +
+  `QTimer`). `EditTrackMetadataCommand` patches via `model.find_row_by_path` + `model.set_display`.
+- Cell reads throughout `crate_manager.py` go through model accessors: `track_path_at(row)`,
+  `orig_path_at(row)`, `display_at(row, col)`, `find_row_by_path(path)`.
+
+### CrateReader hardening (2026-09-03)
+
+- **Resolution is in-memory, not filesystem.** `_resolve_single` used to call `Path.exists()`
+  per crate-track reference (× every track × every crate, twice) — ~6s on a 190-crate / 20k
+  library on a media drive, for counts nothing in the GUI consumes. It now matches against an
+  NFC-normalized `set` of the scanned inventory plus an unambiguous-basename count index. The
+  filesystem fallback is kept only for the no-inventory (CLI/test) path.
+- **macOS AppleDouble sidecars ignored.** Writing a `.crate` onto exFAT/SMB makes macOS drop a
+  `._<name>.crate` next to it; `rglob('*.crate')` matched those and produced phantom crates.
+  Any file whose name starts with `._` is skipped in `CrateReader`, `SmartCrateReader`,
+  `PathRewriter`, and `crate_writer.read_crate_order`'s name set.
+- **Serato system crates hidden.** Serato DJ's Stems feature auto-creates (and re-creates)
+  `_Serato_/Subcrates/Serato Stems/Stems.crate`. `CrateReader.read()` drops any crate whose
+  top-level path segment is in `_SERATO_SYSTEM_CRATES` (`{'serato stems'}` — extend as needed),
+  plus anything nested under it, and scrubs it from parents' `children` lists. CrateSort has
+  no code path that *creates* a named crate — every `.crate` write is a user action.
+
 ### CrateItemDelegate — five states
 
 | State | Trigger | Background | Left Bar |
@@ -666,6 +732,39 @@ Tracks can be dragged from the track panel and dropped onto a crate in the crate
 | 11 | Bitrate |
 | 12 | Comments |
 | 13 | File Path |
+
+---
+
+## Rinse (Duplicate Review) — Architecture (reworked 2026-09-02)
+
+`src/gui/duplicate_review_view.py` — full-screen takeover launched from the dashboard stat
+card. `QStackedWidget`: 0 = results, 1 = consolidation progress, 2 = celebration. Detector
+(`core/duplicate_detector.py`) produces two tiers — `true_duplicate` (red) and `variant`
+(orange). Consolidation runs through `core/duplicate_consolidator.py` on a `QThread`.
+
+**Copy rule (locked):** never "delete" — the flow is *consolidation*. The confirm dialog and
+its button say "Consolidate".
+
+**Model — opt-in, per group:**
+- Every group renders as a cheap collapsed **strip** (`_build_collapsed_card`: tier dot, song,
+  "N copies · frees X", a self-painted disclosure chevron `_DisclosureButton`). Building 200+
+  full cards up front froze the app; only groups in `self._expanded` get the full body.
+- An open card: one **radio** picks the copy to keep; every other copy is consolidated into it
+  (no per-copy checkbox — that was tried and cut as confusing). **Accept This Group** locks the
+  group's choices in and collapses it *in place* — no auto-jump to another group. **Keep All —
+  Don't Ask Again** dismisses the group (persisted by fingerprint).
+- Sticky header: `X of Y groups reviewed` + teal bar, and a filter pill row (All / True
+  duplicates / Possible variants / Needs review / Accepted) with live counts. True Duplicates
+  section header carries **Accept all remaining true duplicates**.
+- `_apply_card_change(idx)` rebuilds one card widget in place; full `_populate_results()` only
+  on load and filter switch. `hideEvent` tears down all result widgets, `showEvent` rebuilds
+  from the intact review state — so navigating away from Rinse is cheap, and
+  `main_window._switch_content` skips its `grab()` slide-snapshot for the Rinse view.
+- `consolidator.consolidate()` accepts `(group, winner, losers)` triples as well as the legacy
+  `(group, winner)` pairs.
+
+`_DisclosureButton` and the Rinse chevron are **self-painted** (`QPainter.drawPolyline`) — the
+`⌄`/`⌃` glyph chars don't render in the app font. See PyQt gotchas #24.
 
 ---
 
