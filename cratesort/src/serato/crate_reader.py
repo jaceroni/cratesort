@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -80,6 +81,19 @@ class CrateReader:
                 crates={},
                 top_level=[],
             )
+
+        # Precompute O(1) resolution structures. Resolving each crate-track
+        # reference with Path.exists() is a filesystem stat syscall per track —
+        # 190 crates x hundreds of tracks each was ~6s of syscalls on a media
+        # drive. Match against the in-memory library index instead.
+        self._inv_norm: set[str] = set()
+        self._inv_name_counts: dict[str, int] = {}
+        if inventory_paths:
+            _nfc = unicodedata.normalize
+            for p in inventory_paths:
+                self._inv_norm.add(_nfc('NFC', str(p)))
+                nm = p.name
+                self._inv_name_counts[nm] = self._inv_name_counts.get(nm, 0) + 1
 
         crates: dict[str, Crate] = {}
 
@@ -187,25 +201,25 @@ class CrateReader:
         Check whether a track path resolves to a local file inside the library.
         Tries: (1) relative to library root, (2) as an absolute path,
         (3) an *unambiguous* filename match against the inventory.
-        """
-        # Try relative to library root (most common case)
-        candidate = self._library_root / track_path
-        if candidate.exists():
-            return True
 
-        # Try absolute path as-is (path from original drive might resolve)
+        When an inventory is supplied this is a pure in-memory lookup (no
+        filesystem stat) — see the index built in read().
+        """
+        if inventory_paths is not None:
+            _nfc = unicodedata.normalize
+            if _nfc('NFC', str(self._library_root / track_path)) in self._inv_norm:
+                return True
+            if _nfc('NFC', track_path) in self._inv_norm:
+                return True
+            # Unambiguous basename match only (a fuzzy stem fallback used to
+            # bind unrelated same-ish files and was removed).
+            return self._inv_name_counts.get(Path(track_path).name, 0) == 1
+
+        # No inventory (CLI / tests): fall back to the filesystem.
+        if (self._library_root / track_path).exists():
+            return True
         if Path(track_path).exists():
             return True
-
-        # Filename match against the local inventory — only when exactly one
-        # file has that basename. The fuzzy substring-stem fallback was
-        # removed: it reported unrelated files as "resolved" (e.g. a
-        # straggler outside the library matching a same-ish in-library name).
-        if inventory_paths:
-            fname = Path(track_path).name
-            if sum(1 for p in inventory_paths if p.name == fname) == 1:
-                return True
-
         return False
 
     def _build_hierarchy(self, crates: dict[str, Crate]) -> None:
