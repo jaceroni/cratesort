@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 
 SUBCRATES_DIR = 'Subcrates'
 
+# Crates Serato DJ auto-generates and manages itself (not user crates). Serato's
+# Stems feature, for example, drops a real "Serato Stems/Stems.crate" folder into
+# Subcrates. These get hidden from CrateSort's crate tree — matched on the
+# top-level path segment, case-insensitively. Add names here as they turn up.
+_SERATO_SYSTEM_CRATES = frozenset({
+    'serato stems',
+})
+
+
+def _is_serato_system_crate(full_path: str) -> bool:
+    return full_path.split('/', 1)[0].strip().lower() in _SERATO_SYSTEM_CRATES
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -124,6 +136,12 @@ class CrateReader:
         # --- Pass 2: wire up parent/child relationships ---
         # Create phantom parents for crates whose parents don't have a .crate file
         self._build_hierarchy(crates)
+
+        # Drop Serato's own auto-managed system crates (e.g. "Serato Stems") and
+        # anything nested under them — they aren't user crates.
+        crates = {fp: c for fp, c in crates.items() if not _is_serato_system_crate(fp)}
+        for c in crates.values():
+            c.children = [ch for ch in c.children if ch in crates]
 
         top_level = sorted(fp for fp, c in crates.items() if c.parent is None)
 
