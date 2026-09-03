@@ -175,6 +175,35 @@ def _show_in_finder(file_path: str) -> None:
         pass
 
 
+def _path_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _glob_sig(directory: Path, pattern: str) -> tuple:
+    """(count, newest-mtime) for files matching pattern — cheap change-detector."""
+    try:
+        files = list(directory.glob(pattern))
+    except OSError:
+        return (0, 0.0)
+    return (len(files), max((_path_mtime(f) for f in files), default=0.0))
+
+
+def _library_load_signature(inventory, library_path: Path) -> tuple:
+    """Everything library_browser.load() reads off disk. If this is unchanged
+    since the last load, a repeat load() (e.g. a plain tab switch) is a no-op
+    and can be skipped — rebuilding the 20k-row tree every visit is the stall."""
+    cs = library_path / '_CrateSort'
+    return (
+        id(inventory), len(inventory), str(library_path),
+        _path_mtime(cs / 'classification_session.json'),
+        _path_mtime(cs / 'library_edits.json'),
+        _glob_sig(cs, 'duplicate_consolidation_*.json'),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Track tree row-height delegate
 # ---------------------------------------------------------------------------
@@ -737,6 +766,7 @@ class LibraryBrowserView(QWidget):
         self._has_classification = False
         self._library_path: Optional[Path] = None
         self._loaded_inv_id: Optional[int] = None
+        self._load_sig: Optional[tuple] = None
         self._inventory = []
         self._edits: dict[str, dict[str, str]] = {}
         self._confidence_backfilled = False
@@ -805,10 +835,19 @@ class LibraryBrowserView(QWidget):
         """
         Load (or refresh) from scanner inventory + optional classification session.
 
-        The early-return cache has been removed intentionally: after the user runs
-        classification and navigates here, the same inventory object is reused (same
-        id()) but the session file on disk has changed.  Always reload the session.
+        Skips the full rebuild when nothing it reads has changed since the last
+        load (see _library_load_signature) — a plain tab switch back to Library
+        would otherwise rebuild the whole 20k-row tree every time. The signature
+        includes the classification-session and edits file mtimes, so a reload
+        after classify / inline edits / a Rinse consolidation still goes through.
         """
+        sig = _library_load_signature(inventory, library_path)
+        if (sig == self._load_sig
+                and self._tree.topLevelItemCount() > 0
+                and self._library_path == library_path):
+            return
+        self._load_sig = sig
+
         # A genuine library change invalidates the remembered tree state
         # (artist names won't carry over); a same-library reload (tab switch,
         # post-classify refresh) keeps it. Gate the save below on this.

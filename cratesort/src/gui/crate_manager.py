@@ -516,6 +516,39 @@ def _show_in_finder(file_path: str) -> None:
         pass
 
 
+def _path_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _glob_sig(directory: Path, pattern: str) -> tuple:
+    """(count, newest-mtime) for files matching pattern — cheap change-detector."""
+    try:
+        files = list(directory.glob(pattern))
+    except OSError:
+        return (0, 0.0)
+    return (len(files), max((_path_mtime(f) for f in files), default=0.0))
+
+
+def _crate_load_signature(inventory, library_path: Path) -> tuple:
+    """Everything crate_manager.load() reads off disk. Unchanged since last load
+    ⇒ a repeat load() (plain tab switch) is a no-op and can be skipped instead of
+    re-reading every .crate/.scrate and rebuilding the tree. Any crate edit,
+    reorder, smart-crate change, or inline edit bumps one of these mtimes."""
+    serato = library_path / '_Serato_'
+    cs     = library_path / '_CrateSort'
+    return (
+        id(inventory), len(inventory), str(library_path),
+        _glob_sig(serato / 'Subcrates',   '*.crate'),
+        _glob_sig(serato / 'Smartcrates', '*.scrate'),
+        _path_mtime(serato / 'neworder.pref'),
+        _path_mtime(cs / 'library_edits.json'),
+        _path_mtime(cs / 'classification_session.json'),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Add Tracks dialog
 # ---------------------------------------------------------------------------
@@ -1547,6 +1580,7 @@ class CrateManagerView(QWidget):
 
         # Crate order persistence (Fix 3)
         self._crate_order: dict[str, list[str]] = {}  # "" = top-level; path = children of that crate
+        self._load_sig: Optional[tuple] = None       # skip redundant full reloads on tab switch
 
         # Expanded state preserved across tab switches
         self._expanded_paths: set[str] = set()
@@ -1589,6 +1623,16 @@ class CrateManagerView(QWidget):
     # ── Public API ────────────────────────────────────────────────────
 
     def load(self, inventory, library_path: Path) -> None:
+        # Skip the full re-read + tree rebuild when nothing on disk has changed
+        # since the last load (plain tab switch back to Crates). Any crate edit,
+        # reorder, smart-crate change or inline edit bumps the signature.
+        sig = _crate_load_signature(inventory, library_path)
+        if (sig == self._load_sig
+                and self._library_path == library_path
+                and self._crate_tree.topLevelItemCount() > 0):
+            return
+        self._load_sig = sig
+
         self._library_path = library_path
         self._inventory    = list(inventory)
         self._inventory_by_path = {}
