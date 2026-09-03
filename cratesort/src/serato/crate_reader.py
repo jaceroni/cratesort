@@ -99,6 +99,8 @@ class CrateReader:
 
         # --- Pass 1: collect all .crate files and parse their tracks ---
         for crate_file in sorted(self._subcrates_dir.rglob('*.crate')):
+            if crate_file.name.startswith('._'):
+                continue  # macOS AppleDouble sidecar (e.g. "._TV Themes.crate"), not a crate
             full_path, parent_path, display_name = self._parse_filepath(crate_file)
             tracks, error = self._read_tracks(crate_file)
 

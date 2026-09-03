@@ -157,6 +157,8 @@ class PathRewriter:
         written_originals: list[tuple[Path, bytes]] = []
 
         for crate_file in sorted(self._subcrates_dir.rglob('*.crate')):
+            if crate_file.name.startswith('._'):
+                continue  # macOS AppleDouble sidecar, not a crate
             mods_before = result.crates_modified
             pre_bytes   = crate_file.read_bytes() if not dry_run else b''
             try:
