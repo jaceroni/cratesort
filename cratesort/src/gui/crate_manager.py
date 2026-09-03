@@ -2747,6 +2747,10 @@ class CrateManagerView(QWidget):
         self._original_track_paths = list(track_paths)
 
         self._track_model.set_rows(rows)
+        # A model reset doesn't clear the view's per-row hidden flags the way
+        # QTableWidget.setRowCount(0) used to — a prior crate's search filter
+        # would leave rows hidden by index in the next crate. Reset explicitly.
+        self._clear_row_hidden()
         self._track_table.sortByColumn(self._sort_col, self._sort_order)
         self._hover_play_row = -1
         if not self._settings.value(_SETTINGS_KEY):
@@ -2764,7 +2768,13 @@ class CrateManagerView(QWidget):
         rows = [{'resolved': False, 'track_path': tp, 'filename': Path(tp).name}
                 for tp in track_paths]
         self._track_model.set_rows(rows)
+        self._clear_row_hidden()
         self._hover_play_row = -1
+
+    def _clear_row_hidden(self) -> None:
+        for r in range(self._track_model.rowCount()):
+            if self._track_table.isRowHidden(r):
+                self._track_table.setRowHidden(r, False)
 
     # ── Track click / selection ────────────────────────────────────────
 
