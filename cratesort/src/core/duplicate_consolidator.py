@@ -59,12 +59,15 @@ class DuplicateConsolidator:
 
     def consolidate(
         self,
-        approved_groups: list[tuple[DuplicateGroup, DuplicateCopy]],
+        approved_groups: list[tuple],
         commit: bool = True,
         progress_callback=None,
     ) -> ConsolidationResult:
         """
-        approved_groups: list of (group, chosen_winner) pairs.
+        approved_groups: list of (group, chosen_winner) pairs, or
+        (group, chosen_winner, losers) triples where `losers` is the explicit
+        subset of copies to consolidate into the winner. With a 2-tuple, every
+        copy that isn't the winner is treated as a loser (legacy behavior).
         progress_callback: callable(done: int, total: int, label: str) or None.
         """
         total           = len(approved_groups)
@@ -81,12 +84,19 @@ class DuplicateConsolidator:
         rlog = RollbackLog(log_path)
         rlog.set_context(self._library_path, self._serato_dir)
 
-        for i, (group, winner) in enumerate(approved_groups):
+        for i, entry in enumerate(approved_groups):
+            if len(entry) == 3:
+                group, winner, losers = entry
+            else:
+                group, winner = entry
+                losers = [c for c in group.copies if c.file_path != winner.file_path]
+
             if progress_callback:
                 label = f'{group.canonical_artist} — {group.canonical_title}'
                 progress_callback(i, total, label)
 
-            losers = [c for c in group.copies if c.file_path != winner.file_path]
+            # Guard: never remove the winner even if a caller included it.
+            losers = [c for c in losers if c.file_path != winner.file_path]
             changes: list[PathChange] = []
 
             for loser in losers:

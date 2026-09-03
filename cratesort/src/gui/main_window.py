@@ -498,6 +498,14 @@ class MainWindow(QMainWindow):
             self._content.setCurrentIndex(index)
             return
 
+        # The duplicate-review screen holds hundreds of row widgets; grab()-ing
+        # it for the slide snapshot stalls the main thread for a beat. Entry into
+        # it already skips the animation (see _start_rinse / _on_rinse_done) — make
+        # the exit symmetric with a plain cut.
+        if outgoing is getattr(self, '_duplicate_review', None):
+            self._content.setCurrentIndex(index)
+            return
+
         forward = index > current_idx
         direction = 1 if forward else -1
 

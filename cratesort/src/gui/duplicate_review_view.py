@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import subprocess
+import sys as _sys
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QPointF, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QButtonGroup, QFrame, QHBoxLayout, QLabel, QProgressBar,
     QPushButton, QRadioButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
@@ -41,7 +44,35 @@ _STATE_RESULTS      = 0
 _STATE_PROGRESS     = 1
 _STATE_CELEBRATION  = 2
 
+# Filter modes for the results screen
+_FILTERS = (
+    ('all',            'All'),
+    ('true_duplicate', 'True duplicates'),
+    ('variant',        'Possible variants'),
+    ('needs_review',   'Needs review'),
+    ('accepted',       'Accepted'),
+)
 
+_FILTER_PILL_QSS = (
+    f'QPushButton {{ background: transparent; color: {_MUTED}; border: 1px solid #4a4a4a; '
+    f'border-radius: 6px; padding: 5px 14px; font-size: 12px; }}'
+    f'QPushButton:hover {{ color: {_CREAM}; border-color: {_CREAM}; }}'
+    f'QPushButton:checked {{ background: {_TEAL}; color: #ffffff; border-color: {_TEAL}; }}'
+)
+
+
+def _show_in_finder(file_path: str) -> None:
+    """Reveal (and select) a file in the OS file browser. Mirrors the helper
+    already used in library_browser.py / crate_manager.py / classifier_view.py."""
+    try:
+        if _sys.platform == 'darwin':
+            subprocess.run(['open', '-R', file_path], check=False)
+        elif _sys.platform == 'win32':
+            subprocess.run(['explorer', f'/select,{file_path}'], check=False)
+        else:
+            subprocess.run(['xdg-open', str(Path(file_path).parent)], check=False)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -116,25 +147,62 @@ def _winner_metadata_advantages(winner: DuplicateCopy, losers: list[DuplicateCop
 def _comment_merge_note(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> str:
     """
     Return a plain-language note about comment merging, or '' if nothing to say.
-
-    Cases:
-    - Winner has comment, at least one loser has a different comment
-      → 'comments from both copies will be merged'
-    - Winner has no comment, at least one loser has a comment
-      → 'comment from other copy will carry over'
-    - Otherwise → ''
     """
     loser_comments = [l.comment for l in losers if l.comment]
     if not loser_comments:
         return ''
     if winner.comment:
-        # Both sides have comments — they'll be merged
         if any(c != winner.comment for c in loser_comments):
             return 'comments from both copies will be merged'
         return ''
     else:
-        # Winner is blank — loser comment carries over cleanly
         return 'comment from other copy will carry over'
+
+
+# ---------------------------------------------------------------------------
+# Disclosure (expand / collapse) control
+# ---------------------------------------------------------------------------
+
+class _DisclosureButton(QPushButton):
+    """Self-painted expand/collapse chevron. A glyph char (⌄ / ⌃) does not
+    render in the app font, so the chevron is drawn directly."""
+
+    def __init__(self, expanded: bool, on_toggle: Callable[[], None], parent=None):
+        super().__init__(parent)
+        self._expanded = expanded
+        self._hover = False
+        self.setFixedSize(28, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFlat(True)
+        self.setStyleSheet('QPushButton { background: transparent; border: none; }')
+        self.setToolTip('Collapse' if expanded else 'Expand')
+        self.clicked.connect(lambda: on_toggle())
+
+    def enterEvent(self, e):  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(_CREAM if self._hover else _MUTED), 1.7)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        cx, cy = self.width() / 2, self.height() / 2
+        half, amp = 4.5, 2.4
+        if self._expanded:  # chevron points up
+            pts = [QPointF(cx - half, cy + amp), QPointF(cx, cy - amp), QPointF(cx + half, cy + amp)]
+        else:               # chevron points down
+            pts = [QPointF(cx - half, cy - amp), QPointF(cx, cy + amp), QPointF(cx + half, cy - amp)]
+        p.drawPolyline(QPolygonF(pts))
+        p.end()
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +216,7 @@ class _ConsolidationWorker(QThread):
 
     def __init__(
         self,
-        approved: list,
+        approved: list,                    # list of (group, winner, losers) triples
         library_path: Path,
         serato_dir: Path,
         parent=None,
@@ -191,6 +259,13 @@ class DuplicateReviewView(QWidget):
       1 — Progress: consolidation in progress (% complete bar)
       2 — Celebration: "Rinsed. X files cleaned up, Y GB freed."
 
+    Review model (opt-in, per-group):
+      * Every group is a cheap collapsed strip; click it to open the full card.
+      * In an open card, one radio picks the copy to keep — every other copy is
+        consolidated into it.
+      * "Accept This Group" locks that group in and moves you to the next one;
+        no other group is touched until "Consolidate Accepted Groups".
+
     Emits `done` when the user dismisses the celebration or skips entirely.
     """
 
@@ -208,8 +283,17 @@ class DuplicateReviewView(QWidget):
 
         # Per-group winner overrides: group index → DuplicateCopy
         self._winner_overrides: dict[int, DuplicateCopy] = {}
-        # Per-group dismissed flags for Tier 2
+        # Groups the user has accepted (locked in, collapsed)
+        self._accepted:  set[int] = set()
+        # Groups the user chose to keep in full ("don't ask again")
         self._dismissed: set[int] = set()
+        # Groups whose full card body is currently rendered. Everything else is a
+        # cheap strip — building 700+ full cards up front freezes the app.
+        self._expanded: set[int] = set()
+
+        self._filter_mode = 'all'
+        self._card_widgets: dict[int, QWidget] = {}
+        self._filter_btns:  dict[str, QPushButton] = {}
 
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -235,9 +319,39 @@ class DuplicateReviewView(QWidget):
         self._library_path = library_path
         self._serato_dir   = serato_dir
         self._winner_overrides.clear()
+        self._accepted.clear()
         self._dismissed.clear()
+        self._expanded.clear()
+        self._filter_mode = 'all'
+        if 'all' in self._filter_btns:
+            self._filter_btns['all'].setChecked(True)
         self._populate_results()
         self._stack.setCurrentIndex(_STATE_RESULTS)
+
+    # ── Off-stage teardown ────────────────────────────────────────────────
+    # A big library can produce 700+ group rows. Keeping them all alive while
+    # the user is on another screen weighs on the whole app (and makes the
+    # screen-switch snapshot slow). Free them on hide; rebuild from the same
+    # review state on show. State (accepted / expanded / winner overrides)
+    # lives in plain dicts on self and is never touched here.
+
+    def _clear_result_widgets(self) -> None:
+        while self._results_layout.count() > 1:
+            item = self._results_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._card_widgets.clear()
+
+    def hideEvent(self, event):  # noqa: N802
+        super().hideEvent(event)
+        if self._card_widgets:
+            self._clear_result_widgets()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        if (self._groups and not self._card_widgets
+                and self._stack.currentIndex() == _STATE_RESULTS):
+            self._populate_results()
 
     # ── Results screen (State 0) ────────────────────────────────────────────
 
@@ -251,8 +365,12 @@ class DuplicateReviewView(QWidget):
         # Header bar
         hdr = QFrame()
         hdr.setStyleSheet(f'background: {_PANEL}; border: none;')
-        hdr_row = QHBoxLayout(hdr)
-        hdr_row.setContentsMargins(32, 20, 32, 20)
+        hdr_col = QVBoxLayout(hdr)
+        hdr_col.setContentsMargins(32, 20, 32, 20)
+        hdr_col.setSpacing(12)
+
+        hdr_row = QHBoxLayout()
+        hdr_row.setContentsMargins(0, 0, 0, 0)
 
         title_col = QVBoxLayout()
         title_lbl = QLabel('Rinse Your Library')
@@ -273,16 +391,63 @@ class DuplicateReviewView(QWidget):
         self._skip_btn.clicked.connect(self.done.emit)
         hdr_row.addWidget(self._skip_btn)
 
-        self._consolidate_btn = QPushButton('Consolidate Checked')
+        self._consolidate_btn = QPushButton('Consolidate Accepted Groups')
         self._consolidate_btn.setFixedHeight(36)
         self._consolidate_btn.setStyleSheet(
             f'QPushButton {{ background: {_TEAL}; color: #ffffff; border: none; '
             f'border-radius: 6px; padding: 0 20px; font-weight: 600; }}'
             f'QPushButton:hover {{ background: #38706a; }}'
             f'QPushButton:pressed {{ background: #2d6358; }}'
+            f'QPushButton:disabled {{ background: #3a3a3a; color: {_DIM}; }}'
         )
         self._consolidate_btn.clicked.connect(self._on_consolidate)
         hdr_row.addWidget(self._consolidate_btn)
+        hdr_col.addLayout(hdr_row)
+
+        # Progress anchor — "X of Y groups reviewed"
+        self._progress_row_w = QWidget()
+        self._progress_row_w.setStyleSheet('background: transparent;')
+        prog_row = QHBoxLayout(self._progress_row_w)
+        prog_row.setContentsMargins(0, 2, 0, 2)
+        prog_row.setSpacing(12)
+        self._review_progress_lbl = QLabel()
+        self._review_progress_lbl.setStyleSheet(
+            f'color: {_MUTED}; font-size: 12px; background: transparent; border: none;'
+        )
+        self._review_progress_bar = QProgressBar()
+        self._review_progress_bar.setTextVisible(False)
+        self._review_progress_bar.setFixedHeight(8)
+        self._review_progress_bar.setStyleSheet(
+            f'QProgressBar {{ background: {_SEP}; border: none; border-radius: 4px; }}'
+            f'QProgressBar::chunk {{ background: {_TEAL}; border-radius: 4px; }}'
+        )
+        prog_row.addWidget(self._review_progress_lbl)
+        prog_row.addWidget(self._review_progress_bar, stretch=1)
+        hdr_col.addWidget(self._progress_row_w)
+
+        # Filter bar
+        self._filter_row_w = QWidget()
+        self._filter_row_w.setStyleSheet('background: transparent;')
+        filt_row = QHBoxLayout(self._filter_row_w)
+        filt_row.setContentsMargins(0, 4, 0, 6)
+        filt_row.setSpacing(8)
+        self._filter_group = QButtonGroup(w)
+        self._filter_group.setExclusive(True)
+        for mode, base_label in _FILTERS:
+            b = QPushButton(base_label)
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setMinimumHeight(30)
+            b.setStyleSheet(_FILTER_PILL_QSS)
+            b._base_label = base_label  # type: ignore[attr-defined]
+            if mode == 'all':
+                b.setChecked(True)
+            b.clicked.connect(lambda _c=False, m=mode: self._on_filter_changed(m))
+            self._filter_group.addButton(b)
+            self._filter_btns[mode] = b
+            filt_row.addWidget(b)
+        filt_row.addStretch()
+        hdr_col.addWidget(self._filter_row_w)
 
         outer.addWidget(hdr)
 
@@ -291,12 +456,13 @@ class DuplicateReviewView(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet(f'QScrollArea {{ background: {_BG}; border: none; }}')
+        self._results_scroll = scroll
 
         self._results_content = QWidget()
         self._results_content.setStyleSheet(f'background: {_BG};')
         self._results_layout = QVBoxLayout(self._results_content)
         self._results_layout.setContentsMargins(32, 24, 32, 32)
-        self._results_layout.setSpacing(24)
+        self._results_layout.setSpacing(14)
         self._results_layout.addStretch()
 
         scroll.setWidget(self._results_content)
@@ -304,16 +470,53 @@ class DuplicateReviewView(QWidget):
 
         return w
 
+    # ── Filtering ──────────────────────────────────────────────────────────
+
+    def _on_filter_changed(self, mode: str) -> None:
+        self._filter_mode = mode
+        self._populate_results()
+        self._results_scroll.verticalScrollBar().setValue(0)
+
+    def _passes_filter(self, idx: int, group: DuplicateGroup) -> bool:
+        m = self._filter_mode
+        if m == 'all':
+            return True
+        if m in ('true_duplicate', 'variant'):
+            return group.tier == m
+        if m == 'needs_review':
+            return idx not in self._accepted and idx not in self._dismissed
+        if m == 'accepted':
+            return idx in self._accepted
+        return True
+
+    def _ensure_one_expanded(self) -> Optional[int]:
+        """Keep exactly one reviewable group open to work on. Returns the index
+        newly expanded, or None if one was already open / nothing to open."""
+        reviewable = [
+            i for i, g in enumerate(self._groups)
+            if i not in self._accepted and i not in self._dismissed
+            and self._passes_filter(i, g)
+        ]
+        if reviewable and not (self._expanded & set(reviewable)):
+            self._expanded.add(reviewable[0])
+            return reviewable[0]
+        return None
+
+    # ── Results population ─────────────────────────────────────────────────
+
     def _populate_results(self) -> None:
         # Clear old content (keep the trailing stretch)
         while self._results_layout.count() > 1:
             item = self._results_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._card_widgets.clear()
 
-        # Skipped-track disclosure — shown before any results, every time
+        def insert(wdg: QWidget) -> None:
+            self._results_layout.insertWidget(self._results_layout.count() - 1, wdg)
+
         skipped = self._summary.skipped_count if self._summary else 0
-        if skipped > 0:
+        if skipped > 0 and self._filter_mode == 'all':
             n = skipped
             notice = QLabel(
                 f'{n:,} untagged track{"s" if n != 1 else ""} '
@@ -323,48 +526,55 @@ class DuplicateReviewView(QWidget):
             notice.setStyleSheet(
                 f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
             )
-            self._results_layout.insertWidget(0, notice)
+            insert(notice)
 
-        tier1 = [g for g in self._groups if g.tier == 'true_duplicate']
-        tier2 = [g for g in self._groups if g.tier == 'variant']
+        tier1 = [(i, g) for i, g in enumerate(self._groups) if g.tier == 'true_duplicate']
+        tier2 = [(i, g) for i, g in enumerate(self._groups) if g.tier == 'variant']
 
-        if tier1:
-            self._results_layout.insertWidget(
-                self._results_layout.count() - 1,
-                self._build_section_header(
-                    f'True Duplicates — {len(tier1)} group{"s" if len(tier1) != 1 else ""}',
-                    'Same file found in multiple locations. '
-                    'We\'ve selected the best copy — confirm or choose a different one.',
-                    _RED,
-                )
-            )
-            for i, g in enumerate(self._groups):
-                if g.tier == 'true_duplicate':
-                    self._results_layout.insertWidget(
-                        self._results_layout.count() - 1,
-                        self._build_group_card(i, g),
+        self._ensure_one_expanded()
+
+        def render_section(
+            title_base: str, subtitle: str, accent: str,
+            entries: list[tuple[int, DuplicateGroup]], is_true: bool,
+        ) -> None:
+            visible = [(i, g) for i, g in entries if self._passes_filter(i, g)]
+            if not visible:
+                return
+            action: Optional[tuple[str, Callable[[], None]]] = None
+            if is_true and self._filter_mode != 'accepted':
+                remaining = [
+                    i for i, _g in entries
+                    if i not in self._accepted and i not in self._dismissed
+                ]
+                if remaining:
+                    action = (
+                        'Accept all remaining true duplicates',
+                        lambda r=remaining: self._on_accept_all_true(r),
                     )
+            n = len(entries)
+            insert(self._build_section_header(
+                f'{title_base} — {n} group{"s" if n != 1 else ""}',
+                subtitle, accent, action=action,
+            ))
+            for i, g in visible:
+                card = self._build_group_card(i, g)
+                self._card_widgets[i] = card
+                insert(card)
 
-        if tier2:
-            self._results_layout.insertWidget(
-                self._results_layout.count() - 1,
-                self._build_section_header(
-                    f'Possible Variants — {len(tier2)} group{"s" if len(tier2) != 1 else ""}',
-                    'Looks like different versions of the same song. '
-                    'Confirm if any are actual duplicates you want to consolidate.',
-                    _ORANGE,
-                )
-            )
-            for i, g in enumerate(self._groups):
-                if g.tier == 'variant':
-                    self._results_layout.insertWidget(
-                        self._results_layout.count() - 1,
-                        self._build_group_card(i, g),
-                    )
+        render_section(
+            'True Duplicates',
+            'Same file found in multiple locations. '
+            'We\'ve selected the best copy — confirm or choose a different one.',
+            _RED, tier1, True,
+        )
+        render_section(
+            'Possible Variants',
+            'Looks like different versions of the same song. '
+            'Confirm if any are actual duplicates you want to consolidate.',
+            _ORANGE, tier2, False,
+        )
 
-        has_actionable = any(i not in self._dismissed for i in range(len(self._groups)))
-        self._consolidate_btn.setVisible(has_actionable)
-
+        # Empty states
         if not tier1 and not tier2:
             if skipped > 0:
                 headline = QLabel('Nothing to review.')
@@ -382,28 +592,116 @@ class DuplicateReviewView(QWidget):
                 body.setStyleSheet(
                     f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
                 )
-                self._results_layout.insertWidget(
-                    self._results_layout.count() - 1, headline
-                )
-                self._results_layout.insertWidget(
-                    self._results_layout.count() - 1, body
-                )
+                insert(headline)
+                insert(body)
             else:
                 empty = QLabel('No duplicates found. Your library is clean.')
                 empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 empty.setStyleSheet(
                     f'color: {_MUTED}; font-size: 14px; background: transparent; border: none;'
                 )
-                self._results_layout.insertWidget(0, empty)
+                insert(empty)
+        elif not self._card_widgets:
+            msg = {
+                'accepted':      'No groups accepted yet. Open a group and choose "Accept This Group".',
+                'needs_review':  'Every group has been reviewed. Consolidate when you\'re ready.',
+                'true_duplicate': 'No true duplicates.',
+                'variant':       'No possible variants.',
+            }.get(self._filter_mode, 'Nothing matches this filter.')
+            lbl = QLabel(msg)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(
+                f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
+            )
+            insert(lbl)
 
-    def _build_section_header(self, title: str, subtitle: str, accent: str) -> QFrame:
+        self._refresh_progress_and_filters()
+        self._refresh_consolidate_btn()
+
+    def _apply_card_change(self, idx: int, refresh: bool = True) -> None:
+        """Rebuild just one group's widget in place. Avoids re-rendering every
+        strip (700+) on each expand / accept / collapse."""
+        old = self._card_widgets.get(idx)
+        if old is None:
+            if refresh:
+                self._refresh_progress_and_filters()
+                self._refresh_consolidate_btn()
+            return
+        pos = self._results_layout.indexOf(old)
+        self._results_layout.removeWidget(old)
+        old.deleteLater()
+        group = self._groups[idx]
+        if pos >= 0 and self._passes_filter(idx, group):
+            new = self._build_group_card(idx, group)
+            self._results_layout.insertWidget(pos, new)
+            self._card_widgets[idx] = new
+        else:
+            self._card_widgets.pop(idx, None)
+        if refresh:
+            self._refresh_progress_and_filters()
+            self._refresh_consolidate_btn()
+
+    def _refresh_progress_and_filters(self) -> None:
+        total = len(self._groups)
+        reviewed = len(self._accepted | self._dismissed)
+        self._review_progress_bar.setRange(0, max(total, 1))
+        self._review_progress_bar.setValue(reviewed)
+        self._review_progress_lbl.setText(
+            f'{reviewed} of {total} group{"s" if total != 1 else ""} reviewed'
+        )
+        has_groups = total > 0
+        self._progress_row_w.setVisible(has_groups)
+        self._filter_row_w.setVisible(has_groups)
+
+        counts = {
+            'all':            total,
+            'true_duplicate': sum(1 for g in self._groups if g.tier == 'true_duplicate'),
+            'variant':        sum(1 for g in self._groups if g.tier == 'variant'),
+            'needs_review':   sum(
+                1 for i in range(total)
+                if i not in self._accepted and i not in self._dismissed
+            ),
+            'accepted':       len(self._accepted),
+        }
+        for mode, btn in self._filter_btns.items():
+            base = getattr(btn, '_base_label', btn.text())
+            btn.setText(f'{base} ({counts[mode]})')
+
+    def _refresh_consolidate_btn(self) -> None:
+        n = len(self._accepted)
+        actionable = any(self._selected_losers_for(i) for i in self._accepted)
+        self._consolidate_btn.setVisible(n > 0)
+        self._consolidate_btn.setEnabled(actionable)
+        label = f'Consolidate Accepted Group{"s" if n != 1 else ""}'
+        if n:
+            label += f' ({n})'
+        self._consolidate_btn.setText(label)
+
+    # ── Selection helpers ──────────────────────────────────────────────────
+
+    def _winner_for(self, idx: int) -> Optional[DuplicateCopy]:
+        g = self._groups[idx]
+        return self._winner_overrides.get(idx, g.recommended_winner)
+
+    def _selected_losers_for(self, idx: int) -> list[DuplicateCopy]:
+        """Every copy in the group except the one being kept."""
+        g = self._groups[idx]
+        winner = self._winner_for(idx)
+        return [c for c in g.copies if c is not winner]
+
+    # ── Section header ─────────────────────────────────────────────────────
+
+    def _build_section_header(
+        self, title: str, subtitle: str, accent: str,
+        action: Optional[tuple[str, Callable[[], None]]] = None,
+    ) -> QFrame:
         f = QFrame()
         f.setStyleSheet('background: transparent; border: none;')
         outer = QVBoxLayout(f)
-        outer.setContentsMargins(0, 36, 0, 14)
+        outer.setContentsMargins(0, 22, 0, 6)
         outer.setSpacing(0)
 
-        # Accent bar spans the full height of title + subtitle
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(12)
@@ -427,55 +725,147 @@ class DuplicateReviewView(QWidget):
         text_col.addWidget(s)
 
         row.addLayout(text_col, stretch=1)
-        outer.addLayout(row)
 
+        if action is not None:
+            label, handler = action
+            btn = QPushButton(label)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(30)
+            btn.setStyleSheet(
+                f'QPushButton {{ background: transparent; color: {_TEAL}; '
+                f'border: 1px solid {_TEAL}; border-radius: 6px; padding: 0 14px; font-size: 12px; }}'
+                f'QPushButton:hover {{ background: rgba(66, 129, 117, 0.15); }}'
+            )
+            btn.clicked.connect(lambda _c=False, h=handler: h())
+            row.addWidget(btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        outer.addLayout(row)
         return f
+
+    # ── Group card: collapsed strip ────────────────────────────────────────
+
+    def _disclosure_btn(self, idx: int, expanded: bool) -> QPushButton:
+        """The single alternating expand/collapse affordance — no words.
+        Chevron down = click to open, chevron up = click to close. Always the
+        far-right item on a group's title line."""
+        if expanded:
+            return _DisclosureButton(True, lambda i=idx: self._on_collapse(i))
+        return _DisclosureButton(False, lambda i=idx: self._on_expand(i))
+
+    def _build_collapsed_card(self, idx: int, group: DuplicateGroup) -> QFrame:
+        """Cheap one-line strip. Click anywhere to open the full card."""
+        losers = self._selected_losers_for(idx)
+        freed  = sum(c.file_size for c in losers)
+        accent = _RED if group.tier == 'true_duplicate' else _ORANGE
+
+        card = QFrame()
+        card.setStyleSheet(
+            f'QFrame {{ background: {_PANEL}; border: 1px solid #383838; border-radius: 8px; }}'
+            f'QFrame:hover {{ border-color: #5a5a5a; }}'
+        )
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        row = QHBoxLayout(card)
+        row.setContentsMargins(20, 12, 16, 12)
+        row.setSpacing(12)
+
+        dot = QLabel('●')
+        dot.setStyleSheet(f'color: {accent}; font-size: 11px; background: transparent; border: none;')
+        row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        song_lbl = QLabel(f'{group.canonical_artist}  —  {group.canonical_title}')
+        song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 13px; font-weight: 600; background: transparent; border: none;')
+        row.addWidget(song_lbl, stretch=1, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        n = len(group.copies)
+        meta = f'{n} copies'
+        if freed:
+            meta += f'  ·  frees {fmt_bytes(freed)}'
+        meta_lbl = QLabel(meta)
+        meta_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
+        row.addWidget(meta_lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        row.addWidget(self._disclosure_btn(idx, expanded=False),
+                      alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        card.mousePressEvent = lambda _e, i=idx: self._on_expand(i)
+        return card
+
+    def _on_expand(self, idx: int) -> None:
+        if idx in self._expanded:
+            return
+        self._expanded.add(idx)
+        self._apply_card_change(idx)
+        self._scroll_to_card(idx)
+
+    def _on_collapse(self, idx: int) -> None:
+        self._expanded.discard(idx)
+        self._apply_card_change(idx)
+        self._scroll_to_card(idx)
+
+    # ── Group card: full body ──────────────────────────────────────────────
 
     def _build_group_card(self, idx: int, group: DuplicateGroup) -> QFrame:
         if idx in self._dismissed:
             return self._build_dismissed_card(idx, group)
+        if idx in self._accepted:
+            return self._build_accepted_card(idx, group)
+        if idx not in self._expanded:
+            return self._build_collapsed_card(idx, group)
 
         card = QFrame()
         card.setStyleSheet(
             f'QFrame {{ background: {_PANEL}; border: 1px solid #444444; border-radius: 8px; }}'
         )
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(12)
 
-        # Title row
-        title_row = QHBoxLayout()
+        winner = self._winner_for(idx)
+
+        # Title bar — its own row with real height so the title, savings figure
+        # and controls all sit centred on one line without the buttons clipping.
+        title_bar = QWidget()
+        title_bar.setMinimumHeight(34)
+        title_bar.setStyleSheet('background: transparent;')
+        title_row = QHBoxLayout(title_bar)
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+        _vc = Qt.AlignmentFlag.AlignVCenter
+
         song_lbl = QLabel(f'{group.canonical_artist}  —  {group.canonical_title}')
+        song_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | _vc)
         song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 14px; font-weight: 600; background: transparent; border: none;')
         title_row.addWidget(song_lbl, stretch=1)
 
-        savings_lbl = QLabel(f'saves {fmt_bytes(group.space_savings)}')
+        savings_lbl = QLabel(
+            f'frees {fmt_bytes(sum(c.file_size for c in group.copies if c is not winner))}'
+        )
         savings_lbl.setStyleSheet(f'color: {_TEAL}; font-size: 12px; background: transparent; border: none;')
-        title_row.addWidget(savings_lbl)
+        title_row.addWidget(savings_lbl, alignment=_vc)
 
         keep_all_btn = QPushButton('Keep All — Don\'t Ask Again')
         keep_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        keep_all_btn.setFixedHeight(26)
+        keep_all_btn.setMinimumHeight(28)
         keep_all_btn.setToolTip('Keep every copy in this group and never flag this exact set again')
         keep_all_btn.setStyleSheet(
             f'QPushButton {{ background: transparent; color: {_MUTED}; '
-            f'border: 1px solid #444444; border-radius: 6px; padding: 0 10px; font-size: 11px; }}'
+            f'border: 1px solid #444444; border-radius: 6px; padding: 4px 12px; font-size: 11px; }}'
             f'QPushButton:hover {{ color: {_CREAM}; border-color: {_CREAM}; }}'
         )
         keep_all_btn.clicked.connect(lambda _checked=False, i=idx: self._on_keep_all(i))
-        title_row.addWidget(keep_all_btn)
+        title_row.addWidget(keep_all_btn, alignment=_vc)
 
-        layout.addLayout(title_row)
+        title_row.addWidget(self._disclosure_btn(idx, expanded=True), alignment=_vc)
 
-        # Radio button group — one selection per group, no page rebuild
+        layout.addWidget(title_bar)
+
+        # Copy rows — one radio picks the keeper; every other copy is consolidated.
         btn_group = QButtonGroup(card)
         btn_group.setExclusive(True)
-
-        winner = self._winner_overrides.get(idx, group.recommended_winner)
-        copy_rows: list[tuple] = []
+        copy_rows: list[tuple] = []  # (radio, row_frame, copy)
 
         for copy in group.copies:
-            is_winner = (copy == winner)
+            is_winner = (copy is winner)
             radio, row = self._build_copy_row(copy, is_winner, winner, group.copies)
             btn_group.addButton(radio)
             if is_winner:
@@ -483,24 +873,53 @@ class DuplicateReviewView(QWidget):
             copy_rows.append((radio, row, copy))
             layout.addWidget(row)
 
-        def _update_selection(_btn: QRadioButton, checked: bool) -> None:
+        # Footer: live summary + Accept
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 4, 0, 0)
+        summary_lbl = QLabel()
+        summary_lbl.setWordWrap(True)
+        summary_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
+        footer.addWidget(summary_lbl, stretch=1)
+
+        accept_btn = QPushButton('Accept This Group')
+        accept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        accept_btn.setFixedHeight(32)
+        accept_btn.setStyleSheet(
+            f'QPushButton {{ background: {_TEAL}; color: #ffffff; border: none; '
+            f'border-radius: 6px; padding: 0 16px; font-size: 12px; font-weight: 600; }}'
+            f'QPushButton:hover {{ background: #38706a; }}'
+        )
+        accept_btn.clicked.connect(lambda _checked=False, i=idx: self._on_accept_group(i))
+        footer.addWidget(accept_btn)
+
+        def _refresh_footer(cur_winner: DuplicateCopy) -> None:
+            n = len(group.copies) - 1
+            summary_lbl.setText(
+                f'Keeping {cur_winner.file_path.name}  ·  {n} other '
+                f'cop{"ies" if n != 1 else "y"} consolidated into it'
+            )
+            savings_lbl.setText(
+                f'frees {fmt_bytes(sum(c.file_size for c in group.copies if c is not cur_winner))}'
+            )
+
+        def _on_winner_toggled(_btn, checked: bool) -> None:
             if not checked:
                 return
-            for r, row_frame, c in copy_rows:
+            cur = next((c for r, rf, c in copy_rows if r.isChecked()), winner)
+            self._winner_overrides[idx] = cur
+            for r, rf, c in copy_rows:
                 is_w = r.isChecked()
-                bg     = _ROW  if is_w else _ROW2
+                bg     = _ROW if is_w else _ROW2
                 border = f'2px solid {_TEAL}' if is_w else f'1px solid {_SEP}'
-                row_frame.setStyleSheet(
+                rf.setStyleSheet(
                     f'QFrame {{ background: {bg}; border: {border}; border-radius: 6px; }}'
                 )
-                if is_w:
-                    self._winner_overrides[idx] = c
+            _refresh_footer(cur)
 
-        btn_group.buttonToggled.connect(_update_selection)
+        btn_group.buttonToggled.connect(_on_winner_toggled)
 
         # Bottom note — different messaging for variants vs true duplicates
         if group.tier == 'variant':
-            # Surface any meaningful differences to help the user decide
             durations = [c.duration for c in group.copies if c.duration]
             sizes     = [c.file_size for c in group.copies if c.file_size]
             hints: list[str] = []
@@ -533,7 +952,6 @@ class DuplicateReviewView(QWidget):
             layout.addWidget(note)
 
         elif group.metadata_conflicts:
-            # Tier 1: plain-language metadata conflict note
             conflicting = [c.field.upper() for c in group.metadata_conflicts]
             if len(conflicting) == 1:
                 conflict_str = conflicting[0]
@@ -552,12 +970,12 @@ class DuplicateReviewView(QWidget):
             )
             layout.addWidget(warn)
 
+        layout.addLayout(footer)
+        _refresh_footer(winner)
         return card
 
     def _build_dismissed_card(self, idx: int, group: DuplicateGroup) -> QFrame:
-        """Collapsed state for a group the user chose to keep in full — stays
-        visible (with an Undo) for the rest of this session instead of just
-        vanishing, since dismissing is otherwise a one-way, silent action."""
+        """Collapsed state for a group the user chose to keep in full."""
         card = QFrame()
         card.setStyleSheet(
             f'QFrame {{ background: {_PANEL}; border: 1px solid #383838; border-radius: 8px; }}'
@@ -592,20 +1010,104 @@ class DuplicateReviewView(QWidget):
 
         return card
 
+    def _build_accepted_card(self, idx: int, group: DuplicateGroup) -> QFrame:
+        """Collapsed state for a group whose consolidation is locked in.
+        Nothing touches disk until 'Consolidate Accepted Groups'."""
+        winner = self._winner_for(idx)
+        n = len(self._selected_losers_for(idx))
+
+        card = QFrame()
+        card.setStyleSheet(
+            f'QFrame {{ background: {_PANEL}; border: 1px solid {_TEAL}; border-radius: 8px; }}'
+        )
+        row = QHBoxLayout(card)
+        row.setContentsMargins(20, 14, 20, 14)
+        row.setSpacing(12)
+
+        check = QLabel('✓')
+        check.setStyleSheet(f'color: {_TEAL}; font-size: 16px; font-weight: 700; background: transparent; border: none;')
+        row.addWidget(check, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(3)
+        song_lbl = QLabel(f'{group.canonical_artist}  —  {group.canonical_title}')
+        song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 13px; font-weight: 600; background: transparent; border: none;')
+        text_col.addWidget(song_lbl)
+
+        note_lbl = QLabel(
+            f'Keeping {winner.file_path.name}  ·  {n} cop{"ies" if n != 1 else "y"} consolidated in'
+        )
+        note_lbl.setWordWrap(True)
+        note_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 12px; background: transparent; border: none;')
+        text_col.addWidget(note_lbl)
+        row.addLayout(text_col, stretch=1)
+
+        edit_btn = QPushButton('Edit')
+        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit_btn.setFixedHeight(30)
+        edit_btn.setStyleSheet(
+            f'QPushButton {{ background: transparent; color: {_MUTED}; '
+            f'border: 1px solid #444444; border-radius: 6px; padding: 0 14px; font-size: 12px; }}'
+            f'QPushButton:hover {{ color: {_CREAM}; border-color: {_CREAM}; }}'
+        )
+        edit_btn.clicked.connect(lambda _checked=False, i=idx: self._on_edit_accepted(i))
+        row.addWidget(edit_btn)
+
+        return card
+
+    # ── Per-group actions ──────────────────────────────────────────────────
+
     def _on_keep_all(self, idx: int) -> None:
         group = self._groups[idx]
         self._dismissed.add(idx)
+        self._accepted.discard(idx)
+        self._expanded.discard(idx)
         self._winner_overrides.pop(idx, None)
         if self._library_path is not None:
             add_dismissed(self._library_path, group_fingerprint(group))
-        self._populate_results()
+        self._apply_card_change(idx)
 
     def _on_undo_dismiss(self, idx: int) -> None:
         group = self._groups[idx]
         self._dismissed.discard(idx)
         if self._library_path is not None:
             remove_dismissed(self._library_path, group_fingerprint(group))
-        self._populate_results()
+        self._apply_card_change(idx)
+
+    def _on_accept_group(self, idx: int) -> None:
+        if not self._selected_losers_for(idx):
+            return
+        self._accepted.add(idx)
+        self._dismissed.discard(idx)
+        self._expanded.discard(idx)
+        # Collapse in place only — never auto-jump to another group. The user
+        # decides what to open next.
+        self._apply_card_change(idx)
+
+    def _on_edit_accepted(self, idx: int) -> None:
+        self._accepted.discard(idx)
+        self._expanded.add(idx)
+        self._apply_card_change(idx)
+        self._scroll_to_card(idx)
+
+    def _on_accept_all_true(self, indices: list[int]) -> None:
+        for i in indices:
+            if i not in self._dismissed:
+                self._accepted.add(i)
+                self._expanded.discard(i)
+        for i in indices:
+            self._apply_card_change(i, refresh=False)
+        self._refresh_progress_and_filters()
+        self._refresh_consolidate_btn()
+
+    # ── Navigation helpers ─────────────────────────────────────────────────
+
+    def _scroll_to_card(self, idx: int) -> None:
+        w = self._card_widgets.get(idx)
+        if w is not None:
+            QTimer.singleShot(0, lambda: self._results_scroll.ensureWidgetVisible(w, 0, 40))
+
+    # ── Copy row ───────────────────────────────────────────────────────────
 
     def _build_copy_row(
         self,
@@ -632,6 +1134,7 @@ class DuplicateReviewView(QWidget):
             f'QRadioButton::indicator:unchecked {{ image: url("{_ICON_RADIO_OFF}"); }}'
             f'QRadioButton::indicator:checked   {{ image: url("{_ICON_RADIO_ON}");  }}'
         )
+        radio.setToolTip('Keep this copy')
         h.addWidget(radio, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         info_col = QVBoxLayout()
@@ -664,9 +1167,6 @@ class DuplicateReviewView(QWidget):
 
         others = [c for c in (all_copies or []) if c != copy]
 
-        def _differs(val, getter) -> bool:
-            return any(getter(c) != val for c in others)
-
         def _detail(text: str, color: str = _MUTED) -> QLabel:
             lbl = QLabel(text)
             lbl.setWordWrap(True)
@@ -674,9 +1174,7 @@ class DuplicateReviewView(QWidget):
             return lbl
 
         if copy.crate_count > 0:
-            info_col.addWidget(_detail(
-                f'CRATES: {copy.crate_count}'
-            ))
+            info_col.addWidget(_detail(f'CRATES: {copy.crate_count}'))
         if copy.play_count and copy.play_count > 0:
             info_col.addWidget(_detail(f'PLAYS: {copy.play_count}'))
         info_col.addWidget(_detail(
@@ -709,10 +1207,8 @@ class DuplicateReviewView(QWidget):
             info_col.addWidget(rec_lbl)
 
         elif winner is not None:
-            # Comments are always merged into the winner by Phase C Full — no warning needed.
-            # Only flag play count and crate count since those have visible impact.
             if copy.play_count and copy.play_count > (winner.play_count or 0):
-                warn = QLabel(f'Play count from this copy will be added to the winner')
+                warn = QLabel('Play count from this copy will be added to the winner')
                 warn.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
                 info_col.addWidget(warn)
             if copy.crate_count > winner.crate_count:
@@ -724,11 +1220,24 @@ class DuplicateReviewView(QWidget):
 
         h.addLayout(info_col, stretch=1)
 
-        _r = radio
+        finder_btn = QPushButton('Show in Finder')
+        finder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        finder_btn.setFixedHeight(24)
+        finder_btn.setStyleSheet(
+            f'QPushButton {{ background: transparent; color: {_MUTED}; '
+            f'border: 1px solid #444444; border-radius: 6px; padding: 2px 10px; font-size: 11px; }}'
+            f'QPushButton:hover {{ color: {_CREAM}; border-color: {_CREAM}; }}'
+        )
+        finder_btn.clicked.connect(
+            lambda _checked=False, p=str(copy.file_path): _show_in_finder(p)
+        )
+        h.addWidget(finder_btn, alignment=Qt.AlignmentFlag.AlignTop)
+
+        _r  = radio
         _fp = str(copy.file_path)
 
         def _on_row_press(_event, _radio=_r, _path=_fp) -> None:
-            _radio.toggle()
+            _radio.setChecked(True)
             self.track_selected.emit(_path)
 
         row.mousePressEvent = _on_row_press
@@ -779,12 +1288,10 @@ class DuplicateReviewView(QWidget):
         w = QWidget()
         w.setStyleSheet(f'background: {_BG};')
 
-        # Outer: vertical centering via stretches, horizontal centering via HBox
         outer = QVBoxLayout(w)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addStretch()
 
-        # Fixed-width inner container — forces text to fill a real width instead of collapsing
         inner_w = QWidget()
         inner_w.setFixedWidth(560)
         inner_w.setStyleSheet('background: transparent;')
@@ -870,27 +1377,29 @@ class DuplicateReviewView(QWidget):
     # ── Consolidation flow ──────────────────────────────────────────────────
 
     def _on_consolidate(self) -> None:
-        approved = []
-        for i, group in enumerate(self._groups):
-            if i in self._dismissed:
-                continue
-            winner = self._winner_overrides.get(i, group.recommended_winner)
-            if winner:
-                approved.append((group, winner))
+        approved: list[tuple] = []
+        for i in sorted(self._accepted):
+            group  = self._groups[i]
+            winner = self._winner_for(i)
+            losers = self._selected_losers_for(i)
+            if winner and losers:
+                approved.append((group, winner, losers))
 
         if not approved:
             self.done.emit()
             return
 
-        files_removed = sum(len(group.copies) - 1 for group, _winner in approved)
-        space_freed = sum(group.space_savings for group, _winner in approved)
+        files_removed = sum(len(losers) for _g, _w, losers in approved)
+        space_freed   = sum(c.file_size for _g, _w, losers in approved for c in losers)
         if not _ov_confirm(
             self,
             'Consolidate Duplicates',
-            f'This will permanently delete {files_removed} duplicate '
-            f'file{"s" if files_removed != 1 else ""}, freeing {fmt_bytes(space_freed)}.\n\n'
-            'This cannot be undone. Continue?',
-            confirm_text='Delete Duplicates',
+            f'This will consolidate {files_removed} extra '
+            f'cop{"ies" if files_removed != 1 else "y"} into the ones you\'re keeping '
+            f'and free {fmt_bytes(space_freed)}.\n\n'
+            'Your crates stay pointed at the copy you keep. '
+            'This can\'t be reversed from inside CrateSort.',
+            confirm_text='Consolidate',
             confirm_danger=True,
         ):
             return
