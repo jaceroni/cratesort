@@ -402,15 +402,11 @@ class EditTrackMetadataCommand(Command):
             return
 
         # Already on the right crate — patch immediately for instant feedback
-        table = self.view._track_table
-        for r in range(table.rowCount()):
-            path_cell = table.item(r, 13)  # TC_PATH = 13
-            if path_cell and path_cell.text() == self.file_path:
-                cell = table.item(r, self.field_col)
-                if cell:
-                    cell.setText(val)
-                self.view._flash_row(r)
-                break
+        model = self.view._track_model
+        r = model.find_row_by_path(self.file_path)
+        if r >= 0:
+            model.set_display(r, self.field_col, val)
+            self.view._flash_row(r)
 
     def execute(self) -> None:
         self._apply(self.new_val)

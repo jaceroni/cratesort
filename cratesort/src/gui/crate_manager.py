@@ -9,14 +9,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QDrag, QFontMetrics, QIcon, QPen, QPixmap, QPainter
+from PyQt6.QtCore import (
+    Qt, QAbstractTableModel, QEvent, QMimeData, QModelIndex, QPoint, QRect,
+    QSettings, QSize, QThread, QTimer, pyqtSignal,
+)
+from PyQt6.QtGui import QBrush, QColor, QDrag, QFont, QFontMetrics, QIcon, QPen, QPixmap, QPainter
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QCompleter, QDialog,
     QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QFileDialog, QMenu, QProgressBar, QPushButton, QSplitter,
-    QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem,
+    QStackedWidget, QStyledItemDelegate, QTableView,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -316,17 +319,228 @@ def _crate_icon(smart: bool) -> QIcon:
 # Reorderable table widget
 # ---------------------------------------------------------------------------
 
-class _NumericItem(QTableWidgetItem):
-    """Table item that sorts numerically using its integer UserRole value."""
-    def __lt__(self, other: QTableWidgetItem) -> bool:
-        try:
-            return (self.data(Qt.ItemDataRole.UserRole) or 0) < (other.data(Qt.ItemDataRole.UserRole) or 0)
-        except TypeError:
-            return super().__lt__(other)
+_ORIG_PATH_ROLE = Qt.ItemDataRole.UserRole + 1   # crate's stored track-reference string
+
+# Column → resolved-row-dict key (columns 1..13; TC_POS is handled separately)
+_COL_KEY = {
+    TC_TITLE: 'title', TC_ARTIST: 'artist', TC_ALBUM: 'album',
+    TC_DURATION: 'dur', TC_GENRE: 'genre', TC_TAGS: 'tags', TC_BPM: 'bpm',
+    TC_DATE: 'date_str', TC_FORMAT: 'fmt', TC_YEAR: 'year',
+    TC_BITRATE: 'bitrate', TC_COMMENT: 'comment', TC_PATH: 'path',
+}
+# Unresolved-row display text by column index (TC_POS + TC_TITLE filled dynamically)
+_UNRESOLVED_DISPLAY = ['', '', '', '', '—', '—', '', '—', '—', '—', '—', '—', '', 'Not found in library']
 
 
-class _ReorderableTable(QTableWidget):
-    """QTableWidget with manual row drag-to-reorder and cross-widget drag support."""
+class _TrackTableModel(QAbstractTableModel):
+    """Virtualized model backing the crate track table. Rows are the dicts the
+    _CrateLoadWorker produces (resolved rows carry every display string;
+    unresolved rows carry just track_path + filename)."""
+
+    ORIG_PATH_ROLE = _ORIG_PATH_ROLE
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[dict] = []
+        self._now_playing: Optional[str] = None
+        self._is_playing = False
+        self._hover_row = -1
+        self._flash_rows: set[int] = set()
+        self._italic = QFont()
+        self._italic.setItalic(True)
+        self._muted_brush = QBrush(QColor(_MUTED))
+        self._flash_brush = QBrush(QColor(_TEAL))
+
+    # ── Qt interface ──────────────────────────────────────────────────
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(_TRACK_HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return _TRACK_HEADERS[section]
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row, col = index.row(), index.column()
+        d = self._rows[row]
+        resolved = d.get('resolved', False)
+
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            return self._display(d, col)
+        if role == Qt.ItemDataRole.DecorationRole and col == TC_TITLE:
+            return self._title_icon(d, row)
+        if role == Qt.ItemDataRole.ToolTipRole and col == TC_COMMENT:
+            return d.get('comment') or None
+        if role == Qt.ItemDataRole.FontRole and not resolved:
+            return self._italic
+        if role == Qt.ItemDataRole.ForegroundRole:
+            if row in self._flash_rows:
+                return self._flash_brush
+            if not resolved:
+                return self._muted_brush
+        if role == _ORIG_PATH_ROLE:
+            return d.get('track_path', '')
+        if role == Qt.ItemDataRole.UserRole:
+            return self.track_path_of(d)
+        return None
+
+    # ── Display / helpers ─────────────────────────────────────────────
+    def _display(self, d: dict, col: int) -> str:
+        if col == TC_POS:
+            return str(d.get('_pos', 0))
+        if d.get('resolved'):
+            return str(d.get(_COL_KEY[col], ''))
+        if col == TC_TITLE:
+            return d.get('filename') or Path(d.get('track_path', '')).name
+        return _UNRESOLVED_DISPLAY[col]
+
+    @staticmethod
+    def track_path_of(d: dict) -> str:
+        return d.get('path_str') or d.get('track_path') or ''
+
+    def _title_icon(self, d: dict, row: int):
+        tp = self.track_path_of(d)
+        if tp and tp == self._now_playing:
+            return pause_icon() if self._is_playing else play_icon()
+        return play_icon() if row == self._hover_row else note_icon()
+
+    # ── Public API (used by the view / CrateManagerView) ──────────────
+    def set_rows(self, rows: list[dict]) -> None:
+        self.beginResetModel()
+        self._rows = list(rows)
+        for i, d in enumerate(self._rows):
+            d['_pos'] = i + 1
+        self._hover_row = -1
+        self.endResetModel()
+
+    def row_dict(self, row: int) -> Optional[dict]:
+        return self._rows[row] if 0 <= row < len(self._rows) else None
+
+    def is_resolved(self, row: int) -> bool:
+        d = self.row_dict(row)
+        return bool(d and d.get('resolved'))
+
+    def track_path_at(self, row: int) -> str:
+        d = self.row_dict(row)
+        return self.track_path_of(d) if d else ''
+
+    def orig_path_at(self, row: int) -> str:
+        d = self.row_dict(row)
+        return d.get('track_path', '') if d else ''
+
+    def display_at(self, row: int, col: int) -> str:
+        d = self.row_dict(row)
+        return self._display(d, col) if d else ''
+
+    def find_row_by_path(self, file_path: str) -> int:
+        for i, d in enumerate(self._rows):
+            if d.get('path_str') == file_path or d.get('track_path') == file_path:
+                return i
+        return -1
+
+    def ordered_orig_paths(self) -> list[str]:
+        return [d['track_path'] for d in self._rows if d.get('track_path')]
+
+    def set_display(self, row: int, col: int, value: str) -> None:
+        d = self.row_dict(row)
+        key = _COL_KEY.get(col)
+        if d is None or key is None:
+            return
+        d[key] = value
+        idx = self.index(row, col)
+        self.dataChanged.emit(idx, idx,
+                              [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
+
+    def set_now_playing(self, path, playing: bool) -> None:
+        self._now_playing = str(path) if path else None
+        self._is_playing = playing
+        self._touch_title_column()
+
+    def set_playing_state(self, playing: bool) -> None:
+        self._is_playing = playing
+        self._touch_title_column()
+
+    def set_hover_row(self, row: int) -> None:
+        if row == self._hover_row:
+            return
+        old, self._hover_row = self._hover_row, row
+        for r in (old, row):
+            if 0 <= r < len(self._rows):
+                idx = self.index(r, TC_TITLE)
+                self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+
+    def set_flash(self, row: int, on: bool) -> None:
+        if not (0 <= row < len(self._rows)):
+            return
+        if on:
+            self._flash_rows.add(row)
+        else:
+            self._flash_rows.discard(row)
+        left, right = self.index(row, 0), self.index(row, self.columnCount() - 1)
+        self.dataChanged.emit(left, right, [Qt.ItemDataRole.ForegroundRole])
+
+    def _touch_title_column(self) -> None:
+        if self._rows:
+            self.dataChanged.emit(self.index(0, TC_TITLE),
+                                  self.index(len(self._rows) - 1, TC_TITLE),
+                                  [Qt.ItemDataRole.DecorationRole])
+
+    # ── Sorting (in-place; preserves selection via persistent indexes) ─
+    def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
+        if not self._rows:
+            return
+        keyf = self._sort_key(column)
+        self.layoutAboutToBeChanged.emit()
+        persist = self.persistentIndexList()
+        by_id = {id(self._rows[ix.row()]): ix for ix in persist}
+        self._rows.sort(key=keyf, reverse=(order == Qt.SortOrder.DescendingOrder))
+        froms, tos = [], []
+        for new_r, d in enumerate(self._rows):
+            ix = by_id.get(id(d))
+            if ix is not None:
+                froms.append(ix)
+                tos.append(self.index(new_r, ix.column()))
+        if froms:
+            self.changePersistentIndexList(froms, tos)
+        self.layoutChanged.emit()
+
+    def _sort_key(self, col: int):
+        if col == TC_POS:
+            return lambda d: d.get('_pos', 0)
+        if col == TC_DURATION:
+            return lambda d: d.get('duration_secs', 0.0) or 0.0
+        if col == TC_DATE:
+            return lambda d: d.get('date_ts', 0) or 0
+        if col in (TC_BPM, TC_YEAR):
+            def _num(d, c=col):
+                try:
+                    return (0, float(self._display(d, c)))
+                except (TypeError, ValueError):
+                    return (1, 0.0)
+            return _num
+        if col == TC_BITRATE:
+            def _br(d):
+                try:
+                    return (0, int(self._display(d, TC_BITRATE).split()[0]))
+                except (TypeError, ValueError, IndexError):
+                    return (1, 0)
+            return _br
+        return lambda d, c=col: self._display(d, c).lower()
+
+
+class _ReorderableTable(QTableView):
+    """Virtualized QTableView with manual row drag-to-reorder + cross-widget drag."""
 
     rows_reordered = pyqtSignal(list)  # list[str] — new order of original track paths
 
@@ -339,7 +553,7 @@ class _ReorderableTable(QTableWidget):
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
 
         # Teal drop indicator line (overlay on viewport)
-        self._drop_line = QFrame(self.viewport() if self.viewport() else self)
+        self._drop_line = QFrame(self.viewport())
         self._drop_line.setFrameShape(QFrame.Shape.HLine)
         self._drop_line.setFrameShadow(QFrame.Shadow.Plain)
         self._drop_line.setStyleSheet('background: #428175; border: none;')
@@ -347,20 +561,32 @@ class _ReorderableTable(QTableWidget):
         self._drop_line.hide()
         self._drop_insert_row: int = -1
 
+    # ── small helpers over the model ─────────────────────────────────
+    def _row_count(self) -> int:
+        m = self.model()
+        return m.rowCount() if m is not None else 0
+
+    def _orig_path(self, row: int) -> str:
+        m = self.model()
+        if m is None:
+            return ''
+        return m.index(row, TC_TITLE).data(_ORIG_PATH_ROLE) or ''
+
     def _get_insert_row(self, y: int) -> int:
         """Return the row index to insert BEFORE, based on cursor y position."""
         row = self.rowAt(y)
         if row == -1:
-            return self.rowCount()
+            return self._row_count()
         rect = self.visualRect(self.model().index(row, 0))
         return row + 1 if y > rect.center().y() else row
 
     def _position_drop_line(self, insert_before: int) -> None:
         vp = self.viewport()
+        n = self._row_count()
         if insert_before <= 0:
             y = 0
-        elif insert_before >= self.rowCount():
-            last = self.visualRect(self.model().index(self.rowCount() - 1, 0))
+        elif insert_before >= n:
+            last = self.visualRect(self.model().index(n - 1, 0))
             y = last.bottom()
         else:
             r = self.visualRect(self.model().index(insert_before, 0))
@@ -418,14 +644,7 @@ class _ReorderableTable(QTableWidget):
             event.ignore()
             return
 
-        # Read current visual order of original crate track paths
-        current_order: list[str] = []
-        for r in range(self.rowCount()):
-            cell = self.item(r, TC_TITLE)  # TC_TITLE = 1
-            if cell:
-                orig = cell.data(Qt.ItemDataRole.UserRole + 1)
-                if orig:
-                    current_order.append(orig)
+        current_order = [p for p in (self._orig_path(r) for r in range(self._row_count())) if p]
 
         source_set   = set(source_rows)
         source_paths = [current_order[r] for r in source_rows if r < len(current_order)]
@@ -443,13 +662,7 @@ class _ReorderableTable(QTableWidget):
 
     def startDrag(self, supported_actions) -> None:
         rows  = sorted({idx.row() for idx in self.selectedIndexes()})
-        paths: list[str] = []
-        for r in rows:
-            cell = self.item(r, TC_TITLE)
-            if cell:
-                orig = cell.data(Qt.ItemDataRole.UserRole + 1)
-                if orig:
-                    paths.append(orig)
+        paths = [p for p in (self._orig_path(r) for r in rows) if p]
         if not paths:
             super().startDrag(supported_actions)
             return
@@ -462,8 +675,9 @@ class _ReorderableTable(QTableWidget):
         # Ghost pixmap: teal pill showing track title or "N tracks"
         n = len(paths)
         if n == 1:
-            title_cell = self.item(rows[0], TC_TITLE)
-            label = title_cell.text() if title_cell else paths[0].rsplit('/', 1)[-1]
+            m = self.model()
+            label = (m.index(rows[0], TC_TITLE).data(Qt.ItemDataRole.DisplayRole)
+                     if m is not None else None) or paths[0].rsplit('/', 1)[-1]
         else:
             label = f'{n} tracks'
 
@@ -1605,6 +1819,7 @@ class CrateManagerView(QWidget):
         # Pre-initialize so eventFilter never raises AttributeError
         # if events fire during _build_crate_panel() before _build_track_panel() runs
         self._track_table: Optional[_ReorderableTable] = None  # type: ignore[assignment]
+        self._track_model: _TrackTableModel                    # set in _build_track_panel
         self._load_worker:   Optional[_CrateLoadWorker]       = None
         self._export_worker: Optional[_ExportCrateWorker]     = None
         self._export_dialog: Optional[_ExportProgressDialog]  = None
@@ -1984,8 +2199,8 @@ class CrateManagerView(QWidget):
         layout.setSpacing(0)
 
         self._track_table = _ReorderableTable()
-        self._track_table.setColumnCount(len(_TRACK_HEADERS))
-        self._track_table.setHorizontalHeaderLabels(_TRACK_HEADERS)
+        self._track_model = _TrackTableModel(self._track_table)
+        self._track_table.setModel(self._track_model)
 
         hdr = self._track_table.horizontalHeader()
         hdr.setSectionsMovable(True)
@@ -1997,17 +2212,17 @@ class CrateManagerView(QWidget):
 
         self._track_table.verticalHeader().setVisible(False)
         self._track_table.setSelectionBehavior(
-            QTableWidget.SelectionBehavior.SelectRows
+            QAbstractItemView.SelectionBehavior.SelectRows
         )
         self._track_table.setSelectionMode(
-            QTableWidget.SelectionMode.ExtendedSelection
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self._track_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers
+            QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self._track_table.setAlternatingRowColors(True)
         self._track_table.setShowGrid(True)
-        self._track_table.setStyleSheet('QTableWidget { gridline-color: #383838; }')
+        self._track_table.setStyleSheet('QTableView { gridline-color: #383838; }')
 
         from PyQt6.QtGui import QPalette
         _pal = self._track_table.palette()
@@ -2023,8 +2238,8 @@ class CrateManagerView(QWidget):
         self._track_table.setSortingEnabled(True)
         self._track_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._track_table.customContextMenuRequested.connect(self._on_track_context_menu)
-        self._track_table.itemClicked.connect(self._on_track_clicked)
-        self._track_table.itemDoubleClicked.connect(self._on_track_double_clicked)
+        self._track_table.clicked.connect(self._on_track_clicked)
+        self._track_table.doubleClicked.connect(self._on_track_double_clicked)
         self._track_table.installEventFilter(self)
         self._track_table.viewport().installEventFilter(self)
         # Hover the note icon → play glyph; click it → load/pause in the player.
@@ -2320,16 +2535,14 @@ class CrateManagerView(QWidget):
 
     def _filter_tracks(self, text: str) -> None:
         q = text.lower().strip()
-        for row in range(self._track_table.rowCount()):
+        m = self._track_model
+        for row in range(m.rowCount()):
             if not q:
                 self._track_table.setRowHidden(row, False)
                 continue
-            title_cell  = self._track_table.item(row, TC_TITLE)
-            artist_cell = self._track_table.item(row, TC_ARTIST)
-            album_cell  = self._track_table.item(row, TC_ALBUM)
             match = any(
-                q in (cell.text().lower() if cell else '')
-                for cell in (title_cell, artist_cell, album_cell)
+                q in m.display_at(row, col).lower()
+                for col in (TC_TITLE, TC_ARTIST, TC_ALBUM)
             )
             self._track_table.setRowHidden(row, not match)
 
@@ -2531,193 +2744,36 @@ class CrateManagerView(QWidget):
         self._track_search.blockSignals(True)
         self._track_search.clear()
         self._track_search.blockSignals(False)
-        self._track_table.setSortingEnabled(False)
-        self._track_table.setRowCount(0)
-        self._track_table.setRowCount(len(rows))
         self._original_track_paths = list(track_paths)
 
-        for row_idx, row in enumerate(rows):
-            if row['resolved']:
-                self._populate_resolved_row_from_data(row_idx, row)
-            else:
-                self._populate_unresolved_row(row_idx, row['track_path'])
-
-        self._track_table.setSortingEnabled(True)
+        self._track_model.set_rows(rows)
         self._track_table.sortByColumn(self._sort_col, self._sort_order)
         self._hover_play_row = -1
-        self._refresh_now_playing_marker()
         if not self._settings.value(_SETTINGS_KEY):
             self._size_pos_column(len(rows))
             QTimer.singleShot(100, self._enforce_min_col_widths)
             QTimer.singleShot(100, self._size_artist_column)
 
-    def _populate_resolved_row_from_data(self, row: int, d: dict) -> None:
-        tp       = d['track_path']
-        path_str = d['path_str']
-
-        pos_cell = _NumericItem(str(row + 1))
-        pos_cell.setData(Qt.ItemDataRole.UserRole,     row + 1)
-        pos_cell.setData(Qt.ItemDataRole.UserRole + 1, tp)
-        self._track_table.setItem(row, TC_POS, pos_cell)
-
-        values = [
-            d['title'], d['artist'], d['album'], d['dur'], d['genre'],
-            d['tags'], d['bpm'], d['date_str'], d['fmt'], d['year'],
-            d['bitrate'], d['comment'], d['path'],
-        ]
-        for i, val in enumerate(values):
-            col  = i + 1
-            cell = QTableWidgetItem(val)
-            cell.setData(Qt.ItemDataRole.UserRole,     path_str)
-            cell.setData(Qt.ItemDataRole.UserRole + 1, tp)
-            if col == TC_TITLE:
-                cell.setIcon(_get_note_icon())
-            if col == TC_DATE and d['date_ts']:
-                cell = _NumericItem(val)
-                cell.setData(Qt.ItemDataRole.UserRole,     d['date_ts'])
-                cell.setData(Qt.ItemDataRole.UserRole + 1, tp)
-                self._track_table.setItem(row, col, cell)
-                continue
-            self._track_table.setItem(row, col, cell)
-
-        if d['comment']:
-            self._track_table.item(row, TC_COMMENT).setToolTip(d['comment'])
-
     def _populate_track_table(self, track_paths: list[str]) -> None:
+        # Only ever called with [] (an empty crate); real loads go through the
+        # worker path -> _populate_track_table_from_rows.
         self._track_search.blockSignals(True)
         self._track_search.clear()
         self._track_search.blockSignals(False)
-        self._track_table.setSortingEnabled(False)
-        self._track_table.setRowCount(0)
-        self._track_table.setRowCount(len(track_paths))
-        self._original_track_paths = list(track_paths)  # preserve for removal
-
-        for row, tp in enumerate(track_paths):
-            rec = self._resolve_track(tp)
-            if rec is not None:
-                self._populate_resolved_row(row, tp, rec)
-            else:
-                self._populate_unresolved_row(row, tp)
-
-        self._track_table.setSortingEnabled(True)
-        self._track_table.sortByColumn(self._sort_col, self._sort_order)
+        self._original_track_paths = list(track_paths)
+        rows = [{'resolved': False, 'track_path': tp, 'filename': Path(tp).name}
+                for tp in track_paths]
+        self._track_model.set_rows(rows)
         self._hover_play_row = -1
-        self._refresh_now_playing_marker()
-        # Only auto-size columns on first-ever use; once the user has set their
-        # preferred widths those are saved and we leave them alone.
-        if not self._settings.value(_SETTINGS_KEY):
-            self._size_pos_column(len(track_paths))
-            QTimer.singleShot(100, self._enforce_min_col_widths)
-            QTimer.singleShot(100, self._size_artist_column)
-
-    def _populate_resolved_row(self, row: int, track_path: str, rec) -> None:
-        edits = self._edits.get(str(rec.path), {})
-
-        path_str = str(rec.path)
-        artist_key = f'__artist__{rec.artist}' if rec.artist else ''
-        title  = edits.get('title',   rec.title  or '')
-        artist = edits.get('reassign_artist', rec.artist or '')
-        album  = edits.get('album',   rec.album  or '')
-        genre  = (
-            edits.get('genre')
-            or (self._edits.get(artist_key, {}).get('genre') if artist_key else None)
-            or self._track_genre_overrides.get(path_str)
-            or self._session_genre.get(rec.artist or '')
-            or rec.genre
-            or '—'
-        )
-        tags    = edits.get('tags',    '')
-        bpm     = edits.get('bpm',     str(round(rec.bpm)) if rec.bpm else '—')
-        year    = edits.get('year',    rec.year    or '—')
-        comment = edits.get('comment', rec.comment or '')
-        dur     = _fmt_dur(rec.duration)
-        fmt     = rec.extension.lstrip('.').upper() if rec.extension else '—'
-        bitrate = f'{rec.bitrate} kbps' if rec.bitrate else '—'
-        path    = str(rec.path)
-
-        pos_cell = _NumericItem(str(row + 1))
-        pos_cell.setData(Qt.ItemDataRole.UserRole, row + 1)    # integer for numeric sort
-        pos_cell.setData(Qt.ItemDataRole.UserRole + 1, track_path)
-        self._track_table.setItem(row, TC_POS, pos_cell)
-
-        # Resolve Date Added from Serato database V2.
-        # database V2 stores relative paths; rec.path is absolute — strip library root.
-        # The reader normalises U+F022 → ' : ', so rel_key uses real filesystem chars.
-        add_dt  = None
-        rel_key = None
-        if self._add_dates and self._library_path:
-            try:
-                rel_key = Path(path).relative_to(self._library_path).as_posix()
-                add_dt  = self._add_dates.get(rel_key)
-                # Fallback: try with Serato's private-use char in place of ' : '
-                if add_dt is None:
-                    add_dt = self._add_dates.get(rel_key.replace(' : ', ''))
-            except ValueError:
-                pass  # path not under library_path — leave add_dt as None
-
-        date_str = add_dt.strftime('%Y-%m-%d') if add_dt else '—'
-        date_ts  = int(add_dt.timestamp()) if add_dt else 0
-
-        values = [title, artist, album, dur, genre, tags, bpm, date_str, fmt, year, bitrate, comment, path]
-        for i, val in enumerate(values):
-            col  = i + 1  # shift by 1 due to TC_POS
-            cell = QTableWidgetItem(val)
-            cell.setData(Qt.ItemDataRole.UserRole, path)
-            cell.setData(Qt.ItemDataRole.UserRole + 1, track_path)  # original crate path
-            if col == TC_TITLE:
-                cell.setIcon(_get_note_icon())
-            if col == TC_DATE and date_ts:
-                # Swap for a _NumericItem so Qt sorts by the integer timestamp
-                cell = _NumericItem(val)
-                cell.setData(Qt.ItemDataRole.UserRole,     date_ts)    # numeric sort key
-                cell.setData(Qt.ItemDataRole.UserRole + 1, track_path)
-                # (UserRole is overwritten below by the general path assignment — re-set here)
-                self._track_table.setItem(row, col, cell)
-                continue
-            self._track_table.setItem(row, col, cell)
-
-        if comment:
-            self._track_table.item(row, TC_COMMENT).setToolTip(comment)
-
-    def _populate_unresolved_row(self, row: int, track_path: str) -> None:
-        filename = Path(track_path).name
-        muted    = QBrush(QColor(_MUTED))
-
-        # TC_POS cell (col 0)
-        pos_cell = _NumericItem(str(row + 1))
-        pos_cell.setData(Qt.ItemDataRole.UserRole, row + 1)    # integer for numeric sort
-        pos_cell.setData(Qt.ItemDataRole.UserRole + 1, track_path)
-        pos_cell.setForeground(muted)
-        f = pos_cell.font()
-        f.setItalic(True)
-        pos_cell.setFont(f)
-        self._track_table.setItem(row, TC_POS, pos_cell)
-
-        values = [
-            filename, '', '', '—', '—', '', '—', '—', '—', '—', '—',
-            '', 'Not found in library',
-        ]
-        for i, val in enumerate(values):
-            col  = i + 1  # shift by 1 due to TC_POS
-            cell = QTableWidgetItem(val)
-            cell.setData(Qt.ItemDataRole.UserRole, track_path)
-            cell.setData(Qt.ItemDataRole.UserRole + 1, track_path)
-            cell.setForeground(muted)
-            f = cell.font()
-            f.setItalic(True)
-            cell.setFont(f)
-            if col == TC_TITLE:
-                cell.setIcon(_get_note_icon())
-            self._track_table.setItem(row, col, cell)
 
     # ── Track click / selection ────────────────────────────────────────
 
-    def _on_track_clicked(self, item: QTableWidgetItem) -> None:
-        row       = item.row()
-        path_item = self._track_table.item(row, TC_PATH)
-        if not path_item:
+    def _on_track_clicked(self, index) -> None:
+        if not index.isValid():
             return
-        raw_path      = path_item.text()
+        raw_path = self._track_model.track_path_at(index.row())
+        if not raw_path:
+            return
         rec           = self._resolve_track(raw_path)
         resolved_path = str(rec.path) if rec else raw_path
         self.track_selected.emit(resolved_path)
@@ -2726,33 +2782,19 @@ class CrateManagerView(QWidget):
     # ── Row play/pause affordance (Title-cell note icon) ───────────────
     # Same behaviour as the Library tree: hover the icon → play glyph;
     # click → load in the bottom player; click again → pause; third → resume.
+    # The icon itself is rendered by _TrackTableModel via DecorationRole; these
+    # helpers just tell it which row is hovered / playing.
     _TITLE_ICON_HIT_WIDTH = 24  # left slice of the Title cell that acts as the button
 
     def _row_track_path(self, row: int) -> str:
-        it = self._track_table.item(row, TC_PATH)
-        return it.text() if it is not None else ''
+        return self._track_model.track_path_at(row)
 
     def _row_rec(self, row: int):
         path = self._row_track_path(row)
         return self._resolve_track(path) if path else None
 
-    def _row_icon_for(self, path_str: str, *, hovered: bool):
-        if path_str and path_str == self._now_playing_path:
-            return pause_icon() if self._is_playing else play_icon()
-        return play_icon() if hovered else note_icon()
-
-    def _set_title_icon(self, row: int, icon) -> None:
-        cell = self._track_table.item(row, TC_TITLE)
-        if cell is not None:
-            cell.setIcon(icon)
-
-    def _restore_row_icon(self, row: int) -> None:
-        if 0 <= row < self._track_table.rowCount():
-            self._set_title_icon(row, self._row_icon_for(self._row_track_path(row), hovered=False))
-
     def _hover_row_at(self, pos) -> int:
-        """Row under pos (any column) that resolves to a real track, else -1.
-        Drives the whole-row hover glyph swap, like the Library tree."""
+        """Row under pos (any column) that resolves to a real track, else -1."""
         idx = self._track_table.indexAt(pos)
         if not idx.isValid():
             return -1
@@ -2775,16 +2817,13 @@ class CrateManagerView(QWidget):
         row = self._hover_row_at(pos)
         if row == self._hover_play_row:
             return
-        if self._hover_play_row >= 0:
-            self._restore_row_icon(self._hover_play_row)
-        if row >= 0:
-            self._set_title_icon(row, self._row_icon_for(self._row_track_path(row), hovered=True))
         self._hover_play_row = row
+        self._track_model.set_hover_row(row)
 
     def _clear_hover_play_icon(self) -> None:
         if self._hover_play_row >= 0:
-            self._restore_row_icon(self._hover_play_row)
             self._hover_play_row = -1
+            self._track_model.set_hover_row(-1)
 
     def _handle_play_icon_click(self, pos) -> bool:
         row = self._title_icon_row_at(pos)
@@ -2799,11 +2838,7 @@ class CrateManagerView(QWidget):
         return True
 
     def _refresh_now_playing_marker(self) -> None:
-        for row in range(self._track_table.rowCount()):
-            self._set_title_icon(
-                row,
-                self._row_icon_for(self._row_track_path(row), hovered=(row == self._hover_play_row)),
-            )
+        self._track_model.set_now_playing(self._now_playing_path, self._is_playing)
 
     def set_now_playing(self, path) -> None:
         """Mark the row whose track is loaded in the playback bar. Called from
@@ -2814,7 +2849,7 @@ class CrateManagerView(QWidget):
         self._now_playing_path = new
         if new:
             self._is_playing = True  # only ever arrives from a fresh play()
-        self._refresh_now_playing_marker()
+        self._track_model.set_now_playing(self._now_playing_path, self._is_playing)
 
     def set_playing_state(self, playing: bool) -> None:
         """Sync the loaded row's glyph to the real player state (pause while
@@ -2823,26 +2858,27 @@ class CrateManagerView(QWidget):
         if playing == self._is_playing:
             return
         self._is_playing = playing
-        if self._now_playing_path:
-            self._refresh_now_playing_marker()
+        self._track_model.set_playing_state(playing)
 
     # ── Inline editing ─────────────────────────────────────────────────
 
-    def _on_track_double_clicked(self, item: QTableWidgetItem) -> None:
-        col = item.column()
+    def _on_track_double_clicked(self, index) -> None:
+        if not index.isValid():
+            return
+        col = index.column()
         if col not in _EDITABLE_COLS:
             return
-        row       = item.row()
-        path_item = self._track_table.item(row, TC_PATH)
-        if not path_item:
+        row = index.row()
+        raw_path = self._track_model.track_path_at(row)
+        if not raw_path:
             return
-        rec = self._resolve_track(path_item.text())
+        rec = self._resolve_track(raw_path)
         if rec is None:
             return
 
         self._commit_editor()
 
-        current = item.text()
+        current = self._track_model.display_at(row, col)
         editor = make_inline_editor(
             current,
             on_commit=self._commit_editor,
@@ -2854,8 +2890,16 @@ class CrateManagerView(QWidget):
         self._edit_col      = col
         self._edit_original = current
 
-        self._track_table.setCellWidget(row, col, editor)
+        self._set_cell_editor(row, col, editor)
         editor.setFocus()
+
+    def _set_cell_editor(self, row: int, col: int, widget) -> None:
+        if row < 0 or col < 0:
+            return
+        try:
+            self._track_table.setIndexWidget(self._track_model.index(row, col), widget)
+        except Exception:
+            pass
 
     def _commit_editor(self) -> None:
         if self._edit_widget is None:
@@ -2871,18 +2915,13 @@ class CrateManagerView(QWidget):
         self._edit_col      = -1
         self._edit_original = ''
 
-        try:
-            self._track_table.removeCellWidget(row, col)
-        except Exception:
-            pass
+        self._set_cell_editor(row, col, None)
 
         if new_val == original:
             return
 
-        path_item = self._track_table.item(row, TC_PATH)
-        if not path_item:
-            return
-        rec = self._resolve_track(path_item.text())
+        raw_path = self._track_model.track_path_at(row)
+        rec = self._resolve_track(raw_path) if raw_path else None
         if rec is None:
             return
 
@@ -2897,9 +2936,7 @@ class CrateManagerView(QWidget):
             )
             self._undo_manager.push(cmd)  # execute() updates cell + saves
         else:
-            cell = self._track_table.item(row, col)
-            if cell:
-                cell.setText(new_val)
+            self._track_model.set_display(row, col, new_val)
             self._edits.setdefault(str(rec.path), {})[field_name] = new_val
             self._save_edits()
             self._flash_row(row)
@@ -2912,33 +2949,19 @@ class CrateManagerView(QWidget):
         self._edit_row      = -1
         self._edit_col      = -1
         self._edit_original = ''
-        try:
-            self._track_table.removeCellWidget(row, col)
-        except Exception:
-            pass
+        self._set_cell_editor(row, col, None)
 
     def _flash_row(self, row: int) -> None:
-        teal  = QBrush(QColor(_TEAL))
-        cream = QBrush(QColor(_CREAM))
-        for col in range(self._track_table.columnCount()):
-            cell = self._track_table.item(row, col)
-            if cell:
-                cell.setForeground(teal)
-        def _restore(r=row):
-            for c in range(self._track_table.columnCount()):
-                it = self._track_table.item(r, c)
-                if it:
-                    it.setForeground(cream)
-        QTimer.singleShot(1500, _restore)
+        if row < 0:
+            return
+        self._track_model.set_flash(row, True)
+        QTimer.singleShot(1500, lambda r=row: self._track_model.set_flash(r, False))
 
     # ── Undo/redo command support (genre / tags / reassign) ─────────────
 
     def _find_row_by_path(self, file_path: str) -> Optional[int]:
-        for r in range(self._track_table.rowCount()):
-            cell = self._track_table.item(r, TC_PATH)
-            if cell and cell.text() == file_path:
-                return r
-        return None
+        r = self._track_model.find_row_by_path(file_path)
+        return r if r >= 0 else None
 
     def _apply_crate_genre(self, crate_path: Optional[str], values: dict) -> None:
         """values: file_path -> genre to set, or None to clear the override.
@@ -2973,9 +2996,7 @@ class CrateManagerView(QWidget):
                 or rec.genre
                 or '—'
             )
-            cell = self._track_table.item(row, TC_GENRE)
-            if cell:
-                cell.setText(display)
+            self._track_model.set_display(row, TC_GENRE, display)
             self._flash_row(row)
 
     def _apply_crate_tags(self, crate_path: Optional[str], file_path: str, tags_str: str) -> None:
@@ -2994,9 +3015,7 @@ class CrateManagerView(QWidget):
 
         row = self._find_row_by_path(file_path)
         if row is not None:
-            cell = self._track_table.item(row, TC_TAGS)
-            if cell:
-                cell.setText(tags_str)
+            self._track_model.set_display(row, TC_TAGS, tags_str)
             self._flash_row(row)
 
     def _apply_crate_reassign(self, crate_path: Optional[str], values: dict) -> None:
@@ -3021,9 +3040,7 @@ class CrateManagerView(QWidget):
             if row is None or rec is None:
                 continue
             display = self._edits.get(path, {}).get('reassign_artist', rec.artist or '')
-            cell = self._track_table.item(row, TC_ARTIST)
-            if cell:
-                cell.setText(display)
+            self._track_model.set_display(row, TC_ARTIST, display)
             self._flash_row(row)
 
     def eventFilter(self, obj, event) -> bool:
@@ -4024,15 +4041,13 @@ class CrateManagerView(QWidget):
         # Scroll to and select the first newly added track
         first_path = paths[0] if paths else None
         if first_path:
-            for row in range(self._track_table.rowCount()):
-                cell = self._track_table.item(row, TC_TITLE)
-                if cell and cell.data(Qt.ItemDataRole.UserRole) == first_path:
-                    self._track_table.selectRow(row)
-                    self._track_table.scrollToItem(
-                        cell,
-                        QAbstractItemView.ScrollHint.PositionAtCenter,
-                    )
-                    break
+            row = self._track_model.find_row_by_path(first_path)
+            if row >= 0:
+                self._track_table.selectRow(row)
+                self._track_table.scrollTo(
+                    self._track_model.index(row, 0),
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
 
     def _reload_current_crate(self) -> None:
         self._refresh(select=self._current_crate_path)
@@ -4131,11 +4146,11 @@ class CrateManagerView(QWidget):
     # ── Track context menu ─────────────────────────────────────────────
 
     def _on_track_context_menu(self, pos) -> None:
-        item = self._track_table.itemAt(pos)
-        if item is None:
+        idx = self._track_table.indexAt(pos)
+        if not idx.isValid():
             return
 
-        clicked_row   = item.row()
+        clicked_row   = idx.row()
         selected_rows = sorted({idx.row() for idx in self._track_table.selectedIndexes()})
         if clicked_row not in selected_rows:
             self._track_table.clearSelection()
@@ -4165,19 +4180,16 @@ class CrateManagerView(QWidget):
         elif action == reassign_act:
             self._reassign_artist_for_row(clicked_row)
         elif action == finder_act:
-            path_item = self._track_table.item(clicked_row, TC_PATH)
-            if path_item:
-                rec = self._resolve_track(path_item.text())
-                _show_in_finder(str(rec.path) if rec else path_item.text())
+            raw = self._track_model.track_path_at(clicked_row)
+            if raw:
+                rec = self._resolve_track(raw)
+                _show_in_finder(str(rec.path) if rec else raw)
         elif action == cp_artist_act:
-            cell = self._track_table.item(clicked_row, TC_ARTIST)
-            QApplication.clipboard().setText(cell.text() if cell else '')
+            QApplication.clipboard().setText(self._track_model.display_at(clicked_row, TC_ARTIST))
         elif action == cp_title_act:
-            cell = self._track_table.item(clicked_row, TC_TITLE)
-            QApplication.clipboard().setText(cell.text() if cell else '')
+            QApplication.clipboard().setText(self._track_model.display_at(clicked_row, TC_TITLE))
         elif action == cp_path_act:
-            path_item = self._track_table.item(clicked_row, TC_PATH)
-            QApplication.clipboard().setText(path_item.text() if path_item else '')
+            QApplication.clipboard().setText(self._track_model.track_path_at(clicked_row))
         elif action == remove_act:
             self._confirm_remove_tracks(self._context_rows)
 
@@ -4185,13 +4197,9 @@ class CrateManagerView(QWidget):
         from cratesort.src.gui.classifier_view import _ChangeGenreDialog
         if not rows:
             return
-        hint_genre = ''
-        genre_cell = self._track_table.item(rows[0], TC_GENRE)
-        if genre_cell:
-            hint_genre = genre_cell.text()
+        hint_genre = self._track_model.display_at(rows[0], TC_GENRE)
         if len(rows) == 1:
-            title_cell = self._track_table.item(rows[0], TC_TITLE)
-            label      = title_cell.text() if title_cell else '1 track'
+            label = self._track_model.display_at(rows[0], TC_TITLE) or '1 track'
         else:
             label = f'{len(rows)} tracks'
 
@@ -4202,10 +4210,8 @@ class CrateManagerView(QWidget):
 
         old_genres: dict[str, Optional[str]] = {}
         for row in rows:
-            path_item = self._track_table.item(row, TC_PATH)
-            if not path_item:
-                continue
-            rec = self._resolve_track(path_item.text())
+            raw = self._track_model.track_path_at(row)
+            rec = self._resolve_track(raw) if raw else None
             if rec is None:
                 continue
             old_genres[str(rec.path)] = self._edits.get(str(rec.path), {}).get('genre')
@@ -4222,11 +4228,9 @@ class CrateManagerView(QWidget):
         from cratesort.src.gui.classifier_view import _EditTagsDialog
         if not rows:
             return
-        row       = rows[0]
-        path_item = self._track_table.item(row, TC_PATH)
-        if not path_item:
-            return
-        rec = self._resolve_track(path_item.text())
+        row = rows[0]
+        raw = self._track_model.track_path_at(row)
+        rec = self._resolve_track(raw) if raw else None
         if rec is None:
             return
         old_tags_str = self._edits.get(str(rec.path), {}).get('tags', '')
@@ -4253,10 +4257,8 @@ class CrateManagerView(QWidget):
 
     def _reassign_artist_for_row(self, row: int) -> None:
         from cratesort.src.gui.classifier_view import _ReassignArtistDialog
-        path_item = self._track_table.item(row, TC_PATH)
-        if not path_item:
-            return
-        rec = self._resolve_track(path_item.text())
+        raw = self._track_model.track_path_at(row)
+        rec = self._resolve_track(raw) if raw else None
         if rec is None:
             return
         existing_artists = sorted({rec.artist for rec in self._inventory if rec.artist})
@@ -4283,11 +4285,9 @@ class CrateManagerView(QWidget):
             return
         paths_to_remove: list[str] = []
         for row in rows:
-            path_item = self._track_table.item(row, TC_TITLE)  # any cell has the data
-            if path_item:
-                original = path_item.data(Qt.ItemDataRole.UserRole + 1)
-                if original:
-                    paths_to_remove.append(original)
+            original = self._track_model.orig_path_at(row)
+            if original:
+                paths_to_remove.append(original)
         if not paths_to_remove:
             return
         n = len(paths_to_remove)
@@ -4312,9 +4312,9 @@ class CrateManagerView(QWidget):
         if not rows:
             return
         if len(rows) == 1:
-            title_cell = self._track_table.item(rows[0], TC_TITLE)
-            label      = f'"{title_cell.text()}"' if title_cell else '1 track'
-            msg        = f'Remove {label} from {self._current_crate_path!r}?'
+            t = self._track_model.display_at(rows[0], TC_TITLE)
+            label = f'"{t}"' if t else '1 track'
+            msg   = f'Remove {label} from {self._current_crate_path!r}?'
         else:
             msg = f'Remove {len(rows)} tracks from {self._current_crate_path!r}?'
 
@@ -4620,7 +4620,7 @@ class CrateManagerView(QWidget):
     def _enforce_min_col_widths(self) -> None:
         hdr = self._track_table.horizontalHeader()
         fm  = hdr.fontMetrics()
-        for col in range(self._track_table.columnCount()):
+        for col in range(len(_TRACK_HEADERS)):
             text  = _TRACK_HEADERS[col]
             min_w = fm.horizontalAdvance(text) + 40
             if self._track_table.columnWidth(col) < min_w:
@@ -4631,12 +4631,10 @@ class CrateManagerView(QWidget):
         in this crate, rather than leaving it at header-label width."""
         fm = self._track_table.horizontalHeader().fontMetrics()
         widest = 0
-        for row in range(self._track_table.rowCount()):
-            item = self._track_table.item(row, TC_ARTIST)
-            if item is not None:
-                w = fm.horizontalAdvance(item.text())
-                if w > widest:
-                    widest = w
+        for row in range(self._track_model.rowCount()):
+            w = fm.horizontalAdvance(self._track_model.display_at(row, TC_ARTIST))
+            if w > widest:
+                widest = w
         artist_w = widest + 40
         if artist_w > self._track_table.columnWidth(TC_ARTIST):
             self._track_table.setColumnWidth(TC_ARTIST, artist_w)
