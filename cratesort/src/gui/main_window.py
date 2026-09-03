@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
         # Library Browser — index 1
         self._library_browser = LibraryBrowserView(undo_manager=self._undo_manager)
         self._library_browser.album_art_requested.connect(self._update_album_art)
+        self._library_browser.track_deselected.connect(self._restore_status_library_path)
         self._library_browser.play_requested.connect(self._on_play_requested)
         self._content.addWidget(self._library_browser)
 

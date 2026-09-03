@@ -59,7 +59,7 @@ LC_CLS_CONF     = 13
 LC_CLS_STATUS   = 14
 
 HEADERS = [
-    'Artist', 'Tracks', 'Album', 'Genre', 'Style Tags',
+    'Artist / Title', 'Tracks', 'Album', 'Genre', 'Style Tags',
     'Duration', 'Format', 'BPM', 'Year', 'Bitrate', 'Comments', 'File Path',
     'Proposed Genre', 'Confidence', 'Status',
 ]
@@ -752,6 +752,8 @@ class LibraryBrowserView(QWidget):
     # Emitted when a track is selected (for album art panel)
     track_selected       = pyqtSignal(str)   # file path
     album_art_requested  = pyqtSignal(str)
+    # Emitted when a non-track row (an artist) is selected — clears the footer path
+    track_deselected     = pyqtSignal()
     # Emitted after an inline edit is committed (file_path, field, new_value)
     track_field_changed  = pyqtSignal(str, str, str)
     # Emitted when the hover play-icon on a track row is clicked
@@ -1817,7 +1819,10 @@ class LibraryBrowserView(QWidget):
             if rec and hasattr(rec, 'path'):
                 self.track_selected.emit(str(rec.path))
                 self.album_art_requested.emit(str(rec.path))
-        # Artist row: single click highlights only — expand/collapse on double click
+        else:
+            # Artist row: single click highlights only (expand/collapse on
+            # double click). No file is selected, so drop any footer path.
+            self.track_deselected.emit()
 
     # ── Event filter (click-away editor close) ────────────────────────
 
