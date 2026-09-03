@@ -1538,6 +1538,7 @@ class _LaunchSeratoButton(QPushButton):
 class CrateManagerView(QWidget):
     track_selected      = pyqtSignal(str)
     album_art_requested = pyqtSignal(str)
+    track_deselected    = pyqtSignal()   # a crate (not a track) got selected — clears footer path
     navigate_to_settings = pyqtSignal()   # emitted by "Load Library" on empty-state screen
     launch_serato_requested = pyqtSignal()
     play_requested      = pyqtSignal(object)  # TrackRecord — row note-icon clicked
@@ -2335,6 +2336,8 @@ class CrateManagerView(QWidget):
     # ── Crate tree selection states ────────────────────────────────────
 
     def _on_tree_selection_changed(self, current: QTreeWidgetItem, _previous) -> None:
+        # Selecting a crate means no track is selected — drop any footer path.
+        self.track_deselected.emit()
         if not current or not self._crate_delegate:
             return
 

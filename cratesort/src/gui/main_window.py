@@ -162,6 +162,7 @@ class MainWindow(QMainWindow):
         self._crate_manager = CrateManagerView(undo_manager=self._undo_manager)
         self._crate_manager.track_selected.connect(self._update_album_art)
         self._crate_manager.album_art_requested.connect(self._update_album_art)
+        self._crate_manager.track_deselected.connect(self._restore_status_library_path)
         self._crate_manager.navigate_to_settings.connect(lambda: self._on_nav_by_id('settings'))
         self._crate_manager.launch_serato_requested.connect(self._on_launch_serato_requested)
         self._crate_manager.play_requested.connect(self._on_play_requested)
