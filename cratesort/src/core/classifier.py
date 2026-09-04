@@ -12,10 +12,24 @@ from cratesort.src.core.scanner import TrackRecord
 # Constants
 # ---------------------------------------------------------------------------
 
+# Bump this whenever a change here would change what genre a track lands in —
+# a new PARENT_GENRES entry, a STYLE_MAP addition/edit, a new tier/routing rule,
+# etc. A saved classification_session.json stamps itself with the version that
+# produced it; dashboard.py's classification cache-skip compares that stamp
+# against this constant and forces a fresh classify pass on mismatch, so a
+# taxonomy change takes effect automatically on next launch — for a real user
+# updating the app, not just for dev testing — with no manual cache-clearing
+# and no "Reclassify Library" button needed. Bumping this is a deliberate,
+# not-in-place edit: it forces every user's whole library to reclassify on
+# their next launch, so reserve it for changes that actually affect genre
+# assignment, not e.g. copy/UI tweaks elsewhere in the classify flow.
+# 2 — 2026-09-04: added Latin genre + Film & TV content-type bucket.
+CLASSIFIER_VERSION = 2
+
 PARENT_GENRES = frozenset({
     "Blues", "Country", "Electronic", "Funk/Soul", "Hip-Hop/Rap",
-    "House", "Jazz", "R&B", "Reggae", "Rock", "Seasonal", "Specialty",
-    "Traditional",   # 13th genre — Standards, Vocal Pop, Easy Listening, etc.
+    "House", "Jazz", "Latin", "R&B", "Reggae", "Rock", "Seasonal",
+    "Specialty", "Traditional",   # 14th genre — Standards, Vocal Pop, Easy Listening, etc.
 })
 
 # Genre tags that carry no useful information — fall through to style analysis.
@@ -393,6 +407,22 @@ STYLE_MAP: dict[str, str] = {
     "traditional jazz": "Jazz",
     "vocal jazz": "Jazz",
 
+    # ── Latin ────────────────────────────────────────────────────────────────
+    "banda": "Latin",
+    "bachata": "Latin",
+    "corrido": "Latin",
+    "cumbia": "Latin",
+    "latin": "Latin",
+    "latin pop": "Latin",
+    "mariachi": "Latin",
+    "merengue": "Latin",
+    "norteño": "Latin",
+    "norteno": "Latin",
+    "ranchera": "Latin",
+    "salsa": "Latin",
+    "tejano": "Latin",
+    "vallenato": "Latin",
+
     # ── R&B ──────────────────────────────────────────────────────────────────
     "'50s r&b": "R&B",
     "50s r&b": "R&B",
@@ -683,6 +713,7 @@ _FOLDER_HINTS: dict[str, str] = {
     "rap": "Hip-Hop/Rap",
     "house": "House",
     "jazz": "Jazz",
+    "latin": "Latin",
     "r&b": "R&B",
     "reggae": "Reggae",
     "rock": "Rock",
@@ -724,7 +755,7 @@ class ClassificationResult:
 
 class GenreClassifier:
     """
-    Classifies a TrackRecord into one of the 12 CrateSort parent genres.
+    Classifies a TrackRecord into one of the 14 CrateSort parent genres.
 
     Classification tiers (first match wins):
       1. Genre tag is already a valid parent genre → HIGH

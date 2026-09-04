@@ -2454,8 +2454,14 @@ class DashboardWidget(QWidget):
     def _classification_is_current(self) -> bool:
         """True when classification_session.json can be reused as-is: it exists,
         it's newer than any staged style-tag edits (which feed the classifier),
+        it was produced by the CLASSIFIER_VERSION this build actually ships
+        (a structural taxonomy/routing change — e.g. a new genre — bumps that
+        constant, so an old session never gets silently reused across an app
+        update; this is what makes a taxonomy change take effect automatically
+        for a real user on their next launch, with no manual cache-clearing),
         and it covers exactly the current set of track paths. Any add/remove/
-        move, or an edits change, forces a fresh classification pass."""
+        move, an edits change, or a classifier version bump forces a fresh
+        classification pass."""
         if not self._library_path or not self._inventory:
             return False
         cs = self._library_path / '_CrateSort'
@@ -2470,6 +2476,9 @@ class DashboardWidget(QWidget):
                 return False
             data = json.loads(session_file.read_text(encoding='utf-8'))
         except Exception:
+            return False
+        from cratesort.src.core.classifier import CLASSIFIER_VERSION
+        if data.get('classifier_version', 0) != CLASSIFIER_VERSION:
             return False
         saved = {
             t.get('path')

@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from cratesort.src.core.classifier import PARENT_GENRES
+from cratesort.src.core.classifier import PARENT_GENRES, CLASSIFIER_VERSION
 from cratesort.src.gui.overlays import _ArrowComboBox, _CrateSortDialog, _create_dialog_layout
 
 # Regex: detect collaboration patterns in artist fields (feat., ft., &, vs., comma-not-sort)
@@ -58,6 +58,33 @@ _DJ_TOOLS_FOLDER_PATTERNS = frozenset({
 })
 
 DJ_TOOLS_LABEL = 'DJ Tools (untagged)'
+
+# Film & TV is a content-type bucket, not a music genre — it lives outside
+# PARENT_GENRES entirely (see classifier.py) and is assigned purely by folder
+# location, never by artist-name lookup. That second part matters: an artist
+# name like "Scarface" collides between the rapper and the movie, and the
+# normal per-artist majority-vote pipeline below would otherwise drag a movie
+# clip into whatever genre the rapper's audio tracks vote for. Pulling these
+# tracks out by folder name *before* artist grouping happens sidesteps that
+# collision structurally, rather than trying to detect it after the fact.
+FILM_TV_GENRE = 'Film & TV'
+_FILM_TV_FOLDER_NAMES = frozenset({'film & tv', 'film and tv'})
+
+
+def _film_tv_title(rec) -> str:
+    """
+    Best-effort show/movie title for grouping Film & TV clips into their own
+    subfolder, mirroring how music videos group by artist. Prefers a real
+    artist/©ART tag (this project's convention stores the show/movie name
+    there); falls back to the leading " - "-delimited filename segment for
+    files with no usable tag, matching the naming convention
+    "Show or Movie - S# E# - Scene (Year).ext".
+    """
+    raw_artist = (rec.artist or '').strip()
+    if raw_artist and raw_artist.lower() not in ('unknown artist', 'various'):
+        return raw_artist
+    stem = Path(rec.filename).stem
+    return stem.split(' - ', 1)[0].strip() or 'Unknown Title'
 
 # TheHandler instance for sort-form artist names (Fixes 3 + 4)
 from cratesort.src.utils.the_handler import TheHandler as _TheHandler
@@ -132,7 +159,12 @@ STATE_COLORS = {
     'changed':  '#428175',
     'flagged':  '#D4A04A',
 }
-ALL_GENRES = sorted(PARENT_GENRES) + ['Unclassified']
+
+# FILM_TV_GENRE is deliberately not in PARENT_GENRES (it's a content-type
+# bucket, not a music genre — see the comment above its definition) but it
+# still needs to be a selectable option here, e.g. to manually correct a
+# missed Film & TV clip or move one back into a real genre.
+ALL_GENRES = sorted(PARENT_GENRES) + [FILM_TV_GENRE, 'Unclassified']
 
 # Tree column indices
 COL_ARTIST  = 0
@@ -172,6 +204,13 @@ class ArtistEntry:
     final_genre: str = ''
     is_collaboration: bool = False
     tags: list[str] = field(default_factory=list)
+    # True only for Film & TV title-groups. Their genre is always deterministic
+    # (folder + is_video, never voted/looked-up), and their display name is a
+    # show/movie title that can legitimately collide with a real artist's name
+    # (e.g. "Scarface" the movie vs. Scarface the rapper) — so any code that
+    # keys a lookup dict by bare `entry.artist` across all entries must skip
+    # these to avoid two different entries silently overwriting one shared key.
+    is_film_tv: bool = False
 
     @property
     def display_genre(self) -> str:
@@ -191,6 +230,12 @@ class ClassificationSession:
     library_path: Path
     entries: list[ArtistEntry]
     created_at: str
+    # Stamped with the CLASSIFIER_VERSION that produced this session. A newly
+    # created session always gets the current version; a loaded session keeps
+    # whatever it was saved with (see load(), which defaults missing/old
+    # sessions to 0 — always stale) so dashboard.py's cache-skip check can
+    # tell a structural classifier change from just "same files as before".
+    classifier_version: int = CLASSIFIER_VERSION
 
     @property
     def approved_count(self) -> int:
@@ -209,6 +254,7 @@ class ClassificationSession:
         data = {
             'library_path': str(self.library_path),
             'created_at': self.created_at,
+            'classifier_version': self.classifier_version,
             'entries': [
                 {
                     'artist': e.artist,
@@ -220,6 +266,7 @@ class ClassificationSession:
                     'final_genre': e.final_genre,
                     'is_collaboration': e.is_collaboration,
                     'tags': e.tags,
+                    'is_film_tv': e.is_film_tv,
                     'tracks': [
                         {'path': t.path, 'filename': t.filename,
                          'title': t.title, 'duration': t.duration,
@@ -255,6 +302,7 @@ class ClassificationSession:
                 final_genre=e.get('final_genre', ''),
                 is_collaboration=e.get('is_collaboration', False),
                 tags=e.get('tags', []),
+                is_film_tv=e.get('is_film_tv', False),
             )
             for e in data['entries']
         ]
@@ -262,6 +310,9 @@ class ClassificationSession:
             library_path=Path(data['library_path']),
             entries=entries,
             created_at=data['created_at'],
+            # Missing (older session, predates version tracking) → 0, which
+            # never equals a real CLASSIFIER_VERSION, so it's always stale.
+            classifier_version=data.get('classifier_version', 0),
         )
 
     def apply_library_edits(self) -> None:
@@ -426,13 +477,29 @@ class _ClassifyWorker(QThread):
             style_tags_by_path: dict[str, list[str]] = {}
 
             # Pre-classify every track; separate DJ-tools (untagged short clips)
-            # from regular artist tracks so they don't skew artist-level votes.
+            # and Film & TV clips from regular artist tracks so they don't skew
+            # artist-level votes.
             dj_tools_tracks: list = []
+            film_tv_by_title: dict[str, list] = defaultdict(list)
             artist_tracks: dict[str, list] = defaultdict(list)
 
             for rec in self._inventory:
                 raw_artist = rec.artist or ''
                 no_artist = not raw_artist or raw_artist.lower() in ('unknown artist', 'various', 'fx')
+
+                # Film & TV: any video sitting in a "Film & TV" folder is pulled
+                # out here, before artist grouping — regardless of whether it
+                # carries an artist tag. Unlike the DJ Tools/Specialty checks
+                # below, this one is NOT gated on no_artist: a movie or TV clip
+                # can carry a real-looking artist tag (e.g. "Scarface") that
+                # collides with an actual recording artist, and the whole point
+                # is to route it away before that name ever reaches the
+                # per-artist genre vote.
+                if rec.is_video:
+                    ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
+                    if ancestor_names & _FILM_TV_FOLDER_NAMES:
+                        film_tv_by_title[_film_tv_title(rec)].append(rec)
+                        continue
 
                 # Fix 7: untagged video files in purpose-video folders → DJ Tools /
                 # Specialty. Requires no_artist, same as the audio DJ Tools check
@@ -467,8 +534,9 @@ class _ClassifyWorker(QThread):
                 if combined_tags:
                     style_tags_by_path[str(rec.path)] = combined_tags
 
-            artists = sorted(artist_tracks.keys())
-            total   = len(artists) + (1 if dj_tools_tracks else 0)
+            artists       = sorted(artist_tracks.keys())
+            film_tv_titles = sorted(film_tv_by_title.keys())
+            total = len(artists) + len(film_tv_titles) + (1 if dj_tools_tracks else 0)
             entries: list[ArtistEntry] = []
 
             for i, artist in enumerate(artists):
@@ -579,6 +647,44 @@ class _ClassifyWorker(QThread):
                     'track_count': len(tracks),
                     'genre': proposed_genre,
                     'recognized': recognized,
+                })
+
+            if self._cancelled:
+                return
+
+            # Film & TV (grouped by show/movie title, one ArtistEntry per title —
+            # same shape as a music artist, just under a forced genre with no
+            # voting involved).
+            for j, title in enumerate(film_tv_titles):
+                if self._cancelled:
+                    return
+                tracks = film_tv_by_title[title]
+                track_infos = [
+                    TrackInfo(
+                        path=str(rec.path),
+                        filename=rec.filename,
+                        title=rec.title,
+                        duration=rec.duration,
+                        genre_tag=rec.genre,
+                        comment=rec.comment,
+                    )
+                    for rec in tracks
+                ]
+                entries.append(ArtistEntry(
+                    artist=title,
+                    proposed_genre=FILM_TV_GENRE,
+                    confidence='HIGH',
+                    reason='Video in Film & TV folder',
+                    tracks=track_infos,
+                    original_genres=sorted({rec.genre for rec in tracks if rec.genre}),
+                    state='pending',
+                    is_film_tv=True,
+                ))
+                self.progress.emit(len(artists) + j + 1, total, {
+                    'artist': title,
+                    'track_count': len(tracks),
+                    'genre': FILM_TV_GENRE,
+                    'recognized': True,
                 })
 
             if self._cancelled:

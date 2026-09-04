@@ -206,13 +206,18 @@ Right now `GenreClassifier` (`classifier.py`) is purely local and has zero knowl
 **Why this isn't a contradiction of "no external APIs required":** that line in `CLAUDE-CS.md` lives under the tech-stack list, not as a marketed promise — checked both `docs/positioning-brief-cratesort.md` and `docs/what-is-cratesort.md`, neither claims "runs fully offline" as a selling point. There's also already a working precedent: `yt_import_dialog.py` already does an optional MusicBrainz lookup to fill in canonical tags after a YouTube download, gracefully degrading with no internet. Extending that same "optional, best-effort, offline-safe" pattern to classification would be consistent with existing app behavior, not a new category of risk.
 
 **Real complexity to solve before building this (not yet scoped in detail):**
-- MusicBrainz/Discogs genre data is freeform, community-tagged text — CrateSort's taxonomy is a fixed 12-genre list. Needs its own mapping layer, similar in spirit to the existing `STYLE_MAP`, translating arbitrary external tags into one of the 12 buckets.
+- MusicBrainz/Discogs genre data is freeform, community-tagged text — CrateSort's taxonomy is a fixed 14-genre list. Needs its own mapping layer, similar in spirit to the existing `STYLE_MAP`, translating arbitrary external tags into one of the 14 buckets.
 - Network latency — a lookup per never-before-seen artist needs to not stall the classify pass; likely needs async/batched fetching plus per-artist caching (query once per artist name across all their tracks, not once per track).
 - Must degrade cleanly with no internet connection — exactly like the YT import path already does — never a hard requirement for the app to function.
 - The crowdsourced/aggregated-data half of the vision is a materially bigger, separate decision (user opt-in, anonymization, some kind of shared backend to collect and query pattern data) from "just add one external genre lookup" — worth scoping as two distinct phases, not one project.
 - See also the related, already-tabled **CrateCleaner** sister-tool idea below, which already envisions audio fingerprinting + MusicBrainz/Discogs lookup for metadata correction — that's a separate standalone product, but the lookup/mapping infrastructure built for one could likely be shared with the other.
 
 **Status:** explicitly tabled for later. Current local-only classifier confirmed as a good, correct core foundation — not being replaced, just potentially extended. Not urgent; revisit when ready to scope the network/mapping/opt-in work properly.
+
+### Film & TV / real-artist name-collision residual gap (2026-09-04)
+Adding the Film & TV content-type bucket (see `CLAUDE-CS.md` → "Film & TV — a content-type bucket, not a genre") fixed the automatic classification/display collision between a movie/show and a real artist sharing a name (flagship case: Scarface the rapper vs. *Scarface* the movie) — that fix is live and verified in both the classify workflow and the Library tree.
+
+One residual gap wasn't closed: per-artist manual edits in `library_browser.py` (Change Genre, Edit Style Tags, confidence-freeze) all share a single `__artist__{name}`-keyed storage convention across roughly 15 call sites. If a movie/show title is *identical* to a real artist's name in the same library AND the user manually edits either one via those actions, the edit could bleed into both, since they'd share the same storage key. This is much narrower than the original bug — it now requires an exact name collision **and** manual per-artist editing on it, versus firing automatically on any such collision — but it's a real gap if it comes up. Full close would mean re-keying those ~15 sites by `(name, is_film_tv)` instead of bare name. Tabled rather than done as a blind, untested sweep across that much surface area in the same pass as the main fix.
 
 ---
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from cratesort.src.core.duplicate_consolidator import read_recent_merges
+from cratesort.src.core.classifier import PARENT_GENRES
 
 from PyQt6.QtCore import Qt, QByteArray, QEvent, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal
 
@@ -67,13 +68,11 @@ HEADERS = [
 _MUTED   = '#a89b85'
 _DUMMY   = '__LAZY__'
 
-# Taxonomy-validated genres — only these 13 are accepted for ID3 fallback bucketing.
+# Taxonomy-validated genres — only PARENT_GENRES (classifier.py) are accepted
+# for ID3 fallback bucketing. Sourced from there directly rather than a
+# hand-maintained duplicate, so this can't drift out of sync again.
 # Keys are lowercase for case-insensitive matching; values are the canonical forms.
-_VALID_GENRES_LOWER: dict[str, str] = {g.lower(): g for g in {
-    'Blues', 'Country', 'Electronic', 'Funk/Soul', 'Hip-Hop/Rap',
-    'House', 'Jazz', 'R&B', 'Reggae', 'Rock', 'Seasonal',
-    'Specialty', 'Traditional',
-}}
+_VALID_GENRES_LOWER: dict[str, str] = {g.lower(): g for g in PARENT_GENRES}
 
 # The full fixed taxonomy, display order — shown in the "Why Only These
 # Genres?" modal.
@@ -876,6 +875,17 @@ class LibraryBrowserView(QWidget):
                 )
                 session = ClassificationSession.load(session_file)
                 for entry in session.entries:
+                    # Film & TV entries are excluded here on purpose: their genre
+                    # is always deterministic (folder + is_video), never voted or
+                    # looked up, and their display name is a show/movie title that
+                    # can legitimately collide with a real artist's name (e.g.
+                    # "Scarface" the movie vs. Scarface the rapper). Letting them
+                    # into these name-keyed dicts would risk one silently
+                    # overwriting the other's real classification. _rebuild_tree
+                    # carves Film & TV tracks out and assigns their genre directly,
+                    # so it never needs to consult these dicts for them anyway.
+                    if entry.is_film_tv:
+                        continue
                     self._session_genre[entry.artist] = (entry.display_genre, entry.confidence)
                     for track in entry.tracks:
                         self._session_artists[track.path] = entry.artist
@@ -1445,21 +1455,38 @@ class LibraryBrowserView(QWidget):
         self._tree.clear()
         self._confidence_backfilled = False
 
-        # Group tracks by canonical artist
+        # Group tracks by canonical artist. Film & TV video clips are pulled out
+        # into their own title-keyed groups first, before canonical-artist
+        # grouping runs — same rule as the classify workflow (see
+        # classifier_view.py's _ClassifyWorker) — so a movie/show whose name
+        # happens to match a real artist (e.g. "Scarface" the movie vs.
+        # Scarface the rapper) never merges into that artist's bucket.
         artist_tracks: dict[str, list] = defaultdict(list)
+        film_tv_tracks: dict[str, list] = defaultdict(list)
         try:
             from cratesort.src.gui.classifier_view import (
                 _extract_primary_artist, _canonical_artist,
+                _film_tv_title, _FILM_TV_FOLDER_NAMES, FILM_TV_GENRE,
             )
         except ImportError:
             def _extract_primary_artist(a): return (a, False)
             def _canonical_artist(a): return a
+            def _film_tv_title(rec): return rec.artist or 'Unknown Title'
+            _FILM_TV_FOLDER_NAMES = frozenset()
+            FILM_TV_GENRE = 'Film & TV'
 
         for rec in self._inventory:
             edits = self._edits.get(str(rec.path), {})
             if 'reassign_artist' in edits:
-                canonical = edits['reassign_artist']
-            elif str(rec.path) in self._session_artists:
+                # Explicit manual override always wins, video or not.
+                artist_tracks[edits['reassign_artist']].append(rec)
+                continue
+            if rec.is_video:
+                ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
+                if ancestor_names & _FILM_TV_FOLDER_NAMES:
+                    film_tv_tracks[_film_tv_title(rec)].append(rec)
+                    continue
+            if str(rec.path) in self._session_artists:
                 canonical = self._session_artists[str(rec.path)]
             else:
                 primary, _ = _extract_primary_artist(rec.artist or 'Unknown Artist')
@@ -1491,6 +1518,21 @@ class LibraryBrowserView(QWidget):
                             _tag_counts[canonical] += 1
                     genre = _tag_counts.most_common(1)[0][0] if _tag_counts else ''
             item = self._make_artist_item(artist, tracks, genre)
+            self._tree.addTopLevelItem(item)
+            if genre:
+                genres.add(genre)
+            for rec in tracks:
+                if rec.extension:
+                    formats.add(rec.extension.lstrip('.').upper())
+
+        # Film & TV groups: genre defaults to the deterministic Film & TV bucket
+        # (never voted or looked up via _classify_lookup/ID3 majority vote), but
+        # still honors a manual "Change Genre" override — e.g. moving "Menace
+        # to Society" into Hip-Hop/Rap on purpose.
+        for title, tracks in sorted(film_tv_tracks.items()):
+            artist_edits = self._edits.get(f'__artist__{title}', {})
+            genre = artist_edits.get('genre', FILM_TV_GENRE)
+            item = self._make_artist_item(title, tracks, genre)
             self._tree.addTopLevelItem(item)
             if genre:
                 genres.add(genre)

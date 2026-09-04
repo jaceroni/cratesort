@@ -345,12 +345,13 @@ Right-click → Edit Style Tags (on a track or an artist row) stages a comma-sep
 
 ### Artist genre fallback chain (in _rebuild_tree)
 
+0. Film & TV carve-out (added 2026-09-04) — a video (`rec.is_video`) whose ancestor folder is "Film & TV"/"Film and TV" is grouped separately by show/movie title, never reaching steps 1-3, and defaults to `Film & TV` unless overridden by step 1.
 1. Artist override in `library_edits.json` — key format `f'__artist__{artist}'`
 2. Classification session `final_genre` or `proposed_genre` from `_classify_lookup(artist)`
-3. Taxonomy-validated ID3 majority vote — only accepts exact matches against the 13 valid parent genres (case-insensitive). Invalid tags ("Pop", "Alternative Rock", "Hip Hop") are rejected.
+3. Taxonomy-validated ID3 majority vote — only accepts exact matches against the 14 valid parent genres (case-insensitive). Invalid tags ("Pop", "Alternative Rock", "Hip Hop") are rejected.
 4. Default to `''` — Unclassified
 
-Raw ID3 tags are only trusted at Step 3 if they match one of the 13 valid parent genres exactly. No other fallback.
+Raw ID3 tags are only trusted at Step 3 if they match one of the 14 valid parent genres exactly. No other fallback.
 
 ### Genre sidebar in Library
 
@@ -516,6 +517,8 @@ Rendered immediately by `_start_scan_now()`, before the background `_ScanWorker`
 Dashboard has a `refresh()` method called when navigating to index 0 — re-runs duplicate + straggler detection and repopulates dashboard state (always `scanning=False`; `refresh()` no-ops if `_summary is None`). Unlike `_show_dashboard`, `refresh()` still runs those **synchronously on the main thread** — fast now (~0.4s) but a candidate for the `_BgSteps` treatment. **Serato sync check (`_check_serato_sync()`) runs only in `_show_dashboard()` at session start — it is NOT called from `refresh()`.** This prevents CrateSort's own crate writes during a session from being flagged as external Serato changes.
 
 **Classification cache-skip (2026-09-02):** `_start_classification_phase()` calls `_classification_is_current()` — true when `classification_session.json` exists, is newer than `library_edits.json`, and its track-path set exactly equals the current inventory. When true it skips the whole classify phase (worker + the ~7.7 MB session rewrite) and goes straight to `_show_dashboard`. `_ClassifyWorker.run()` also does `self.usleep(200)` every 20 artists so a genuine first-run classify doesn't GIL-freeze its own progress screen.
+
+**Classifier version stamp (2026-09-04):** the cache-skip above compares files, not code — it had no way to know when `classifier.py`'s own logic changed (e.g. adding the Latin genre), so a user with an existing session would silently keep stale results forever, across app updates, with no in-app way to force a refresh. Surfaced when Jace added Latin mid-session and it didn't show up on reopen — same root cause as an earlier "gotta clear the cache" incident, and would have bitten a real user updating from an older build the exact same way. Fixed with `CLASSIFIER_VERSION` (`classifier.py`) — bump it whenever a change would change what genre a track lands in. `ClassificationSession` stamps itself with this on creation (`classifier_version` field, defaults to the current constant), persists it in `save()`/`load()`, and `_classification_is_current()` now also requires `data.get('classifier_version', 0) == CLASSIFIER_VERSION` — a missing field (pre-dates this fix) or an old value both read as stale and force a fresh classify pass automatically, no button, no manual file deletion. A standalone "Reclassify Library" button was considered and deliberately declined (see `settings_view.py`'s already-orphaned `_on_reset_classification()`/`_on_clear_library_edits()`, wired to nothing) — Jace's call: this dev-loop scenario isn't something a real end user hits, and the version stamp already covers the real-user upgrade case automatically.
 
 3. **Recent Activity** (`_build_activity_section()`) — combined feed: crate changes, recently added tracks, and reorganization events (teal dot = reorg/addition, orange dot = rollback/removal). Last 30 days, capped at 10 items.
 
@@ -976,7 +979,7 @@ Called after every execute and rollback. Updates `classification_session.json` a
 
 ---
 
-## Genre taxonomy (13 parent genres)
+## Genre taxonomy (14 parent genres)
 
 These are the only folder-level categories. Style distinctions live in metadata and Serato crates.
 
@@ -989,6 +992,7 @@ These are the only folder-level categories. Style distinctions live in metadata 
 | Hip-Hop/Rap | Boom Bap, Conscious, G-Funk, Gangsta, Golden Era, Hardcore, Instrumental Hip-Hop, Jazzy Hip-Hop, Old School, Southern, Underground, West Coast |
 | House | Acid House, Chicago House, Deep House, Garage, Soulful House, Tech House |
 | Jazz | Avant-Garde, Bebop, Bossa Nova, Cool Jazz, Fusion, Hard Bop, Jazz-Funk, Latin Jazz, Library, Lo-Fi, Modal, Smooth Jazz, Soul-Jazz, Swing |
+| Latin | Banda, Bachata, Corrido, Cumbia, Mariachi, Merengue, Norteño, Ranchera, Salsa, Tejano, Vallenato (added 2026-09-04) |
 | R&B | Classic R&B, Contemporary R&B, Freestyle, New Jack Swing, Quiet Storm, Slow Jams, '50s R&B / Doo-Wop |
 | Reggae | Dancehall, Dub, Roots Reggae, Ska |
 | Rock | Alternative, Art Rock, Blues Rock, Boogie Rock, Country Rock, Early Rock & Roll, Folk Rock, Garage Rock, Hard Rock, Heartland Rock, New Wave, Oldies, Pop Rock, Progressive Rock, Psychedelic Rock, Soft Rock, Southern Rock, Surf Rock, Synth-Pop |
@@ -1001,8 +1005,23 @@ These are the only folder-level categories. Style distinctions live in metadata 
 - Synth-Pop and New Wave → Rock, not Electronic.
 - Breakdance / Park Jams → Funk/Soul, not Hip-Hop/Rap.
 - Soul → Funk/Soul, not R&B.
+- Reggaeton → Reggae, not Latin (resolved ambiguity, pre-dates the Latin bucket).
 - All genre and style terms: Title Case.
 - Artist genre changes never cascade to tracks. Style tags are fully independent between artists and tracks.
+
+### Film & TV — a content-type bucket, not a genre (added 2026-09-04)
+
+`Film & TV` (`FILM_TV_GENRE` in `classifier_view.py`) is deliberately **not** in `PARENT_GENRES` — it's a content type, not a music genre, and doesn't count toward the 14 above or the "Why Only These Genres?" explainer. It still gets its own top-level `Media/Film & TV/<Show or Movie>/` folder and its own sidebar bucket in Library (the sidebar builds itself from whatever genre strings exist on entries, so no separate wiring was needed there).
+
+**Trigger**: any video file (`rec.is_video`) whose ancestor folder is literally named "Film & TV" or "Film and TV" (case-insensitive) — checked against `rec.path.parts`, not a substring match. This is deliberately folder-based, not tag- or artist-based: a "Music Videos" folder gets zero special treatment and flows through normal per-artist genre classification exactly like audio.
+
+**Why this needed to be structural, not just a per-track tag**: the existing pipeline groups tracks by canonical artist-name string, then majority-votes ONE genre across the whole group (`classifier_view.py` `_ClassifyWorker`, and separately `library_browser.py` `_rebuild_tree` for the Library tab tree). A movie or TV show can share its title with a real recording artist — the flagship case being **Scarface** (the rapper) vs. *Scarface* (the movie) — and if the video were only tagged `genre='Film & TV'` per-track while staying grouped under artist "Scarface", the group's majority vote (or the tab's ID3-vote fallback) would still overwrite it with whatever the rapper's audio tracks vote for. The fix pulls Film & TV videos out **before** artist grouping happens at all, in both places independently:
+- `classifier_view.py` `_ClassifyWorker.run()`: folder-flagged videos are grouped by show/movie title (`_film_tv_title()` — prefers the artist/©ART tag, falls back to the leading `" - "`-delimited filename segment) into their own `ArtistEntry` objects, `is_film_tv=True`, genre forced to `Film & TV`, never entering the artist-name vote pool.
+- `library_browser.py` `_rebuild_tree()`: same folder+`is_video` carve-out, independently, since this tree does its own artist-name grouping over `self._inventory` rather than consuming `ClassificationSession` results directly.
+
+`ArtistEntry.is_film_tv` (persisted in `classification_session.json`) exists specifically so name-keyed lookup dicts fed by `session.entries` (`_session_genre`, `_session_artists` in `library_browser.py`) can **skip** Film & TV entries — since their genre is always deterministic and never needs voting/lookup, letting them into those dicts risked one silently overwriting a same-named real artist's classification (that IS the Scarface bug, just relocated one layer down). A manual "Change Genre" override on a Film & TV title (e.g. filing "Menace to Society" under Hip-Hop/Rap on purpose) is still respected — it's read the same way as any artist's `__artist__{name}` genre edit.
+
+**Known residual edge case**: per-artist manual edits (Change Genre, Edit Style Tags, confidence-freeze) share a single `__artist__{name}`-keyed storage convention across ~15 call sites in `library_browser.py`. If a movie/show title is *identical* to a real artist's name AND the user manually edits either one via those actions, the edit could bleed into both (they share the storage key). This is far narrower than the original bug — it now requires an exact name collision **and** manual per-artist editing on it, rather than firing automatically — but it hasn't been closed. Would need each of those ~15 sites re-keyed by `(name, is_film_tv)` to fully close; tabled rather than done blind.
 
 ---
 

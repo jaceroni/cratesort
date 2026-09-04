@@ -124,10 +124,13 @@ itself. Always close Serato before running consolidation.
 ## 5. Classify
 
 *(stub — to be written: writes ID3/metadata tags only, filenames and locations
-never change; the 13-genre taxonomy and why it's deliberately small — cross-ref
+never change; the 14-genre taxonomy and why it's deliberately small — cross-ref
 the in-app "Why Only These Genres?" explainer; style tags and how they feed
 classification; what "Unclassified" means and how to resolve it; the tag-only vs
-move-files distinction between Classify and Organize.)*
+move-files distinction between Classify and Organize; the separate Film & TV
+content-type bucket (not one of the 14 genres) and how it's triggered purely by
+folder location — cross-ref `CLAUDE-CS.md` → "Film & TV — a content-type bucket,
+not a genre".)*
 
 ## 6. Organize
 
