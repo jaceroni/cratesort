@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
         self._playback_controller = PlaybackController(self)
         self._playback_controller.now_playing_changed.connect(self._on_now_playing_changed)
         self._playback_controller.playback_state_changed.connect(self._on_playback_state_changed)
+        self._playback_controller.media_error.connect(self._on_media_error)
         self._video_window: Optional[FloatingVideoWindow] = None
 
         content_row = QWidget()
@@ -229,6 +230,9 @@ class MainWindow(QMainWindow):
             self._library_browser.set_now_playing(str(rec.path))
         if hasattr(self, '_crate_manager'):
             self._crate_manager.set_now_playing(str(rec.path))
+
+    def _on_media_error(self, message: str) -> None:
+        _ov_alert(self, 'Playback Error', message)
 
     def _on_playback_state_changed(self, state) -> None:
         """Fan the real player play/pause state out to both track lists so a
@@ -959,6 +963,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._settings.setValue('geometry', self.saveGeometry())
+        if hasattr(self, '_playback_controller'):
+            self._playback_controller.shutdown()
         if hasattr(self, '_library_browser'):
             self._library_browser.save_state()
         if hasattr(self, '_crate_manager'):

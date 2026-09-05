@@ -27,6 +27,13 @@ a = Analysis(
         # worker entry point and its deps are in the bundle.
         'cratesort.src.core.parallel_tag_reader',
         'cratesort.src.core.scan_worker_proc',
+        # Spawned by audio playback in a separate process (freeze-proofing
+        # against a stalling drive, same reasoning as the scan worker above).
+        # Only the worker entry point needs listing — it's the one reached
+        # via a runtime string import that PyInstaller's static analysis
+        # misses; playback_worker.py itself is a normal top-level import
+        # from playback_controller.py, already followed automatically.
+        'cratesort.src.core.playback_worker_proc',
     ],
     hookspath=[],
     hooksconfig={},
