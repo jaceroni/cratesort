@@ -771,6 +771,20 @@ class LibraryBrowserView(QWidget):
         self._inventory = []
         self._edits: dict[str, dict[str, str]] = {}
         self._confidence_backfilled = False
+        # library_edits.json / classification_session.json writes are debounced
+        # (see _save_edits/_sync_genres_to_session) — every genre/tag/field edit
+        # used to do a full disk round-trip synchronously (classification_session.json
+        # alone can be several MB on a large library), which made the Library
+        # screen progressively sluggish the more edits a user made in one sitting.
+        # Now each edit mutates in-memory state immediately and only schedules a
+        # coalesced flush a beat later; save_state() (called on app close) and
+        # load() (called before any reload that would discard unflushed state)
+        # both force an immediate flush first, so nothing is lost.
+        self._edits_dirty = False
+        self._edits_flush_timer: Optional[QTimer] = None
+        self._cached_session = None  # ClassificationSession, loaded once in load()
+        self._session_dirty = False
+        self._session_flush_timer: Optional[QTimer] = None
         self._settings = QSettings('JWBC', 'CrateSort')
         # Genre sidebar selection
         self._sidebar_genre: str = 'All'
@@ -849,6 +863,12 @@ class LibraryBrowserView(QWidget):
             return
         self._load_sig = sig
 
+        # Force any debounced write out to disk before anything below resets
+        # self._edits / self._cached_session — otherwise a reload landing
+        # inside the debounce window would silently discard it.
+        self._flush_edits()
+        self._flush_session()
+
         # A genuine library change invalidates the remembered tree state
         # (artist names won't carry over); a same-library reload (tab switch,
         # post-classify refresh) keeps it. Gate the save below on this.
@@ -867,6 +887,8 @@ class LibraryBrowserView(QWidget):
         self._session_artists = {}   # track_path (str) → entry.artist (str)
         self._track_overrides = {}
         self._has_classification = False
+        self._cached_session = None
+        self._session_dirty = False
         session_file = library_path / '_CrateSort' / 'classification_session.json'
         if session_file.exists():
             try:
@@ -874,6 +896,10 @@ class LibraryBrowserView(QWidget):
                     ClassificationSession, _extract_primary_artist, _canonical_artist,
                 )
                 session = ClassificationSession.load(session_file)
+                # Reused by _sync_genres_to_session for the rest of this view's
+                # lifetime so a genre/tag edit doesn't re-load this same
+                # (possibly multi-MB) file from disk on every single click.
+                self._cached_session = session
                 for entry in session.entries:
                     # Film & TV entries are excluded here on purpose: their genre
                     # is always deterministic (folder + is_video), never voted or
@@ -1403,43 +1429,20 @@ class LibraryBrowserView(QWidget):
 
         self._genre_sidebar_list.blockSignals(False)
 
-        # Post-edit navigation: follow the artist to its new genre bucket if applicable.
-        dest_genre  = self._last_assigned_genre
-        dest_artist = self._last_edited_artist
-        if dest_genre is not None and dest_artist is not None:
-            self._last_edited_artist  = None
-            self._last_assigned_genre = None
+        # _last_edited_artist/_last_assigned_genre used to drive a jump of the
+        # sidebar filter + tree selection to an edited artist's new genre
+        # bucket. Deliberately dropped 2026-09-05 — it yanked the user to a
+        # different tab (unselected, arbitrary scroll position) after every
+        # single genre change, which broke batch triage through Unclassified.
+        # _apply_library_genre now confirms the change via status text instead
+        # and leaves the current view alone; the two vars are just drained
+        # here so stale state never lingers.
+        self._last_edited_artist  = None
+        self._last_assigned_genre = None
 
-            # Navigate when the user is viewing a specific bucket that is no longer
-            # the destination (skip navigation when viewing "All").
-            navigate = (
-                self._sidebar_genre != 'All'
-                and self._sidebar_genre != dest_genre
-            )
-
-            if navigate:
-                self._sidebar_genre = dest_genre
-                self._genre_sidebar_list.blockSignals(True)
-                for i in range(self._genre_sidebar_list.count()):
-                    it = self._genre_sidebar_list.item(i)
-                    if it.data(Qt.ItemDataRole.UserRole) == dest_genre:
-                        self._genre_sidebar_list.setCurrentItem(it)
-                        break
-                self._genre_sidebar_list.blockSignals(False)
-
-            # Always re-apply filter so row visibilities and status counts are current.
-            self._apply_filter()
-
-            if navigate:
-                for i in range(self._tree.topLevelItemCount()):
-                    top = self._tree.topLevelItem(i)
-                    top_data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-                    if top_data.get('artist', '') == dest_artist:
-                        self._tree.clearSelection()
-                        top.setSelected(True)
-                        self._tree.setCurrentItem(top)
-                        self._tree.scrollToItem(top)
-                        break
+        # Row visibility + the "N of M visible" count can both be stale after
+        # any edit that changed genre — always refresh them.
+        self._apply_filter()
 
     def _on_sidebar_genre_changed(
         self, current: QListWidgetItem, _previous: QListWidgetItem
@@ -2300,12 +2303,6 @@ class LibraryBrowserView(QWidget):
                     disk_failures += 1
         self._save_edits()
 
-        if disk_failures:
-            self._flash_disk_failure(
-                f'⚠ {disk_failures} track(s) could not be updated on disk — '
-                f'check that the drive is connected and files are not locked.'
-            )
-
         artist_changes = {
             k[len('__artist__'):]: v for k, v in edits_map.items()
             if k.startswith('__artist__') and v is not None
@@ -2317,21 +2314,35 @@ class LibraryBrowserView(QWidget):
         self._sync_genres_to_session(artist_changes, track_changes)
 
         self._rebuild_tree()
-
-        # Follow the last-touched artist to wherever its genre bucket now lives
-        # (execute AND undo both land here) so the sidebar filter + selection
-        # return to it instead of falling back to "All".
-        artist_keys = [k for k in edits_map if k.startswith('__artist__')]
-        if artist_keys:
-            artist = artist_keys[-1][len('__artist__'):]
-            artist_item = self._find_item_by_key(f'__artist__{artist}')
-            if artist_item:
-                self._last_edited_artist  = artist
-                self._last_assigned_genre = artist_item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
-
-        self._populate_genre_sidebar()
+        self._populate_genre_sidebar()   # also re-applies the filter — see its tail comment
         self._update_empty_state()
         self._flash_keys(edits_map.keys())
+
+        # Confirmation, success or failure, is always the LAST thing to touch
+        # _count_label — _populate_genre_sidebar()/_apply_filter() above also
+        # write to it (live "N of M visible" count), so anything set before
+        # them was getting silently overwritten in the same tick before this
+        # fix (true of the old disk-failure warning too, which in practice
+        # never actually stayed on screen long enough to read).
+        #
+        # This also deliberately does NOT jump the sidebar/selection to the
+        # artist's new genre bucket the way it used to — that yanked the user
+        # to a different tab (unselected, arbitrary scroll position) after
+        # every single genre change, breaking batch triage through
+        # Unclassified. Confirmed with Jace 2026-09-05: stay put, confirm via
+        # status text instead.
+        if disk_failures:
+            self._flash_disk_failure(
+                f'⚠ {disk_failures} track(s) could not be updated on disk — '
+                f'check that the drive is connected and files are not locked.'
+            )
+        else:
+            names = [k[len('__artist__'):] if k.startswith('__artist__') else Path(k).stem
+                      for k, g in edits_map.items() if g is not None]
+            genre = next((g for g in edits_map.values() if g is not None), None)
+            if names and genre:
+                label = names[0] if len(names) == 1 else f'{len(names)} items'
+                self._set_status(f'✓ {label} → {genre}', teal=True)
 
     def _apply_library_reassign(self, edits_map: dict, disk_map: dict) -> None:
         """Replace each track's edit dict wholesale and write its artist tag to
@@ -2494,26 +2505,67 @@ class LibraryBrowserView(QWidget):
             self._artist_menu(item, pos)
 
     def _sync_genres_to_session(self, artist_changes: dict, track_changes: dict) -> None:
-        """Write genre changes back to classification_session.json for cross-view sync."""
+        """Apply genre changes to the in-memory classification session and
+        schedule a coalesced write to classification_session.json (cross-view
+        sync — the Classify screen reads this file).
+
+        Used to re-load AND re-save this file (several MB on a large library)
+        from scratch on every single genre edit — the dominant cost behind
+        "Library gets slower the more artists I reassign in one sitting."
+        self._cached_session (populated once in load()) is reused and mutated
+        in place instead; the actual disk write is debounced the same way
+        _save_edits() is, with the same guaranteed-flush points."""
         if not self._library_path or (not artist_changes and not track_changes):
             return
         session_file = self._library_path / '_CrateSort' / 'classification_session.json'
-        if not session_file.exists():
+        if self._cached_session is None:
+            if not session_file.exists():
+                return
+            try:
+                from cratesort.src.gui.classifier_view import ClassificationSession
+                self._cached_session = ClassificationSession.load(session_file)
+            except Exception as exc:
+                print(f'[LibraryBrowser] Failed to load session for sync: {exc}')
+                return
+        session = self._cached_session
+        for entry in session.entries:
+            if entry.artist in artist_changes:
+                entry.final_genre = artist_changes[entry.artist]
+                if entry.state in ('pending', 'flagged'):
+                    entry.state = 'edited'
+            for track in entry.tracks:
+                if track.path in track_changes:
+                    track.genre_tag = track_changes[track.path]
+
+        self._session_dirty = True
+        if self._session_flush_timer is None:
+            self._session_flush_timer = QTimer(self)
+            self._session_flush_timer.setSingleShot(True)
+            self._session_flush_timer.timeout.connect(self._flush_session)
+        self._session_flush_timer.start(1500)
+
+    def _flush_session(self) -> None:
+        if not self._session_dirty or self._cached_session is None:
             return
+        if self._session_flush_timer is not None:
+            self._session_flush_timer.stop()
         try:
-            from cratesort.src.gui.classifier_view import ClassificationSession
-            session = ClassificationSession.load(session_file)
-            for entry in session.entries:
-                if entry.artist in artist_changes:
-                    entry.final_genre = artist_changes[entry.artist]
-                    if entry.state in ('pending', 'flagged'):
-                        entry.state = 'edited'
-                for track in entry.tracks:
-                    if track.path in track_changes:
-                        track.genre_tag = track_changes[track.path]
-            session.save()
+            self._cached_session.save()
         except Exception as exc:
-            print(f'[LibraryBrowser] Failed to sync to session: {exc}')
+            print(f'[LibraryBrowser] Failed to save session: {exc}')
+        self._session_dirty = False
+
+    def _set_cached_session(self, session) -> None:
+        """Adopt `session` (freshly loaded, or just produced by a classify
+        pass) as the live in-memory session, discarding any still-pending
+        debounced write against whatever object was cached before — the
+        caller here always saves (or just built) fresh data of its own, so
+        an old pending flush firing afterward would clobber it with stale
+        state."""
+        if self._session_flush_timer is not None:
+            self._session_flush_timer.stop()
+        self._session_dirty = False
+        self._cached_session = session
 
     def _change_genre_for_selection(self, hint_label: str = '', hint_genre: str = '') -> None:
         """Apply a single genre change to every currently selected item (artist or track)."""
@@ -2745,12 +2797,31 @@ class LibraryBrowserView(QWidget):
                 self._edits = {}
 
     def _save_edits(self) -> None:
+        """Mark library_edits.json dirty and schedule a coalesced write a beat
+        later, rather than writing on every single call — a click-through
+        session across many artists used to do a full disk write (of the
+        whole, ever-growing edits file) per click. See save_state()/load()
+        for the guaranteed-flush points that keep this durable."""
+        self._edits_dirty = True
+        if self._edits_flush_timer is None:
+            self._edits_flush_timer = QTimer(self)
+            self._edits_flush_timer.setSingleShot(True)
+            self._edits_flush_timer.timeout.connect(self._flush_edits)
+        self._edits_flush_timer.start(1200)
+
+    def _flush_edits(self) -> None:
+        if not self._edits_dirty:
+            return
+        if self._edits_flush_timer is not None:
+            self._edits_flush_timer.stop()
         p = self._edits_file()
         if not p or not self._edits:
+            self._edits_dirty = False
             return
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, 'w', encoding='utf-8') as f:
             json.dump(self._edits, f, indent=2)
+        self._edits_dirty = False
 
     def _enforce_min_col_widths(self) -> None:
         """Ensure every column header is fully visible (never clipped)."""
@@ -2779,6 +2850,7 @@ class LibraryBrowserView(QWidget):
                 try:
                     session = ClassificationSession.load(session_file)
                     session.apply_library_edits()
+                    self._set_cached_session(session)
                     self._enter_classify_mode(session)
                     return
                 except Exception:
@@ -2805,6 +2877,7 @@ class LibraryBrowserView(QWidget):
                 try:
                     session = ClassificationSession.load(session_file)
                     session.apply_library_edits()
+                    self._set_cached_session(session)
                     self._enter_classify_mode(session)
                     return
                 except Exception:
@@ -2820,6 +2893,7 @@ class LibraryBrowserView(QWidget):
     def _on_classify_finished(self, session) -> None:
         session.save()
         session.apply_library_edits()
+        self._set_cached_session(session)
         self._refresh_classify_btn()
         self._enter_classify_mode(session)
 
@@ -2846,6 +2920,7 @@ class LibraryBrowserView(QWidget):
     def _on_auto_classify_finished(self, session) -> None:
         session.save()
         session.apply_library_edits()
+        self._set_cached_session(session)
         self._auto_classify_session = session
         if self._analyze_modal is not None:
             self._analyze_modal.on_classification_complete()
@@ -3173,6 +3248,16 @@ class LibraryBrowserView(QWidget):
             print(f'[LibraryBrowser] Failed to save accepted classifications: {exc}')
 
         if save_success:
+            # This writes edits_path directly rather than through
+            # self._edits/_save_edits() — keep the in-memory copy in sync
+            # (and not dirty) so the load() call below doesn't flush a stale
+            # pre-accept self._edits over the file we just wrote.
+            self._edits = edits
+            self._edits_dirty = False
+            if self._edits_flush_timer is not None:
+                self._edits_flush_timer.stop()
+
+        if save_success:
             try:
                 flag_path = self._library_path / '_CrateSort' / 'classification_accepted.flag'
                 flag_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3208,3 +3293,8 @@ class LibraryBrowserView(QWidget):
     def save_state(self) -> None:
         """Call before hiding/destroying the view to persist column order."""
         self._settings.setValue(_SETTINGS_KEY, self._tree.header().saveState())
+        # Force out any debounced library_edits.json / classification_session.json
+        # write (see _save_edits/_sync_genres_to_session) so app close never
+        # loses the last few seconds of edits.
+        self._flush_edits()
+        self._flush_session()
