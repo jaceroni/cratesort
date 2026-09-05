@@ -24,12 +24,13 @@ from cratesort.src.core.scanner import TrackRecord
 # their next launch, so reserve it for changes that actually affect genre
 # assignment, not e.g. copy/UI tweaks elsewhere in the classify flow.
 # 2 — 2026-09-04: added Latin genre + Film & TV content-type bucket.
-CLASSIFIER_VERSION = 2
+# 3 — 2026-09-04: added Orchestral genre.
+CLASSIFIER_VERSION = 3
 
 PARENT_GENRES = frozenset({
     "Blues", "Country", "Electronic", "Funk/Soul", "Hip-Hop/Rap",
-    "House", "Jazz", "Latin", "R&B", "Reggae", "Rock", "Seasonal",
-    "Specialty", "Traditional",   # 14th genre — Standards, Vocal Pop, Easy Listening, etc.
+    "House", "Jazz", "Latin", "Orchestral", "R&B", "Reggae", "Rock",
+    "Seasonal", "Specialty", "Traditional",   # 14th genre — Standards, Vocal Pop, Easy Listening, etc.
 })
 
 # Genre tags that carry no useful information — fall through to style analysis.
@@ -423,6 +424,27 @@ STYLE_MAP: dict[str, str] = {
     "tejano": "Latin",
     "vallenato": "Latin",
 
+    # ── Orchestral ───────────────────────────────────────────────────────────
+    "classical": "Orchestral",
+    "orchestral": "Orchestral",
+    "orchestra": "Orchestral",
+    "symphony": "Orchestral",
+    "symphonic": "Orchestral",
+    "philharmonic": "Orchestral",
+    "philharmonia": "Orchestral",
+    "concerto": "Orchestral",
+    "opera": "Orchestral",
+    "operatic": "Orchestral",
+    "aria": "Orchestral",
+    "requiem": "Orchestral",
+    "sonata": "Orchestral",
+    "overture": "Orchestral",
+    "choral": "Orchestral",
+    "chamber orchestra": "Orchestral",
+    "chamber music": "Orchestral",
+    "film score": "Orchestral",
+    "movie score": "Orchestral",
+
     # ── R&B ──────────────────────────────────────────────────────────────────
     "'50s r&b": "R&B",
     "50s r&b": "R&B",
@@ -714,6 +736,8 @@ _FOLDER_HINTS: dict[str, str] = {
     "house": "House",
     "jazz": "Jazz",
     "latin": "Latin",
+    "orchestral": "Orchestral",
+    "classical": "Orchestral",
     "r&b": "R&B",
     "reggae": "Reggae",
     "rock": "Rock",
@@ -755,7 +779,7 @@ class ClassificationResult:
 
 class GenreClassifier:
     """
-    Classifies a TrackRecord into one of the 14 CrateSort parent genres.
+    Classifies a TrackRecord into one of the 15 CrateSort parent genres.
 
     Classification tiers (first match wins):
       1. Genre tag is already a valid parent genre → HIGH

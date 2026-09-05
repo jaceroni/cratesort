@@ -979,7 +979,7 @@ Called after every execute and rollback. Updates `classification_session.json` a
 
 ---
 
-## Genre taxonomy (14 parent genres)
+## Genre taxonomy (15 parent genres)
 
 These are the only folder-level categories. Style distinctions live in metadata and Serato crates.
 
@@ -993,6 +993,7 @@ These are the only folder-level categories. Style distinctions live in metadata 
 | House | Acid House, Chicago House, Deep House, Garage, Soulful House, Tech House |
 | Jazz | Avant-Garde, Bebop, Bossa Nova, Cool Jazz, Fusion, Hard Bop, Jazz-Funk, Latin Jazz, Library, Lo-Fi, Modal, Smooth Jazz, Soul-Jazz, Swing |
 | Latin | Banda, Bachata, Corrido, Cumbia, Mariachi, Merengue, Norteño, Ranchera, Salsa, Tejano, Vallenato (added 2026-09-04) |
+| Orchestral | Classical, Symphony, Philharmonic, Concerto, Opera, Aria, Requiem, Sonata, Overture, Choral, Chamber Orchestra, Film Score (added 2026-09-04) |
 | R&B | Classic R&B, Contemporary R&B, Freestyle, New Jack Swing, Quiet Storm, Slow Jams, '50s R&B / Doo-Wop |
 | Reggae | Dancehall, Dub, Roots Reggae, Ska |
 | Rock | Alternative, Art Rock, Blues Rock, Boogie Rock, Country Rock, Early Rock & Roll, Folk Rock, Garage Rock, Hard Rock, Heartland Rock, New Wave, Oldies, Pop Rock, Progressive Rock, Psychedelic Rock, Soft Rock, Southern Rock, Surf Rock, Synth-Pop |
@@ -1006,6 +1007,7 @@ These are the only folder-level categories. Style distinctions live in metadata 
 - Breakdance / Park Jams → Funk/Soul, not Hip-Hop/Rap.
 - Soul → Funk/Soul, not R&B.
 - Reggaeton → Reggae, not Latin (resolved ambiguity, pre-dates the Latin bucket).
+- A bare `"soundtrack"` genre/style tag does NOT route to Orchestral — too many OSTs are pop/rock song compilations, not composed scores. Only specific classical/score terms (`classical`, `symphony`, `film score`, `opera`, etc. — see `STYLE_MAP` in `classifier.py`) do. This is separate from the `Film & TV` content-type bucket, which is video-file + folder triggered and unrelated to audio-only orchestral scores.
 - All genre and style terms: Title Case.
 - Artist genre changes never cascade to tracks. Style tags are fully independent between artists and tracks.
 
