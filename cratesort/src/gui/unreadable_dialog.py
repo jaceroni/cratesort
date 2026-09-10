@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
+from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout, _fit_dialog_width
 
 _CREAM = '#f1e3c8'
 _MUTED = '#a89b85'
@@ -37,6 +37,16 @@ class _UnreadableFilesDialog(_CrateSortDialog):
         super().__init__(parent)
         self.setMinimumWidth(620)
         self._entries = list(entries)
+
+        # Widen to fit the longest filename / parent-folder line on one row
+        # (each row also spends ~190px on the "Show in Finder" button and
+        # margins). Longer names elide with a tooltip; the grip goes wider.
+        _fit_dialog_width(
+            self,
+            [p.name for p, _ in self._entries]
+            + [_collapse_home(p.parent) for p, _ in self._entries],
+            chrome=200, minimum=620, maximum=900,
+        )
 
         layout = _create_dialog_layout(self)
 
@@ -124,6 +134,7 @@ class _UnreadableFilesDialog(_CrateSortDialog):
             f'background: transparent; border: none;'
         )
         name.setWordWrap(False)
+        name.setToolTip(str(path))
         top.addWidget(name, stretch=1)
 
         reveal = QPushButton('Show in Finder')

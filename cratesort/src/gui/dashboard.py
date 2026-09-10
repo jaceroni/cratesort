@@ -56,6 +56,7 @@ from cratesort.src.utils.checkpoint import save_checkpoint, load_checkpoint, det
 from cratesort.src.serato.database_reader import read_track_add_dates, read_track_metadata, _normalize_pfil_keys
 from cratesort.src.gui.overlays import (
     _CrateSortDialog, _ov_alert, _create_dialog_layout, _AnimatedStatCardWidget,
+    _fit_dialog_width,
 )
 from cratesort.src.gui.yt_import_dialog import _YTImportDialog
 from cratesort.src.gui.convert_dialog import _ConvertDialog
@@ -666,6 +667,17 @@ class _ChangeReviewDialog(_CrateSortDialog):
         self._pending_reverts:   set[int] = set()   # indices into self._changes marked for removal
         self._changes            = list(changes)
 
+        # Timestamps are shared group headers, not per-row, so a change row is
+        # just "<dot> <description> …stretch… <keep> <remove>" — no inline
+        # timestamp eating ~130px. Chrome below covers the dot, both radios
+        # and the dialog margins. Longer descriptions elide mid-string with a
+        # full-text tooltip; the corner grip goes wider still.
+        _fit_dialog_width(
+            self,
+            [c.get('description', '') for c in self._changes],
+            chrome=360, minimum=560, maximum=900,
+        )
+
         # Use the standard dialog layout builder with Orange accent (selection/confirm)
         layout = _create_dialog_layout(self)
 
@@ -710,14 +722,26 @@ class _ChangeReviewDialog(_CrateSortDialog):
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(4)
         scroll.setWidget(rows_container)
-        # Cap the visible list so it scrolls past ~6 rows instead of forcing
+        # Cap the visible list so it scrolls past ~8 rows instead of forcing
         # the dialog to grow unbounded; below the cap, the dialog shrinks to
         # fit the actual number of changes (no leftover blank space).
-        scroll.setMaximumHeight(300)
+        scroll.setMaximumHeight(440)
         layout.addWidget(scroll)
 
+        # Rows are grouped under a shared timestamp header: a run of
+        # consecutive changes with the same formatted time gets one
+        # "Today at 12:34 AM" line above it (a single Serato session usually
+        # stamps everything the same minute, so this collapses a column of
+        # identical timestamps into one). Changes with no mtime get no header.
         self._row_frames: list[QFrame] = []
+        prev_time_str: Optional[str] = None
         for i, change in enumerate(self._changes):
+            time_str = self._fmt_time(change.get('mtime'))
+            if time_str and time_str != prev_time_str:
+                self._rows_layout.addWidget(
+                    self._build_time_header(time_str, first=(i == 0))
+                )
+            prev_time_str = time_str
             self._rows_layout.addWidget(self._build_row(i, change))
 
         self._rows_layout.addStretch()
@@ -755,6 +779,18 @@ class _ChangeReviewDialog(_CrateSortDialog):
 
     # ── Row builder ───────────────────────────────────────────────────────────
 
+    def _build_time_header(self, time_str: str, *, first: bool) -> QLabel:
+        """Shared timestamp line above a run of same-time change rows."""
+        lbl = QLabel(time_str)
+        lbl.setStyleSheet(
+            'color: #5a5a5a; font-size: 11px; font-weight: 600; letter-spacing: 0.03em; '
+            'background: transparent; border: none;'
+        )
+        # Extra top space before every group except the first, so groups read
+        # as groups; small bottom gap ties the header to its rows.
+        lbl.setContentsMargins(2, 0 if first else 10, 0, 3)
+        return lbl
+
     def _build_row(self, idx: int, change: dict) -> QFrame:
         ctype = change.get('type', '')
         dot_color = (
@@ -767,6 +803,9 @@ class _ChangeReviewDialog(_CrateSortDialog):
         frame.setStyleSheet(
             'QFrame { background: #2a2a2a; border: none; border-radius: 4px; }'
         )
+        # Single line: dot · description · …stretch… · keep radio · remove
+        # radio. The timestamp is not here — it's a shared header above the
+        # group (see _build_time_header / the grouping loop in __init__).
         h = QHBoxLayout(frame)
         h.setContentsMargins(10, 8, 10, 8)
         h.setSpacing(10)
@@ -779,16 +818,16 @@ class _ChangeReviewDialog(_CrateSortDialog):
         dot.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         h.addWidget(dot)
 
-        desc_lbl = QLabel(change.get('description', ''))
+        # Elide (keeping both ends of a "renamed: A → B" line) rather than
+        # hard-clipping. The dialog is widened to fit the longest description
+        # on one line at its default size; the tooltip and the corner grip
+        # cover anything longer.
+        desc_text = change.get('description', '')
+        desc_lbl = _ElidingLabel(desc_text, elide=Qt.TextElideMode.ElideMiddle)
+        desc_lbl.setFixedHeight(18)   # _ElidingLabel defaults to 32 (scan status line); keep rows tight
         desc_lbl.setStyleSheet('color: #f1e3c8; font-size: 13px; background: transparent; border: none;')
-        desc_lbl.setWordWrap(False)
+        desc_lbl.setToolTip(desc_text)
         h.addWidget(desc_lbl, stretch=1)
-
-        mtime: Optional[datetime] = change.get('mtime')
-        time_lbl = QLabel(self._fmt_time(mtime))
-        time_lbl.setStyleSheet('color: #5a5a5a; font-size: 11px; background: transparent; border: none;')
-        time_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        h.addWidget(time_lbl)
 
         can_revert = self._can_revert(change)
         keep_text, undo_text = self._RADIO_LABELS.get(ctype, self._DEFAULT_RADIO_LABELS)
