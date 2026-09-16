@@ -5,13 +5,14 @@
 #   .build-venv/bin/pyinstaller packaging/CrateSort.spec --noconfirm --clean
 #   packaging/build_dmg.sh
 #
-# Regenerate packaging/dmg_background.png first (needs the build venv) if
-# the brand assets or DMG layout changed:
-#   .build-venv/bin/python packaging/generate_dmg_background.py
-#
 # Replaces the old one-off-shell-commands pipeline documented in
 # CLAUDE-CS.md's Packaging & Distribution section — this script IS that
 # pipeline now, kept in sync with the doc's description of each step.
+#
+# Plain default Finder window — no background image, no custom icon
+# layout. A branded background + arranged icon positions was tried
+# 2026-09-16 and explicitly reverted per Jace's direction (not asked for,
+# didn't like it) — don't reintroduce without being asked.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,11 +30,6 @@ if [ ! -d "$APP" ]; then
     echo "ERROR: $APP not found — build it first with PyInstaller (see usage above)." >&2
     exit 1
 fi
-BG_PNG="$ROOT/packaging/dmg_background.png"
-if [ ! -f "$BG_PNG" ]; then
-    echo "ERROR: $BG_PNG not found — run packaging/generate_dmg_background.py first." >&2
-    exit 1
-fi
 
 VOLNAME="CrateSort"
 MOUNT="/Volumes/$VOLNAME"
@@ -43,13 +39,12 @@ RW_DMG="$ROOT/dist_dmg/.CrateSort-rw.dmg"
 FINAL="$ROOT/dist_dmg/CrateSort-$VERSION-beta.dmg"
 
 rm -rf "$STAGE" "$SCRATCH" "$RW_DMG" "$FINAL"
-mkdir -p "$STAGE/.background" "$SCRATCH"
+mkdir -p "$STAGE" "$SCRATCH"
 
 # ---------------------------------------------------------------- staging --
 osacompile -o "$STAGE/Uninstall CrateSort.app" "$ROOT/packaging/uninstall.applescript"
 cp -R "$APP" "$STAGE/CrateSort.app"
 ln -s /Applications "$STAGE/Applications"
-cp "$BG_PNG" "$STAGE/.background/dmg_background.png"
 
 # ------------------------------------------------- rendered app icon -----
 # Raw cratesort/assets/icons/app/CrateSort.icns is a flat, sharp-cornered
@@ -57,9 +52,7 @@ cp "$BG_PNG" "$STAGE/.background/dmg_background.png"
 # composites that treatment onto real .app BUNDLE icons specifically. Grab
 # Finder's actual rendered bitmap off the just-built .app and reuse it for
 # BOTH the DMG file's own icon and the mounted volume's icon, so neither one
-# looks flat/generic next to the real app icon (the volume icon previously
-# just copied the raw flat asset directly — that was the actual source of
-# "the DMG looks generic," alongside having no background/layout at all).
+# looks flat/generic next to the real app icon.
 cat > "$SCRATCH/extract_icon.jxa" <<'JXA'
 function run(argv) {
     ObjC.import("Cocoa");
@@ -89,43 +82,6 @@ iconutil -c icns "$ICONSET" -o "$SCRATCH/rendered.icns"
 hdiutil create -srcfolder "$STAGE" -volname "$VOLNAME" -fs HFS+ -format UDRW -size 300m "$RW_DMG"
 hdiutil attach "$RW_DMG" -readwrite -noverify -noautoopen
 
-# ------------------------------- branded window: background + icon layout --
-# CrateSort.app (primary) on the left, Applications alias on the right with
-# a connecting arrow drawn into the background image (the standard drag-to-
-# install convention), the optional Uninstaller in its own row below,
-# secondary role. Coordinates here must match generate_dmg_background.py's
-# APP_X/APPLICATIONS_X/ROW_Y/UNINSTALL_Y constants.
-cat > "$SCRATCH/layout.applescript" <<APPLESCRIPT
-tell application "Finder"
-    tell disk "$VOLNAME"
-        open
-        set current view of container window to icon view
-        set toolbar visible of container window to false
-        set statusbar visible of container window to false
-        set the bounds of container window to {400, 100, 1060, 520}
-        set theViewOptions to the icon view options of container window
-        set arrangement of theViewOptions to not arranged
-        set icon size of theViewOptions to 128
-        set background picture of theViewOptions to file ".background:dmg_background.png"
-        set position of item "CrateSort.app" of container window to {150, 190}
-        set position of item "Applications" of container window to {510, 190}
-        set position of item "Uninstall CrateSort.app" of container window to {330, 330}
-        close
-        open
-        update without registering applications
-        delay 2
-    end tell
-end tell
-APPLESCRIPT
-osascript "$SCRATCH/layout.applescript"
-
-# Volume icon — applied AFTER the layout step, not before: Finder's own
-# window/icon-view-options writes touch the same 32-byte com.apple.FinderInfo
-# structure that carries the volume's custom-icon bit, and running them
-# first clobbered a custom icon set beforehand (confirmed — the icon and the
-# custom-icon flag were both silently gone by the time the disk was
-# detached). Setting it last, with nothing running afterward but detach,
-# makes it stick.
 cp "$SCRATCH/rendered.icns" "$MOUNT/.VolumeIcon.icns"
 SetFile -c icnC "$MOUNT/.VolumeIcon.icns"
 SetFile -a C "$MOUNT"
