@@ -641,6 +641,7 @@ class _YTImportDialog(_CrateSortDialog):
         self._url_input = QLineEdit()
         self._url_input.setPlaceholderText('Paste a YouTube URL…')
         self._url_input.setStyleSheet(_FIELD_INPUT_STYLE)
+        self._url_input.setFixedHeight(36)   # see _field()'s comment — same stale-layout risk
         self._url_input.returnPressed.connect(self._on_import)
         url_row.addWidget(self._url_input, stretch=1)
 
@@ -699,6 +700,17 @@ class _YTImportDialog(_CrateSortDialog):
         meta_grid.addWidget(self._f_genre, 7, 0, 1, 2)
 
         meta_grid.setColumnStretch(0, 1)
+
+        # Floor meta_frame's own height to what its grid actually needs, read
+        # fresh right now rather than trusted later (see project_pyqt_gotchas
+        # #15 — a QVBoxLayout's cached sizeHint can go permanently stale once
+        # a dialog is first shown, and neither .invalidate() nor .activate()
+        # reliably un-sticks it). Without this, the base dialog's showEvent()
+        # can capture its bounce-in target from a stale, too-short snapshot of
+        # this section — the fields themselves stay full height (fixed above),
+        # but GENRE's row can end up rendered past meta_frame's own bottom
+        # edge, overlapping the Artwork section below it.
+        meta_frame.setMinimumHeight(meta_grid.sizeHint().height())
 
         layout.addWidget(meta_frame)
         layout.addSpacing(12)
@@ -971,6 +983,18 @@ class _YTImportDialog(_CrateSortDialog):
         f = QLineEdit()
         f.setStyleSheet(_FIELD_INPUT_STYLE)
         f.setEnabled(False)
+        # These start disabled (until metadata is fetched) and sit in a
+        # QGridLayout — the row height gets locked in from the layout's
+        # FIRST pass, computed while the field is disabled/empty/unshown,
+        # and never gets recomputed once _fields_enabled(True) changes state
+        # later (matching the app's existing "QVBoxLayout sizeHint() can go
+        # permanently stale post-show" gotcha, one level down in a nested
+        # QGridLayout). The field's own sizeHint() is correct (36px, same as
+        # every other input in the app) but the grid cell it's allocated
+        # ends up several px short, clipping the tops of capital letters and
+        # digits. A hard fixed height can't be shrunk by a stale sizeHint,
+        # unlike minimum/maximumSize which the layout still treats as advisory.
+        f.setFixedHeight(36)
         if width:
             f.setFixedWidth(width)
         return f
