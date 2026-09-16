@@ -362,6 +362,12 @@ class _YTWorker(QThread):
             ),
             'outtmpl': os.path.join(tmpdir, '%(title)s.%(ext)s'),
             'progress_hooks': [hook],
+            # yt-dlp's own merge-and-remux step (video+audio streams downloaded
+            # separately) shells out to ffmpeg internally and otherwise only
+            # looks on $PATH — which is minimal/empty in the packaged .app (no
+            # Homebrew ffmpeg, and imageio_ffmpeg's bundled binary isn't on
+            # PATH either). Point it at the exact bundled binary.
+            'ffmpeg_location': get_ffmpeg_path(),
         }
         self._download_with_fallback(yt_dlp, tmpdir, base_opts)
 
@@ -445,6 +451,11 @@ class _YTWorker(QThread):
             'progress_hooks': [hook],
             'postprocessors': [{'key': 'FFmpegExtractAudio',
                                 'preferredcodec': 'mp3', 'preferredquality': '0'}],
+            # See the matching comment in _run_mp4 — the FFmpegExtractAudio
+            # postprocessor shells out to ffmpeg internally and only checks
+            # $PATH unless told otherwise, which is exactly the "ffprobe and
+            # ffmpeg not found" error hit in the packaged .app.
+            'ffmpeg_location': get_ffmpeg_path(),
         }
         self._download_with_fallback(yt_dlp, tmpdir, base_opts)
 

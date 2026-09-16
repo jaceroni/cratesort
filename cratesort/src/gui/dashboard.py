@@ -1433,6 +1433,39 @@ class DashboardWidget(QWidget):
         card_row.addWidget(welcome_card)
         card_row.addStretch(1)
         layout.addLayout(card_row)
+
+        # YouTube import + local conversion — available with no drive/library
+        # connected at all (neither tool touches library data; see
+        # _build_yt_convert_cards_section). This is the only way to reach them
+        # before a library is picked, so it's shown regardless of which
+        # welcome_card branch rendered above.
+        layout.addSpacing(28)
+
+        tools_eyebrow = QLabel('NO DRIVE NEEDED')
+        tools_eyebrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tools_eyebrow.setStyleSheet(
+            'color: #5a5a5a; font-size: 10px; font-weight: 700; letter-spacing: 0.12em; '
+            'background: transparent; border: none;'
+        )
+        layout.addWidget(tools_eyebrow)
+
+        tools_sub = QLabel('Pull audio from YouTube or convert files you already have.')
+        tools_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tools_sub.setStyleSheet(
+            'color: #a89b85; font-size: 12px; background: transparent; border: none;'
+        )
+        layout.addWidget(tools_sub)
+        layout.addSpacing(4)
+
+        tools_section = self._build_yt_convert_cards_section()
+        tools_section.setFixedWidth(620)
+        tools_row = QHBoxLayout()
+        tools_row.setContentsMargins(0, 0, 0, 0)
+        tools_row.addStretch(1)
+        tools_row.addWidget(tools_section)
+        tools_row.addStretch(1)
+        layout.addLayout(tools_row)
+
         layout.addStretch(1)
 
         # The logo is a fixed-size QSvgWidget and won't surrender height on a
@@ -2045,6 +2078,22 @@ class DashboardWidget(QWidget):
         divider.setStyleSheet('background-color: #2a2a2a; border: none;')
         vbox.addWidget(divider)
         vbox.addSpacing(6)
+
+        vbox.addWidget(self._build_yt_convert_cards_section())
+        return outer
+
+    def _build_yt_convert_cards_section(self) -> QWidget:
+        """YouTube-import + local-conversion cards. Neither tool touches
+        library data (_open_yt_import/_open_convert both work with
+        self._library_path is None — see their bodies), so this is shared
+        between the full dashboard (_build_action_cards_section, above) and
+        the welcome screen (_build_welcome), where it's the only way to reach
+        these tools when no drive/library is connected."""
+        _icons = _ASSETS / 'icons'
+        outer = QWidget()
+        vbox = QVBoxLayout(outer)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(10)
 
         # ── YouTube import cards ──────────────────────────────────────────
         yt_defs = [
