@@ -8,6 +8,18 @@ from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), '..'))
 
+# Single source of truth for the version — cratesort/src/version.py, also
+# read by main_window.py for the in-app title/About text. Read it here as a
+# standalone file (not `import cratesort...`) so packaging the app can never
+# pull in the app's own PyQt6 imports as a side effect. This constant used to
+# be duplicated by hand here AND in main_window.py; main_window.py's copy sat
+# stuck at "0.1.0" for nine straight beta releases because bumping this one
+# was a separate, easy-to-forget step.
+_version_ns: dict = {}
+with open(os.path.join(ROOT, 'cratesort', 'src', 'version.py')) as _f:
+    exec(_f.read(), _version_ns)
+VERSION = _version_ns['VERSION']
+
 block_cipher = None
 
 a = Analysis(
@@ -83,8 +95,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'CrateSort',
         'CFBundleDisplayName': 'CrateSort',
-        'CFBundleShortVersionString': '0.1.9',
-        'CFBundleVersion': '0.1.9',
+        'CFBundleShortVersionString': VERSION,
+        'CFBundleVersion': VERSION,
         'NSHumanReadableCopyright': 'Copyright © 2026 JWBC, LLC. All rights reserved.',
         'NSHighResolutionCapable': True,
     },

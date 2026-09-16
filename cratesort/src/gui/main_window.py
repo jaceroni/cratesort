@@ -37,11 +37,11 @@ from cratesort.src.gui.playback_bar import PlaybackBar
 from cratesort.src.gui.video_window import FloatingVideoWindow
 from cratesort.src.utils.undo_manager import UndoManager
 from cratesort.src.utils.serato_guard import launch_serato
+from cratesort.src.version import VERSION
 
 _ASSETS = Path(__file__).parent.parent.parent / 'assets'
 _LOGO_WORDMARK = _ASSETS / 'logo' / 'cs-logo-lockup-horiz.svg'
 
-VERSION = '0.1.0'
 ORG = 'JWBC'
 APP = 'CrateSort'
 
