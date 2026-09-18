@@ -295,6 +295,16 @@ class DuplicateReviewView(QWidget):
         self._card_widgets: dict[int, QWidget] = {}
         self._filter_btns:  dict[str, QPushButton] = {}
 
+        # Chunked-population bookkeeping (see _populate_results /
+        # _continue_populate) — large libraries build their result rows
+        # across several event-loop ticks instead of freezing on one huge
+        # synchronous pass. _populate_gen invalidates a stale in-flight run;
+        # _populating_in_progress distinguishes "progress screen showing
+        # because we're still building the list" from "showing because a real
+        # consolidation is running" (same stack page, different reason).
+        self._populate_gen = 0
+        self._populating_in_progress = False
+
         self._stack = QStackedWidget()
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -344,6 +354,13 @@ class DuplicateReviewView(QWidget):
 
     def hideEvent(self, event):  # noqa: N802
         super().hideEvent(event)
+        # Invalidate any in-flight chunked population (see _populate_results)
+        # — its stale continuation would otherwise keep firing timers and
+        # inserting widgets into a screen that's being torn down.
+        self._populate_gen += 1
+        if self._populating_in_progress:
+            self._populating_in_progress = False
+            self._stack.setCurrentIndex(_STATE_RESULTS)
         if self._card_widgets:
             self._clear_result_widgets()
 
@@ -504,6 +521,19 @@ class DuplicateReviewView(QWidget):
 
     # ── Results population ─────────────────────────────────────────────────
 
+    # Below this many groups, one synchronous pass is fast enough that a
+    # progress screen would just be an unnecessary flash. Above it — confirmed
+    # on a real 75k-track library that produced 16,000 duplicate groups —
+    # building every row's widget synchronously froze the app for close to a
+    # minute, with a system-level "spinning wheel of death," not just a slow
+    # render. The original review-screen design already avoids the *worst*
+    # case (a full interactive card per group) by rendering everything but the
+    # expanded group as a cheap collapsed strip — see _ensure_one_expanded —
+    # but at 16,000 items even the cheap strip's widget-construction cost adds
+    # up to a real, user-visible freeze.
+    _CHUNK_THRESHOLD = 800
+    _CHUNK_SIZE = 200
+
     def _populate_results(self) -> None:
         # Clear old content (keep the trailing stretch)
         while self._results_layout.count() > 1:
@@ -511,9 +541,74 @@ class DuplicateReviewView(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         self._card_widgets.clear()
+        self._ensure_one_expanded()
 
-        def insert(wdg: QWidget) -> None:
-            self._results_layout.insertWidget(self._results_layout.count() - 1, wdg)
+        # Bump before building the plan so a stale in-flight chunked run (from
+        # a rapid double filter-click, say) recognizes itself as superseded
+        # and stops instead of racing this one.
+        self._populate_gen += 1
+        gen = self._populate_gen
+        steps = self._build_populate_plan()
+
+        if len(self._groups) < self._CHUNK_THRESHOLD:
+            self._run_populate_steps(steps)
+            self._refresh_progress_and_filters()
+            self._refresh_consolidate_btn()
+            return
+
+        # Large library: build entirely off-screen (the progress stack page,
+        # not the results page) so nothing half-renders in front of the user,
+        # with real, calculable progress — the total is always known up
+        # front, so this is a real percentage, never a fake/pulsing one.
+        self._populating_in_progress = True
+        self._progress_bar.setRange(0, max(len(steps), 1))
+        self._progress_bar.setValue(0)
+        self._progress_label.setText('Preparing duplicate review…')
+        self._progress_count.setText(f'0 of {len(self._groups):,} groups')
+        self._stack.setCurrentIndex(_STATE_PROGRESS)
+        self._continue_populate(steps, gen, 0, len(steps))
+
+    def _continue_populate(self, steps: list, gen: int, done: int, total: int) -> None:
+        if gen != self._populate_gen:
+            return  # superseded by a newer load()/filter change — drop this run
+        batch, rest = steps[:self._CHUNK_SIZE], steps[self._CHUNK_SIZE:]
+        self._run_populate_steps(batch)
+        done += len(batch)
+        self._progress_bar.setValue(done)
+        self._progress_count.setText(f'{done:,} of {total:,}')
+        if rest:
+            QTimer.singleShot(0, lambda: self._continue_populate(rest, gen, done, total))
+            return
+        self._populating_in_progress = False
+        self._refresh_progress_and_filters()
+        self._refresh_consolidate_btn()
+        if self._stack.currentIndex() == _STATE_PROGRESS:
+            self._stack.setCurrentIndex(_STATE_RESULTS)
+
+    def _run_populate_steps(self, steps: list) -> None:
+        """Execute a batch of plan steps from _build_populate_plan — either
+        insert an already-built widget, or build+insert one group's card
+        (the expensive part, which is why this is called in chunks)."""
+        for step in steps:
+            if step[0] == 'w':
+                self._insert_result_widget(step[1])
+            else:
+                _, i, g = step
+                card = self._build_group_card(i, g)
+                self._card_widgets[i] = card
+                self._insert_result_widget(card)
+
+    def _insert_result_widget(self, wdg: QWidget) -> None:
+        self._results_layout.insertWidget(self._results_layout.count() - 1, wdg)
+
+    def _build_populate_plan(self) -> list:
+        """Decide everything about what the results screen should show —
+        section headers, empty states, which groups get a card — using only
+        the cheap per-group bookkeeping (tier/filter checks). Building the
+        group-card widgets themselves is deferred: each is represented here
+        as a ('c', idx, group) step for _run_populate_steps to execute later,
+        in chunks."""
+        steps: list = []
 
         skipped = self._summary.skipped_count if self._summary else 0
         if skipped > 0 and self._filter_mode == 'all':
@@ -526,14 +621,12 @@ class DuplicateReviewView(QWidget):
             notice.setStyleSheet(
                 f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
             )
-            insert(notice)
+            steps.append(('w', notice))
 
         tier1 = [(i, g) for i, g in enumerate(self._groups) if g.tier == 'true_duplicate']
         tier2 = [(i, g) for i, g in enumerate(self._groups) if g.tier == 'variant']
 
-        self._ensure_one_expanded()
-
-        def render_section(
+        def plan_section(
             title_base: str, subtitle: str, accent: str,
             entries: list[tuple[int, DuplicateGroup]], is_true: bool,
         ) -> None:
@@ -552,27 +645,27 @@ class DuplicateReviewView(QWidget):
                         lambda r=remaining: self._on_accept_all_true(r),
                     )
             n = len(entries)
-            insert(self._build_section_header(
+            steps.append(('w', self._build_section_header(
                 f'{title_base} — {n} group{"s" if n != 1 else ""}',
                 subtitle, accent, action=action,
-            ))
+            )))
             for i, g in visible:
-                card = self._build_group_card(i, g)
-                self._card_widgets[i] = card
-                insert(card)
+                steps.append(('c', i, g))
 
-        render_section(
+        plan_section(
             'True Duplicates',
             'Same file found in multiple locations. '
             'We\'ve selected the best copy — confirm or choose a different one.',
             _RED, tier1, True,
         )
-        render_section(
+        plan_section(
             'Possible Variants',
             'Looks like different versions of the same song. '
             'Confirm if any are actual duplicates you want to consolidate.',
             _ORANGE, tier2, False,
         )
+
+        has_visible_card = any(step[0] == 'c' for step in steps)
 
         # Empty states
         if not tier1 and not tier2:
@@ -592,16 +685,16 @@ class DuplicateReviewView(QWidget):
                 body.setStyleSheet(
                     f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
                 )
-                insert(headline)
-                insert(body)
+                steps.append(('w', headline))
+                steps.append(('w', body))
             else:
                 empty = QLabel('No duplicates found. Your library is clean.')
                 empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 empty.setStyleSheet(
                     f'color: {_MUTED}; font-size: 14px; background: transparent; border: none;'
                 )
-                insert(empty)
-        elif not self._card_widgets:
+                steps.append(('w', empty))
+        elif not has_visible_card:
             msg = {
                 'accepted':      'No groups accepted yet. Open a group and choose "Accept This Group".',
                 'needs_review':  'Every group has been reviewed. Consolidate when you\'re ready.',
@@ -614,10 +707,9 @@ class DuplicateReviewView(QWidget):
             lbl.setStyleSheet(
                 f'color: {_MUTED}; font-size: 13px; background: transparent; border: none;'
             )
-            insert(lbl)
+            steps.append(('w', lbl))
 
-        self._refresh_progress_and_filters()
-        self._refresh_consolidate_btn()
+        return steps
 
     def _apply_card_change(self, idx: int, refresh: bool = True) -> None:
         """Rebuild just one group's widget in place. Avoids re-rendering every
@@ -773,6 +865,7 @@ class DuplicateReviewView(QWidget):
         row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         song_lbl = QLabel(f'{group.canonical_artist}  —  {group.canonical_title}')
+        song_lbl.setWordWrap(True)  # same overflow risk/fix as the expanded card's title — see there
         song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 13px; font-weight: 600; background: transparent; border: none;')
         row.addWidget(song_lbl, stretch=1, alignment=Qt.AlignmentFlag.AlignVCenter)
 
@@ -833,6 +926,7 @@ class DuplicateReviewView(QWidget):
         _vc = Qt.AlignmentFlag.AlignVCenter
 
         song_lbl = QLabel(f'{group.canonical_artist}  —  {group.canonical_title}')
+        song_lbl.setWordWrap(True)
         song_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | _vc)
         song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 14px; font-weight: 600; background: transparent; border: none;')
         title_row.addWidget(song_lbl, stretch=1)
@@ -1095,10 +1189,46 @@ class DuplicateReviewView(QWidget):
             if i not in self._dismissed:
                 self._accepted.add(i)
                 self._expanded.discard(i)
-        for i in indices:
+
+        # Same freeze this loop hit at real-library scale as _populate_results
+        # — rebuilding one card at a time is already about as cheap as it
+        # gets per item, but at thousands of accepted groups the total add up
+        # to a real, multi-second-to-multi-minute synchronous stretch. Same
+        # chunked-with-progress treatment; see _populate_results for why.
+        if len(indices) < self._CHUNK_THRESHOLD:
+            for i in indices:
+                self._apply_card_change(i, refresh=False)
+            self._refresh_progress_and_filters()
+            self._refresh_consolidate_btn()
+            return
+
+        self._populate_gen += 1
+        gen = self._populate_gen
+        self._populating_in_progress = True
+        self._progress_bar.setRange(0, len(indices))
+        self._progress_bar.setValue(0)
+        self._progress_label.setText('Accepting duplicate groups…')
+        self._progress_count.setText(f'0 of {len(indices):,}')
+        self._stack.setCurrentIndex(_STATE_PROGRESS)
+        self._continue_accept_all(list(indices), gen, 0, len(indices))
+
+    def _continue_accept_all(self, remaining: list[int], gen: int, done: int, total: int) -> None:
+        if gen != self._populate_gen:
+            return  # superseded — a filter change or new load() dropped this run
+        batch, rest = remaining[:self._CHUNK_SIZE], remaining[self._CHUNK_SIZE:]
+        for i in batch:
             self._apply_card_change(i, refresh=False)
+        done += len(batch)
+        self._progress_bar.setValue(done)
+        self._progress_count.setText(f'{done:,} of {total:,}')
+        if rest:
+            QTimer.singleShot(0, lambda: self._continue_accept_all(rest, gen, done, total))
+            return
+        self._populating_in_progress = False
         self._refresh_progress_and_filters()
         self._refresh_consolidate_btn()
+        if self._stack.currentIndex() == _STATE_PROGRESS:
+            self._stack.setCurrentIndex(_STATE_RESULTS)
 
     # ── Navigation helpers ─────────────────────────────────────────────────
 
@@ -1141,6 +1271,7 @@ class DuplicateReviewView(QWidget):
         info_col.setSpacing(3)
 
         name_lbl = QLabel(copy.file_path.name)
+        name_lbl.setWordWrap(True)
         name_lbl.setStyleSheet(
             f'color: {_CREAM}; font-size: 13px; font-weight: 600; background: transparent; border: none;'
         )
@@ -1159,7 +1290,17 @@ class DuplicateReviewView(QWidget):
         fmt_lbl.setStyleSheet(f'color: {_DIM}; font-size: 12px; background: transparent; border: none;')
         info_col.addWidget(fmt_lbl)
 
+        # No wordWrap here used to mean a genuinely deep folder path could
+        # report an unbounded sizeHint width, and since this label sits in a
+        # stretch=1 column, that dragged the whole card (and the scroll
+        # area's content widget, via setWidgetResizable) wider than the
+        # window — a real horizontal-scrollbar bug at real-library depth,
+        # confirmed on a 75k-track library where it pushed the per-group
+        # Accept button off-screen entirely. Wrapping instead of a single
+        # unbounded line means this can never force the row wider than
+        # whatever width the layout actually gives it.
         path_lbl = QLabel(f'LOCATION: {copy.folder_context.replace("/", " > ").replace(" : ", " / ")}')
+        path_lbl.setWordWrap(True)
         path_lbl.setStyleSheet(
             f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;'
         )

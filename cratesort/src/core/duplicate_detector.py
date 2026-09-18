@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,7 +158,7 @@ class DuplicateDetector:
             buckets[key].append(rec)
 
         groups: list[DuplicateGroup] = []
-        for (norm_artist, norm_title), recs in buckets.items():
+        for bucket_i, ((norm_artist, norm_title), recs) in enumerate(buckets.items()):
             if len(recs) < 2:
                 continue
             clusters = self._cluster_by_duration(recs)
@@ -165,6 +166,16 @@ class DuplicateDetector:
                 if len(cluster) < 2:
                     continue
                 groups.append(self._build_group(cluster))
+            # This runs on a background QThread (dashboard.py's _BgSteps), but
+            # a tight pure-Python loop over tens of thousands of buckets still
+            # competes hard for the GIL with the main thread's event loop —
+            # confirmed on a real 75k-track library, where this whole pass
+            # made the app feel fully frozen (not just "a bit slow") for
+            # roughly a minute even though it was never literally blocking
+            # the main thread. A near-zero sleep every so often forces a GIL
+            # handoff so Qt's event loop actually gets scheduled in between.
+            if bucket_i % 200 == 0:
+                time.sleep(0)
 
         return groups
 
