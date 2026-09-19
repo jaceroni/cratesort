@@ -127,6 +127,7 @@ class RollbackLog:
             'moves': [],
             'metadata_changes': [],
             'crate_backup_paths': [],
+            'errors': [],
         }
 
     def set_context(
@@ -152,6 +153,8 @@ class RollbackLog:
             'executed_at': op.executed_at or '',
             'status': op.status,
         }
+        if op.error:
+            entry['error'] = op.error
         if duplicate:
             entry['duplicate'] = True
         if stems:
@@ -159,6 +162,14 @@ class RollbackLog:
         if reason:
             entry['reason'] = reason
         self._data['moves'].append(entry)
+
+    def log_error(self, message: str) -> None:
+        """Record a pipeline-level failure that never reached log_move() at all —
+        e.g. the crate-rewrite step for a group throwing before any file in that
+        group was touched. Without this, such a failure was only ever held in an
+        in-memory list the UI showed a bare count of ("1 file could not be
+        removed — check the log") and the log itself had nothing in it to check."""
+        self._data.setdefault('errors', []).append(message)
 
     def log_metadata(
         self,

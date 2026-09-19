@@ -651,6 +651,9 @@ class _ChangeReviewDialog(_CrateSortDialog):
     }
     _DEFAULT_RADIO_LABELS = ('Keep', 'Undo')
 
+    # Default/minimum cap on the change-list scroll area — see resizeEvent.
+    _SCROLL_MIN_HEIGHT = 440
+
     def __init__(
         self,
         changes: list[dict],
@@ -724,9 +727,14 @@ class _ChangeReviewDialog(_CrateSortDialog):
         scroll.setWidget(rows_container)
         # Cap the visible list so it scrolls past ~8 rows instead of forcing
         # the dialog to grow unbounded; below the cap, the dialog shrinks to
-        # fit the actual number of changes (no leftover blank space).
-        scroll.setMaximumHeight(440)
-        layout.addWidget(scroll)
+        # fit the actual number of changes (no leftover blank space). This
+        # cap is only the DEFAULT — resizeEvent() below raises it as the user
+        # drags the corner resize grip taller, so the table actually claims
+        # the extra space instead of leaving it as dead space under a
+        # frozen-height list (the fix for that exact reported bug).
+        self._scroll = scroll
+        scroll.setMaximumHeight(self._SCROLL_MIN_HEIGHT)
+        layout.addWidget(scroll, 1)
 
         # Rows are grouped under a shared timestamp header: a run of
         # consecutive changes with the same formatted time gets one
@@ -776,6 +784,20 @@ class _ChangeReviewDialog(_CrateSortDialog):
         btn_row.addStretch()
         btn_row.addWidget(self._sync_btn)
         layout.addLayout(btn_row)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)   # keeps _CrateSortDialog's corner grip positioned
+        scroll = getattr(self, '_scroll', None)
+        if scroll is None:
+            return
+        if not hasattr(self, '_chrome_height'):
+            # Everything in the dialog BUT the scroll area (title, description,
+            # button row, margins/spacing) — captured lazily on the first real
+            # resize rather than in __init__, since the layout hasn't settled
+            # actual widget geometry yet at construction time.
+            self._chrome_height = self.height() - scroll.height()
+        available = self.height() - self._chrome_height
+        scroll.setMaximumHeight(max(self._SCROLL_MIN_HEIGHT, available))
 
     # ── Row builder ───────────────────────────────────────────────────────────
 
@@ -2265,6 +2287,47 @@ class DashboardWidget(QWidget):
                 except Exception:
                     continue
 
+            # Duplicate-consolidation log entries — a completely separate log
+            # naming convention (duplicate_consolidation_*.json) from Organize's
+            # reorganization_log_*.json above, so it needs its own glob; without
+            # this, every Rinse consolidation was invisible here regardless of
+            # how recent it was.
+            for log_file in sorted(crate_sort_dir.glob('duplicate_consolidation_*.json'), reverse=True):
+                try:
+                    with open(log_file, encoding='utf-8') as f:
+                        log = json.load(f)
+                    exec_str = log.get('executed_at', '')
+                    if not exec_str:
+                        continue
+                    dt = datetime.fromisoformat(exec_str)
+                    if dt >= cutoff:
+                        completed = sum(1 for m in log.get('moves', []) if m.get('status') == 'completed')
+                        n_errors = len(log.get('errors', []))
+                        time_str = 'Today' if dt.date() == now.date() else dt.strftime('%b %d')
+                        text = f'{completed:,} duplicate{"s" if completed != 1 else ""} consolidated'
+                        if n_errors:
+                            text += f' — {n_errors} error{"s" if n_errors != 1 else ""}'
+                        items.append({
+                            'dot_color': self._ORANGE if n_errors else self._TEAL,
+                            'text': text,
+                            'time_str': time_str,
+                            '_dt': dt,
+                        })
+                    rb_str = log.get('rolled_back_at', '')
+                    if rb_str:
+                        dt_rb = datetime.fromisoformat(rb_str)
+                        if dt_rb >= cutoff:
+                            completed = sum(1 for m in log.get('moves', []) if m.get('status') == 'completed')
+                            time_str_rb = 'Today' if dt_rb.date() == now.date() else dt_rb.strftime('%b %d')
+                            items.append({
+                                'dot_color': self._ORANGE,
+                                'text': f'Consolidation Undone — {completed:,} file{"s" if completed != 1 else ""} restored',
+                                'time_str': time_str_rb,
+                                '_dt': dt_rb,
+                            })
+                except Exception:
+                    continue
+
         items.sort(key=lambda x: x['_dt'], reverse=True)
         items = items[:10]
 
@@ -2679,6 +2742,17 @@ class DashboardWidget(QWidget):
             subcrates = serato_dir / 'Subcrates'
             if subcrates.exists():
                 for crate_file in subcrates.rglob('*.crate'):
+                    if crate_file.name.startswith('._'):
+                        # macOS AppleDouble sidecar (e.g. "._Rock.crate" next to
+                        # "Rock.crate") — auto-created by the OS on non-native
+                        # filesystems (exFAT/FAT32) for any file write, not a
+                        # real crate. Without this guard, _read_tracks() below
+                        # fails to parse it, swallows the error, and returns
+                        # ([], None) — which this loop then records as a brand
+                        # new empty crate, surfacing as a bogus "New crate: ._X"
+                        # entry in the Serato Crate Changes Detected dialog
+                        # every time any real crate gets legitimately rewritten.
+                        continue
                     try:
                         from cratesort.src.serato.crate_reader import CrateReader
                         reader = CrateReader(serato_dir)

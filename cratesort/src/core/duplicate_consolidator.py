@@ -12,7 +12,9 @@ from typing import Optional
 from cratesort.src.core.duplicate_detector import DuplicateCopy, DuplicateGroup
 from cratesort.src.core.file_organizer import FileMoveOp, RollbackLog
 from cratesort.src.core.metadata_merger import merge_metadata
+from cratesort.src.serato.crate_reader import CrateReader
 from cratesort.src.serato.path_rewriter import PathChange, PathRewriter
+from cratesort.src.utils.checkpoint import update_checkpoint_crates
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +85,7 @@ class DuplicateConsolidator:
         )
         rlog = RollbackLog(log_path)
         rlog.set_context(self._library_path, self._serato_dir)
+        touched_crates: set[Path] = set()
 
         for i, entry in enumerate(approved_groups):
             if len(entry) == 3:
@@ -131,7 +134,9 @@ class DuplicateConsolidator:
                     serato_dir=self._serato_dir,
                 )
                 for err in merge_result.errors:
-                    all_errors.append(f'{group.canonical_title}: merge — {err}')
+                    msg = f'{group.canonical_title}: merge — {err}'
+                    all_errors.append(msg)
+                    rlog.log_error(msg)
 
             # Reroute all crate references first (before deleting files)
             rewrite_result = None
@@ -143,10 +148,18 @@ class DuplicateConsolidator:
                     crates_updated += rewrite_result.crates_modified
                     for bp in rewrite_result.backup_paths:
                         rlog.log_crate_backup(bp)
+                    touched_crates.update(r.crate_file for r in rewrite_result.changes_log)
+                    # rewrite() catches per-crate exceptions internally and still
+                    # returns normally — without this, a crate that individually
+                    # failed to update was invisible even to all_errors.
+                    for crate_file, err in rewrite_result.errors:
+                        msg = f'{group.canonical_title}: {crate_file.name} — {err}'
+                        all_errors.append(msg)
+                        rlog.log_error(msg)
                 except Exception as exc:
-                    all_errors.append(
-                        f'{group.canonical_title}: crate rewrite failed — {exc}'
-                    )
+                    msg = f'{group.canonical_title}: crate rewrite failed — {exc}'
+                    all_errors.append(msg)
+                    rlog.log_error(msg)
                     continue
 
             # Delete loser files
@@ -179,6 +192,23 @@ class DuplicateConsolidator:
 
         if commit:
             rlog.save()
+
+        if commit and touched_crates:
+            # Fold the crates we just rewrote into the sync checkpoint using a
+            # fresh read of each one, right now — ground truth from the same
+            # process that just wrote them, not a later rescan that has to
+            # guess. Every other crate's checkpoint entry is left untouched,
+            # so a genuine external Serato-side edit made elsewhere is still
+            # caught next session. See update_checkpoint_crates() docstring.
+            reader = CrateReader(self._serato_dir)
+            updates: dict[str, list[str]] = {}
+            for crate_file in touched_crates:
+                try:
+                    tracks, _ = reader._read_tracks(crate_file)
+                    updates[str(crate_file)] = tracks
+                except Exception as exc:
+                    all_errors.append(f'checkpoint refresh — {crate_file.name}: {exc}')
+            update_checkpoint_crates(self._serato_dir, updates)
 
         if progress_callback:
             progress_callback(total, total, 'Done')

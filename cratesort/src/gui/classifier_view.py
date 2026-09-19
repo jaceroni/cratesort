@@ -487,19 +487,21 @@ class _ClassifyWorker(QThread):
                 raw_artist = rec.artist or ''
                 no_artist = not raw_artist or raw_artist.lower() in ('unknown artist', 'various', 'fx')
 
-                # Film & TV: any video sitting in a "Film & TV" folder is pulled
-                # out here, before artist grouping — regardless of whether it
-                # carries an artist tag. Unlike the DJ Tools/Specialty checks
-                # below, this one is NOT gated on no_artist: a movie or TV clip
-                # can carry a real-looking artist tag (e.g. "Scarface") that
-                # collides with an actual recording artist, and the whole point
-                # is to route it away before that name ever reaches the
-                # per-artist genre vote.
-                if rec.is_video:
-                    ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
-                    if ancestor_names & _FILM_TV_FOLDER_NAMES:
-                        film_tv_by_title[_film_tv_title(rec)].append(rec)
-                        continue
+                # Film & TV: anything (video or audio) sitting in a "Film & TV"
+                # folder is pulled out here, before artist grouping — regardless
+                # of whether it carries an artist tag. Unlike the DJ Tools/
+                # Specialty checks below, this one is NOT gated on no_artist: a
+                # movie or TV clip can carry a real-looking artist tag (e.g.
+                # "Scarface") that collides with an actual recording artist, and
+                # the whole point is to route it away before that name ever
+                # reaches the per-artist genre vote. Audio-only scene/dialogue
+                # clips were added to this same folder-keyed check (not gated on
+                # is_video) so they land in Film & TV alongside video clips of
+                # the same show/movie instead of falling into Specialty.
+                ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
+                if ancestor_names & _FILM_TV_FOLDER_NAMES:
+                    film_tv_by_title[_film_tv_title(rec)].append(rec)
+                    continue
 
                 # Fix 7: untagged video files in purpose-video folders → DJ Tools /
                 # Specialty. Requires no_artist, same as the audio DJ Tools check

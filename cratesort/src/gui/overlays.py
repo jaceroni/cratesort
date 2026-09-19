@@ -156,6 +156,12 @@ class _AnimatedStatCardWidget(QFrame):
             self._current_value = max(self._target_value, self._current_value + step)
         self._value_label.setText(f'{self._current_value:,}{self._suffix}')
 
+    def set_suffix(self, suffix: str) -> None:
+        """Change the unit suffix after construction — for a card whose unit
+        isn't known until the value itself is (e.g. bytes freed rounds to
+        KB/MB/GB depending on the amount)."""
+        self._suffix = suffix
+
     def start_animation(self, target: int, duration_ms: int = 1400) -> None:
         self._target_value = target
         self._duration = duration_ms

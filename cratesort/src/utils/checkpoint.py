@@ -44,6 +44,32 @@ def load_checkpoint(serato_dir: str | Path) -> Optional[dict]:
         return None
 
 
+def update_checkpoint_crates(serato_dir: str | Path, updates: dict[str, list[str]]) -> None:
+    """
+    Patch specific crates into the existing checkpoint in place, leaving every
+    other crate's recorded state untouched, and refresh the timestamp.
+
+    For use right after CrateSort itself rewrites a crate (duplicate
+    consolidation, path repair, etc.) — the caller already knows exactly what
+    that crate's post-write content is, from the same in-process read/write,
+    so there's no need to wait for the next full-library rescan to "discover"
+    a change CrateSort made to itself. That rescan (dashboard.py's
+    _check_serato_sync) is meant to catch changes made directly in Serato
+    between sessions; without this, it was also re-detecting CrateSort's own
+    already-known, already-correct writes as suspicious external changes —
+    the mechanism behind a real false-alarm incident (crate content was never
+    actually wrong, but the "Serato Crate Changes Detected" dialog reported
+    large bogus track-removal counts for crates a same-session consolidation
+    had already correctly touched).
+    """
+    if not updates:
+        return
+    existing = load_checkpoint(serato_dir) or {'crates': {}}
+    crates = dict(existing.get('crates', {}))
+    crates.update(updates)
+    save_checkpoint(serato_dir, crates)
+
+
 def _normalize_path(path: str) -> str:
     """Normalize a crate file path for robust cross-session comparison."""
     p = str(Path(path))

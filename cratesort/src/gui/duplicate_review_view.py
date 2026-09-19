@@ -8,7 +8,7 @@ from typing import Callable, Optional
 from PyQt6.QtCore import Qt, QPointF, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
-    QButtonGroup, QFrame, QHBoxLayout, QLabel, QProgressBar,
+    QButtonGroup, QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar,
     QPushButton, QRadioButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -23,7 +23,12 @@ from cratesort.src.core.duplicate_consolidator import (
     DuplicateConsolidator, ConsolidationResult,
 )
 from cratesort.src.core.duplicate_dismissals import add_dismissed, remove_dismissed
-from cratesort.src.gui.overlays import _ov_alert, _ov_confirm
+from cratesort.src.core.file_organizer import FileOrganizer
+from cratesort.src.serato.crate_reader import CrateReader
+from cratesort.src.utils.checkpoint import update_checkpoint_crates
+from cratesort.src.gui.overlays import (
+    _ov_alert, _ov_confirm, _CrateSortDialog, _create_dialog_layout, _AnimatedStatCardWidget,
+)
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -47,10 +52,8 @@ _STATE_CELEBRATION  = 2
 # Filter modes for the results screen
 _FILTERS = (
     ('all',            'All'),
-    ('true_duplicate', 'True duplicates'),
-    ('variant',        'Possible variants'),
-    ('needs_review',   'Needs review'),
-    ('accepted',       'Accepted'),
+    ('true_duplicate', 'True Duplicates'),
+    ('variant',        'Possible Variants'),
 )
 
 _FILTER_PILL_QSS = (
@@ -103,10 +106,17 @@ def _winner_reason(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> str:
     if (winner.bitrate or 0) > max_loser_br:
         return f'higher quality ({winner.bitrate} kbps)'
 
-    # Larger file at same bitrate (better rip / more data)
+    # Larger file at same bitrate (better rip / more data) — but only when the
+    # difference is big enough to actually mean something. A few-byte (or
+    # even few-KB) gap is just ID3 tag padding, not a meaningfully different
+    # encode, and citing it as "the reason" is technically true but
+    # substantively misleading. Require the delta to clear 1% of the file
+    # size before treating it as real; otherwise fall through to whatever
+    # criterion actually differentiates these files.
     max_loser_size = max(l.file_size for l in losers)
-    if winner.file_size > max_loser_size:
-        return 'larger file size'
+    delta = winner.file_size - max_loser_size
+    if delta > 0 and delta >= max_loser_size * 0.01:
+        return f'larger file size (+{fmt_bytes(delta)})'
 
     # More metadata filled in
     winner_meta = sum(1 for v in [winner.genre_tag, winner.year_tag, winner.bpm] if v)
@@ -127,6 +137,16 @@ def _winner_reason(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> str:
         return 'cleaner filename'
 
     return 'best available copy'
+
+
+def _natural_join(fields: list[str]) -> str:
+    """'comment' -> 'a comment'; 'artwork' -> 'artwork' (uncountable);
+    multiple -> 'a comment and a year'. Used to avoid the stilted
+    'also has: comment' colon-list phrasing."""
+    worded = [f if f == 'artwork' else f'a {f}' for f in fields]
+    if len(worded) == 1:
+        return worded[0]
+    return ', '.join(worded[:-1]) + f' and {worded[-1]}'
 
 
 def _winner_metadata_advantages(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> list[str]:
@@ -157,6 +177,35 @@ def _comment_merge_note(winner: DuplicateCopy, losers: list[DuplicateCopy]) -> s
         return ''
     else:
         return 'comment from other copy will carry over'
+
+
+# Reasons in _winner_reason() that reflect real, objective audio/rip quality —
+# as opposed to metadata completeness, crate count, or filename tidiness,
+# none of which say anything about whether the audio itself is better. A
+# track missing a YEAR tag (someone never filled it in, or entered it wrong)
+# is not evidence of a worse rip, so a loser-row note must not claim "lower
+# quality" on that basis alone — only when one of these genuinely fired.
+_QUALITY_REASON_MARKERS = ('lossless format', 'higher quality (', 'larger file size (')
+
+
+def _loser_note(copy: DuplicateCopy, winner: DuplicateCopy) -> str:
+    """
+    Plain-language note for a non-recommended copy explaining why it wasn't
+    picked — or '' if nothing meaningfully differentiates it from the winner.
+    Deliberately avoids asserting "lower quality" when the only difference is
+    missing/incomplete metadata, since that's a data-entry gap, not evidence
+    the audio itself is worse.
+    """
+    reason = _winner_reason(winner, [copy])
+    if any(marker in reason for marker in _QUALITY_REASON_MARKERS):
+        return f'Not the recommended copy — {reason}'
+    advantages = _winner_metadata_advantages(winner, [copy])
+    if advantages:
+        return (
+            f'Not the recommended copy — missing {_natural_join(advantages)}, '
+            f'which doesn\'t necessarily mean lower quality'
+        )
+    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +295,185 @@ class _ConsolidationWorker(QThread):
             self.errored.emit(f'{exc}\n{traceback.format_exc()}')
 
 
+class _UndoConsolidationWorker(QThread):
+    finished = pyqtSignal(object)   # dict — rollback() result
+    errored  = pyqtSignal(str)
+
+    def __init__(
+        self,
+        log_path: Path,
+        library_path: Path,
+        serato_dir: Optional[Path],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._log_path     = log_path
+        self._library_path = library_path
+        self._serato_dir   = serato_dir
+
+    def run(self) -> None:
+        try:
+            import json
+            result = FileOrganizer(self._library_path, self._serato_dir).rollback(self._log_path)
+            # Fold the just-restored crates back into the sync checkpoint, same
+            # reasoning as DuplicateConsolidator.consolidate() — otherwise the
+            # very next dashboard sync-check would misreport this undo itself
+            # as a suspicious external change.
+            if self._serato_dir:
+                try:
+                    with open(self._log_path, encoding='utf-8') as f:
+                        log_data = json.load(f)
+                    backup_paths = log_data.get('crate_backup_paths', [])
+                    subcrates_dir = self._serato_dir / 'Subcrates'
+                    reader = CrateReader(self._serato_dir)
+                    updates: dict[str, list[str]] = {}
+                    for bp in backup_paths:
+                        # Backup lives under _CrateSort_Backups/<same relative
+                        # path as under Subcrates>/<Name>_<timestamp>.crate.bak —
+                        # map it back to the live crate file it restored.
+                        backup_path = Path(bp)
+                        try:
+                            rel = backup_path.relative_to(self._serato_dir / '_CrateSort_Backups')
+                        except ValueError:
+                            continue
+                        name = rel.name
+                        # Strip the "_<14-digit timestamp>.crate.bak" suffix back to "<Name>.crate"
+                        import re as _re
+                        m = _re.match(r'^(.*)_\d{8}_\d{6}\.crate\.bak$', name)
+                        if not m:
+                            continue
+                        live_path = subcrates_dir / rel.parent / f'{m.group(1)}.crate'
+                        if live_path.exists():
+                            tracks, _ = reader._read_tracks(live_path)
+                            updates[str(live_path)] = tracks
+                    update_checkpoint_crates(self._serato_dir, updates)
+                except Exception:
+                    pass   # checkpoint refresh is best-effort; the undo itself already succeeded
+            self.finished.emit(result)
+        except Exception as exc:
+            self.errored.emit(str(exc))
+
+
+def _round_unit(n: int) -> tuple[int, str]:
+    """Whole-number value + unit for a byte count, same unit ladder as
+    fmt_bytes() but rounded to an integer (the stat-card widget only animates
+    whole numbers)."""
+    val = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if val < 1024:
+            return round(val), unit
+        val /= 1024
+    return round(val), 'TB'
+
+
+class _ConsolidatePreviewDialog(_CrateSortDialog):
+    """
+    Replaces a dense paragraph of prose ("This will consolidate N extra
+    copies into the ones you're keeping and free X...") with the same
+    stat-card treatment used on the dashboard — Jace, reviewing the old
+    version: "it looks like a paragraph, almost a warning... I want a more
+    data-driven view." Reuses _AnimatedStatCardWidget (the one stat-card look
+    used everywhere else in the app) rather than inventing a new one.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget,
+        groups_count: int,
+        files_kept: int,
+        copies_removed: int,
+        space_freed: int,
+    ):
+        super().__init__(parent)
+        self._elastic = False   # matches _ov_confirm(confirm_danger=True) — no bounce for a destructive action
+        self.setMinimumWidth(640)
+
+        layout = _create_dialog_layout(self)
+
+        title_lbl = QLabel('Consolidate Duplicates')
+        title_lbl.setStyleSheet(
+            'color: #f1e3c8; font-size: 22px; font-weight: 600; '
+            'font-family: "Helvetica Neue", Arial, Helvetica; background: transparent; border: none;'
+        )
+        layout.addWidget(title_lbl)
+        layout.addSpacing(4)
+
+        lead_lbl = QLabel(
+            f'Across {groups_count} group{"s" if groups_count != 1 else ""}, '
+            f'here\'s what will happen:'
+        )
+        lead_lbl.setStyleSheet('color: #d5c7ad; font-size: 14px; background: transparent; border: none;')
+        layout.addWidget(lead_lbl)
+
+        stat_row = QHBoxLayout()
+        stat_row.setSpacing(12)
+
+        kept_card = _AnimatedStatCardWidget('FILES KEPT')
+        stat_row.addWidget(kept_card, stretch=1)
+
+        removed_card = _AnimatedStatCardWidget('COPIES REMOVED')
+        stat_row.addWidget(removed_card, stretch=1)
+
+        freed_value, freed_unit = _round_unit(space_freed)
+        freed_card = _AnimatedStatCardWidget('SPACE FREED', suffix=f' {freed_unit}')
+        stat_row.addWidget(freed_card, stretch=1)
+
+        layout.addLayout(stat_row)
+
+        note_lbl = QLabel()
+        note_lbl.setTextFormat(Qt.TextFormat.RichText)
+        note_lbl.setText(
+            '<div style="line-height: 145%;">'
+            'Your crates stay pointed at the copy you keep. An "Undo This '
+            'Consolidation" option will be available right after, as long as '
+            'nothing else touches these files in the meantime.'
+            '</div>'
+        )
+        note_lbl.setWordWrap(True)
+        note_lbl.setStyleSheet('color: #a89b85; font-size: 12px; background: transparent; border: none;')
+        layout.addWidget(note_lbl)
+
+        yes_btn = QPushButton('Consolidate')
+        yes_btn.setFixedHeight(36)
+        yes_btn.setStyleSheet(
+            'QPushButton { background-color: #c35050; color: #ffffff; border: none; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 600; }'
+            'QPushButton:hover { background-color: #b03c3c; }'
+            'QPushButton:pressed { background-color: #973434; }'
+        )
+        yes_btn.clicked.connect(self.accept)
+        yes_btn.setAutoDefault(False)
+
+        no_btn = QPushButton('Cancel')
+        no_btn.setFixedHeight(36)
+        no_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: #a89b85; border: 1px solid #444444; '
+            'border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }'
+            'QPushButton:hover { color: #f1e3c8; border-color: #f1e3c8; background: rgba(241, 227, 200, 0.05); }'
+            'QPushButton:pressed { background: rgba(241, 227, 200, 0.1); }'
+        )
+        no_btn.clicked.connect(self.reject)
+        no_btn.setDefault(True)   # destructive action — Return must stay the safe choice
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+        btn_row.addWidget(no_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(yes_btn)
+        layout.addLayout(btn_row)
+
+        kept_card.start_animation(files_kept, 700)
+        removed_card.start_animation(copies_removed, 700)
+        freed_card.start_animation(freed_value, 700)
+
+
+def _show_consolidate_preview(
+    parent: QWidget, groups_count: int, files_kept: int, copies_removed: int, space_freed: int,
+) -> bool:
+    dlg = _ConsolidatePreviewDialog(parent, groups_count, files_kept, copies_removed, space_freed)
+    return dlg.exec() == QDialog.DialogCode.Accepted
+
+
 # ---------------------------------------------------------------------------
 # Duplicate Review View
 # ---------------------------------------------------------------------------
@@ -280,6 +508,8 @@ class DuplicateReviewView(QWidget):
         self._groups:       list[DuplicateGroup] = []
         self._summary:      Optional[DuplicateSummary] = None
         self._worker:       Optional[_ConsolidationWorker] = None
+        self._undo_worker:  Optional[_UndoConsolidationWorker] = None
+        self._last_rollback_log_path: Optional[Path] = None
 
         # Per-group winner overrides: group index → DuplicateCopy
         self._winner_overrides: dict[int, DuplicateCopy] = {}
@@ -390,7 +620,7 @@ class DuplicateReviewView(QWidget):
         hdr_row.setContentsMargins(0, 0, 0, 0)
 
         title_col = QVBoxLayout()
-        title_lbl = QLabel('Rinse Your Library')
+        title_lbl = QLabel('Duplicate Consolidation')
         title_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 20px; font-weight: 700; background: transparent;')
         subtitle = QLabel('Review potential duplicates before you classify.')
         subtitle.setStyleSheet(f'color: {_MUTED}; font-size: 13px; background: transparent;')
@@ -448,6 +678,14 @@ class DuplicateReviewView(QWidget):
         filt_row = QHBoxLayout(self._filter_row_w)
         filt_row.setContentsMargins(0, 4, 0, 6)
         filt_row.setSpacing(8)
+
+        filt_by_lbl = QLabel('Filter by')
+        filt_by_lbl.setStyleSheet(
+            f'color: {_MUTED}; font-size: 12px; font-weight: 600; '
+            f'background: transparent; border: none;'
+        )
+        filt_row.addWidget(filt_by_lbl)
+
         self._filter_group = QButtonGroup(w)
         self._filter_group.setExclusive(True)
         for mode, base_label in _FILTERS:
@@ -498,13 +736,7 @@ class DuplicateReviewView(QWidget):
         m = self._filter_mode
         if m == 'all':
             return True
-        if m in ('true_duplicate', 'variant'):
-            return group.tier == m
-        if m == 'needs_review':
-            return idx not in self._accepted and idx not in self._dismissed
-        if m == 'accepted':
-            return idx in self._accepted
-        return True
+        return group.tier == m
 
     def _ensure_one_expanded(self) -> Optional[int]:
         """Keep exactly one reviewable group open to work on. Returns the index
@@ -633,8 +865,13 @@ class DuplicateReviewView(QWidget):
             visible = [(i, g) for i, g in entries if self._passes_filter(i, g)]
             if not visible:
                 return
+            # Accepted groups render as a collapsed strip already (see
+            # _build_group_card) — sorting them after the still-pending ones
+            # keeps what you're actively working on at the top, without
+            # needing a dedicated "hide accepted" filter button for it.
+            visible.sort(key=lambda ig: ig[0] in self._accepted)
             action: Optional[tuple[str, Callable[[], None]]] = None
-            if is_true and self._filter_mode != 'accepted':
+            if is_true:
                 remaining = [
                     i for i, _g in entries
                     if i not in self._accepted and i not in self._dismissed
@@ -696,10 +933,8 @@ class DuplicateReviewView(QWidget):
                 steps.append(('w', empty))
         elif not has_visible_card:
             msg = {
-                'accepted':      'No groups accepted yet. Open a group and choose "Accept This Group".',
-                'needs_review':  'Every group has been reviewed. Consolidate when you\'re ready.',
                 'true_duplicate': 'No true duplicates.',
-                'variant':       'No possible variants.',
+                'variant':        'No possible variants.',
             }.get(self._filter_mode, 'Nothing matches this filter.')
             lbl = QLabel(msg)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -750,11 +985,6 @@ class DuplicateReviewView(QWidget):
             'all':            total,
             'true_duplicate': sum(1 for g in self._groups if g.tier == 'true_duplicate'),
             'variant':        sum(1 for g in self._groups if g.tier == 'variant'),
-            'needs_review':   sum(
-                1 for i in range(total)
-                if i not in self._accepted and i not in self._dismissed
-            ),
-            'accepted':       len(self._accepted),
         }
         for mode, btn in self._filter_btns.items():
             base = getattr(btn, '_base_label', btn.text())
@@ -931,12 +1161,6 @@ class DuplicateReviewView(QWidget):
         song_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 14px; font-weight: 600; background: transparent; border: none;')
         title_row.addWidget(song_lbl, stretch=1)
 
-        savings_lbl = QLabel(
-            f'frees {fmt_bytes(sum(c.file_size for c in group.copies if c is not winner))}'
-        )
-        savings_lbl.setStyleSheet(f'color: {_TEAL}; font-size: 12px; background: transparent; border: none;')
-        title_row.addWidget(savings_lbl, alignment=_vc)
-
         keep_all_btn = QPushButton('Keep All — Don\'t Ask Again')
         keep_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         keep_all_btn.setMinimumHeight(28)
@@ -958,24 +1182,39 @@ class DuplicateReviewView(QWidget):
         btn_group.setExclusive(True)
         copy_rows: list[tuple] = []  # (radio, row_frame, copy)
 
+        conflict_fields = [c.field.upper() for c in group.metadata_conflicts]
         for copy in group.copies:
             is_winner = (copy is winner)
-            radio, row = self._build_copy_row(copy, is_winner, winner, group.copies)
+            radio, row = self._build_copy_row(copy, is_winner, winner, group.copies, conflict_fields)
             btn_group.addButton(radio)
             if is_winner:
                 radio.setChecked(True)
             copy_rows.append((radio, row, copy))
             layout.addWidget(row)
 
-        # Footer: live summary + Accept
+        # Footer: the call-to-action sentence sits directly beside its own
+        # button now, rather than up in the title bar competing for space
+        # with the song title and Keep All — it's the same "select a file,
+        # then confirm" action, so it reads as one connected unit.
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 4, 0, 0)
-        summary_lbl = QLabel()
-        summary_lbl.setWordWrap(True)
-        summary_lbl.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
-        footer.addWidget(summary_lbl, stretch=1)
+        footer.addStretch(1)
 
-        accept_btn = QPushButton('Accept This Group')
+        savings_lbl = QLabel(
+            f'Select the file you\'d like to keep — the unselected duplicates will be '
+            f'deleted to free-up {fmt_bytes(sum(c.file_size for c in group.copies if c is not winner))}'
+        )
+        # _MUTED (not the brighter _CREAM) — matches the LOCATION/COMMENT/etc.
+        # detail text already used elsewhere in this card. padding-top nudges
+        # the label's own font-metrics baseline down to align with the
+        # button's vertically-centered text next to it.
+        savings_lbl.setStyleSheet(
+            f'color: {_MUTED}; font-size: 12px; background: transparent; border: none; padding-top: 5px;'
+        )
+        footer.addWidget(savings_lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
+        footer.addSpacing(16)
+
+        accept_btn = QPushButton('Confirm Selection')
         accept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         accept_btn.setFixedHeight(32)
         accept_btn.setStyleSheet(
@@ -987,13 +1226,9 @@ class DuplicateReviewView(QWidget):
         footer.addWidget(accept_btn)
 
         def _refresh_footer(cur_winner: DuplicateCopy) -> None:
-            n = len(group.copies) - 1
-            summary_lbl.setText(
-                f'Keeping {cur_winner.file_path.name}  ·  {n} other '
-                f'cop{"ies" if n != 1 else "y"} consolidated into it'
-            )
             savings_lbl.setText(
-                f'frees {fmt_bytes(sum(c.file_size for c in group.copies if c is not cur_winner))}'
+                f'Select the file you\'d like to keep — the unselected duplicates will be '
+                f'deleted to free-up {fmt_bytes(sum(c.file_size for c in group.copies if c is not cur_winner))}'
             )
 
         def _on_winner_toggled(_btn, checked: bool) -> None:
@@ -1045,24 +1280,11 @@ class DuplicateReviewView(QWidget):
             )
             layout.addWidget(note)
 
-        elif group.metadata_conflicts:
-            conflicting = [c.field.upper() for c in group.metadata_conflicts]
-            if len(conflicting) == 1:
-                conflict_str = conflicting[0]
-            elif len(conflicting) == 2:
-                conflict_str = f'{conflicting[0]} and {conflicting[1]}'
-            else:
-                conflict_str = ', '.join(conflicting[:-1]) + f', and {conflicting[-1]}'
-            warn = QLabel(
-                f'{conflict_str} {"differs" if len(conflicting) == 1 else "differ"} '
-                f'between copies — the winner\'s '
-                f'{"value" if len(conflicting) == 1 else "values"} will be kept.'
-            )
-            warn.setWordWrap(True)
-            warn.setStyleSheet(
-                f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;'
-            )
-            layout.addWidget(warn)
+        # Metadata-conflict disclosure (which fields disagree between copies)
+        # now lives in the winner's teal "Keeping this one" line inside
+        # _build_copy_row, in the same place as the win-reason explanation —
+        # previously it was a separate line here that could disagree with
+        # (or omit fields from) the teal text above it.
 
         layout.addLayout(footer)
         _refresh_footer(winner)
@@ -1241,10 +1463,11 @@ class DuplicateReviewView(QWidget):
 
     def _build_copy_row(
         self,
-        copy:       DuplicateCopy,
-        is_winner:  bool,
-        winner:     Optional[DuplicateCopy] = None,
-        all_copies: Optional[list]          = None,
+        copy:            DuplicateCopy,
+        is_winner:       bool,
+        winner:          Optional[DuplicateCopy] = None,
+        all_copies:      Optional[list]          = None,
+        conflict_fields: Optional[list[str]]     = None,
     ) -> tuple:
         row = QFrame()
         bg     = _ROW  if is_winner else _ROW2
@@ -1325,6 +1548,9 @@ class DuplicateReviewView(QWidget):
             f'GENRE: {copy.genre_tag}' if copy.genre_tag else 'GENRE: N/A'
         ))
         info_col.addWidget(_detail(
+            f'YEAR: {copy.year_tag}' if copy.year_tag else 'YEAR: N/A'
+        ))
+        info_col.addWidget(_detail(
             f'BPM: {int(copy.bpm)}' if copy.bpm else 'BPM: N/A'
         ))
         info_col.addWidget(_detail(
@@ -1335,11 +1561,35 @@ class DuplicateReviewView(QWidget):
             reason = _winner_reason(copy, others)
             advantages = _winner_metadata_advantages(copy, others)
             comment_note = _comment_merge_note(copy, others)
-            label_text = f'✳  Keeping this one — {reason}'
+            # 'best available copy' is a content-free fallback for when
+            # nothing in _winner_reason's own criteria differs — don't show
+            # it as filler when a real differentiator (extra metadata, a
+            # richer comment) is about to be stated right after it anyway.
+            if reason == 'best available copy' and (advantages or comment_note):
+                label_text = '❤  Keep this file'
+            else:
+                label_text = f'❤  Keep this file — {reason}'
             if advantages:
-                label_text += f' — also has: {", ".join(advantages)}'
+                label_text += f' — has {_natural_join(advantages)}'
             if comment_note:
                 label_text += f' — {comment_note}'
+            if conflict_fields:
+                # All differing-value fields (both copies have a value, but
+                # disagree) surface here, in the one place that already
+                # explains the winner decision — previously this lived only
+                # in a separate line below both copies, and could silently
+                # omit fields (e.g. YEAR) that the teal line never mentioned
+                # at all, which read as the two texts contradicting each other.
+                plural = len(conflict_fields) != 1
+                fields_str = (
+                    conflict_fields[0] if len(conflict_fields) == 1
+                    else ', '.join(conflict_fields[:-1]) + f' and {conflict_fields[-1]}'
+                )
+                label_text += (
+                    f' — {fields_str} also {"differ" if plural else "differs"}, '
+                    f'winner\'s value{"s" if plural else ""} kept'
+                )
+            info_col.addSpacing(8)   # extra breathing room above this block
             rec_lbl = QLabel(label_text)
             rec_lbl.setWordWrap(True)
             rec_lbl.setStyleSheet(
@@ -1347,7 +1597,29 @@ class DuplicateReviewView(QWidget):
             )
             info_col.addWidget(rec_lbl)
 
+            info_col.addSpacing(6)   # extra breathing room between the two lines
+            # Crate-safety reassurance is universally true for every
+            # consolidation (not evidence-based like the line above), so it's
+            # fixed text rather than something computed per group. Same gray
+            # as the format/bitrate/duration/size line (_DIM), not teal —
+            # it's a supporting note, not part of the decision claim above it.
+            crates_lbl = QLabel(
+                'Any crates that were using the unselected files will be '
+                'automatically rerouted to the file you keep.'
+            )
+            crates_lbl.setWordWrap(True)
+            crates_lbl.setStyleSheet(
+                f'color: {_DIM}; font-size: 11px; background: transparent; border: none;'
+            )
+            info_col.addWidget(crates_lbl)
+
         elif winner is not None:
+            loser_note = _loser_note(copy, winner)
+            if loser_note:
+                note_lbl = QLabel(loser_note)
+                note_lbl.setWordWrap(True)
+                note_lbl.setStyleSheet(f'color: {_DIM}; font-size: 11px; background: transparent; border: none;')
+                info_col.addWidget(note_lbl)
             if copy.play_count and copy.play_count > (winner.play_count or 0):
                 warn = QLabel('Play count from this copy will be added to the winner')
                 warn.setStyleSheet(f'color: {_MUTED}; font-size: 11px; background: transparent; border: none;')
@@ -1445,20 +1717,23 @@ class DuplicateReviewView(QWidget):
         check.setStyleSheet(f'color: {_TEAL}; font-size: 56px; background: transparent; border: none;')
         layout.addWidget(check)
 
-        self._celeb_headline = QLabel('Rinsed.')
+        self._celeb_headline = QLabel('Consolidation Successful')
         self._celeb_headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._celeb_headline.setStyleSheet(
             f'color: {_CREAM}; font-size: 28px; font-weight: 700; background: transparent; border: none;'
         )
         layout.addWidget(self._celeb_headline)
 
-        self._celeb_stat = QLabel()
-        self._celeb_stat.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._celeb_stat.setWordWrap(True)
-        self._celeb_stat.setStyleSheet(
-            f'color: {_TEAL}; font-size: 16px; background: transparent; border: none;'
-        )
-        layout.addWidget(self._celeb_stat)
+        # Same stat-card treatment as the pre-consolidation confirm dialog
+        # (_ConsolidatePreviewDialog) — one consistent "here are the numbers"
+        # look across both the before and after screens of this same action.
+        stat_row = QHBoxLayout()
+        stat_row.setSpacing(12)
+        self._celeb_removed_card = _AnimatedStatCardWidget('DUPLICATES REMOVED')
+        stat_row.addWidget(self._celeb_removed_card, stretch=1)
+        self._celeb_freed_card = _AnimatedStatCardWidget('SPACE FREED')
+        stat_row.addWidget(self._celeb_freed_card, stretch=1)
+        layout.addLayout(stat_row)
 
         self._celeb_tip = QLabel()
         self._celeb_tip.setTextFormat(Qt.TextFormat.RichText)
@@ -1493,6 +1768,18 @@ class DuplicateReviewView(QWidget):
         )
         self._celeb_errors_lbl.hide()
         layout.addWidget(self._celeb_errors_lbl)
+
+        self._undo_btn = QPushButton('Undo This Consolidation')
+        self._undo_btn.setFixedHeight(30)
+        self._undo_btn.setStyleSheet(
+            f'QPushButton {{ background: transparent; color: {_MUTED}; border: none; '
+            f'font-size: 12px; text-decoration: underline; }}'
+            f'QPushButton:hover {{ color: {_CREAM}; }}'
+        )
+        self._undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._undo_btn.clicked.connect(self._on_undo_consolidation)
+        self._undo_btn.hide()
+        layout.addWidget(self._undo_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         classify_btn = QPushButton('Go Back to Dashboard')
         classify_btn.setFixedHeight(44)
@@ -1532,16 +1819,12 @@ class DuplicateReviewView(QWidget):
 
         files_removed = sum(len(losers) for _g, _w, losers in approved)
         space_freed   = sum(c.file_size for _g, _w, losers in approved for c in losers)
-        if not _ov_confirm(
+        if not _show_consolidate_preview(
             self,
-            'Consolidate Duplicates',
-            f'This will consolidate {files_removed} extra '
-            f'cop{"ies" if files_removed != 1 else "y"} into the ones you\'re keeping '
-            f'and free {fmt_bytes(space_freed)}.\n\n'
-            'Your crates stay pointed at the copy you keep. '
-            'This can\'t be reversed from inside CrateSort.',
-            confirm_text='Consolidate',
-            confirm_danger=True,
+            groups_count=len(approved),
+            files_kept=len(approved),
+            copies_removed=files_removed,
+            space_freed=space_freed,
         ):
             return
 
@@ -1569,18 +1852,28 @@ class DuplicateReviewView(QWidget):
 
     def _on_finished(self, result: ConsolidationResult) -> None:
         self._worker = None
+        self._last_rollback_log_path = result.rollback_log_path
+        if result.rollback_log_path and result.files_removed > 0:
+            self._undo_btn.setText('Undo This Consolidation')
+            self._undo_btn.setEnabled(True)
+            self._undo_btn.show()
+        else:
+            self._undo_btn.hide()
 
         n = result.files_removed
-        s = fmt_bytes(result.space_freed)
-        self._celeb_stat.setText(
-            f'{n:,} duplicate{"s" if n != 1 else ""} cleaned up  ·  {s} freed'
-        )
+        freed_value, freed_unit = _round_unit(result.space_freed)
+        self._celeb_removed_card.start_animation(n, 700)
+        self._celeb_freed_card.set_suffix(f' {freed_unit}')
+        self._celeb_freed_card.start_animation(freed_value, 700)
 
         if result.errors:
-            self._celeb_errors_lbl.setText(
-                f'⚠ {len(result.errors)} file{"s" if len(result.errors) != 1 else ""} '
-                f'could not be removed — check the log.'
-            )
+            n_err = len(result.errors)
+            shown = result.errors[:3]
+            more = n_err - len(shown)
+            detail = '\n'.join(f'⚠ {e}' for e in shown)
+            if more > 0:
+                detail += f'\n…and {more} more.'
+            self._celeb_errors_lbl.setText(detail)
             self._celeb_errors_lbl.show()
         else:
             self._celeb_errors_lbl.hide()
@@ -1604,3 +1897,51 @@ class DuplicateReviewView(QWidget):
         self._worker = None
         self._stack.setCurrentIndex(_STATE_RESULTS)
         _ov_alert(self, 'Consolidation Failed', f'Something went wrong:\n{msg[:400]}')
+
+    # ── Undo ──────────────────────────────────────────────────────────────────
+
+    def _on_undo_consolidation(self) -> None:
+        log_path = getattr(self, '_last_rollback_log_path', None)
+        if not log_path:
+            return
+        if not _ov_confirm(
+            self,
+            'Undo This Consolidation',
+            'This restores every consolidated file back to its original location '
+            'and repoints your crates back to it — undoing exactly what this '
+            'consolidation just did.\n\n'
+            'Only do this now, before anything else has touched these tracks or crates.',
+            confirm_text='Undo',
+            confirm_danger=True,
+        ):
+            return
+
+        self._undo_btn.setEnabled(False)
+        self._undo_btn.setText('Undoing…')
+        self._undo_worker = _UndoConsolidationWorker(
+            log_path=log_path,
+            library_path=self._library_path,
+            serato_dir=self._serato_dir,
+            parent=self,
+        )
+        self._undo_worker.finished.connect(self._on_undo_finished)
+        self._undo_worker.errored.connect(self._on_undo_errored)
+        self._undo_worker.start()
+
+    def _on_undo_finished(self, result: dict) -> None:
+        self._undo_worker = None
+        self._undo_btn.hide()
+        self._last_rollback_log_path = None
+        restored = result.get('restored', 0)
+        failed   = result.get('failed', 0)
+        msg = f'{restored} file{"s" if restored != 1 else ""} restored.'
+        if failed:
+            errors = '\n'.join(result.get('errors', [])[:10])
+            msg += f'\n\n{failed} could not be restored:\n{errors}'
+        _ov_alert(self, 'Consolidation Undone', msg)
+
+    def _on_undo_errored(self, msg: str) -> None:
+        self._undo_worker = None
+        self._undo_btn.setEnabled(True)
+        self._undo_btn.setText('Undo This Consolidation')
+        _ov_alert(self, 'Undo Failed', f'Something went wrong:\n{msg[:400]}')

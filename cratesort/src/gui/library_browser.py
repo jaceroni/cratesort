@@ -1458,9 +1458,9 @@ class LibraryBrowserView(QWidget):
         self._tree.clear()
         self._confidence_backfilled = False
 
-        # Group tracks by canonical artist. Film & TV video clips are pulled out
-        # into their own title-keyed groups first, before canonical-artist
-        # grouping runs — same rule as the classify workflow (see
+        # Group tracks by canonical artist. Film & TV clips (video or audio) are
+        # pulled out into their own title-keyed groups first, before
+        # canonical-artist grouping runs — same rule as the classify workflow (see
         # classifier_view.py's _ClassifyWorker) — so a movie/show whose name
         # happens to match a real artist (e.g. "Scarface" the movie vs.
         # Scarface the rapper) never merges into that artist's bucket.
@@ -1484,11 +1484,10 @@ class LibraryBrowserView(QWidget):
                 # Explicit manual override always wins, video or not.
                 artist_tracks[edits['reassign_artist']].append(rec)
                 continue
-            if rec.is_video:
-                ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
-                if ancestor_names & _FILM_TV_FOLDER_NAMES:
-                    film_tv_tracks[_film_tv_title(rec)].append(rec)
-                    continue
+            ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
+            if ancestor_names & _FILM_TV_FOLDER_NAMES:
+                film_tv_tracks[_film_tv_title(rec)].append(rec)
+                continue
             if str(rec.path) in self._session_artists:
                 canonical = self._session_artists[str(rec.path)]
             else:

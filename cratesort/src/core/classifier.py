@@ -25,10 +25,11 @@ from cratesort.src.core.scanner import TrackRecord
 # assignment, not e.g. copy/UI tweaks elsewhere in the classify flow.
 # 2 — 2026-09-04: added Latin genre + Film & TV content-type bucket.
 # 3 — 2026-09-04: added Orchestral genre.
-CLASSIFIER_VERSION = 3
+# 4 — 2026-09-18: added Comedy genre (stand-up / spoken-word bits).
+CLASSIFIER_VERSION = 4
 
 PARENT_GENRES = frozenset({
-    "Blues", "Country", "Electronic", "Funk/Soul", "Hip-Hop/Rap",
+    "Blues", "Comedy", "Country", "Electronic", "Funk/Soul", "Hip-Hop/Rap",
     "House", "Jazz", "Latin", "Orchestral", "R&B", "Reggae", "Rock",
     "Seasonal", "Specialty", "Traditional",   # 14th genre — Standards, Vocal Pop, Easy Listening, etc.
 })
@@ -69,6 +70,17 @@ SPECIALTY_FOLDER_HINTS = frozenset({
 # ---------------------------------------------------------------------------
 
 STYLE_MAP: dict[str, str] = {
+
+    # ── Comedy ───────────────────────────────────────────────────────────────
+    "comedy album": "Comedy",
+    "spoken comedy": "Comedy",
+    "spoken word": "Comedy",
+    "stand up": "Comedy",
+    "stand up comedy": "Comedy",
+    "stand-up": "Comedy",
+    "stand-up comedy": "Comedy",
+    "standup": "Comedy",
+    "standup comedy": "Comedy",
 
     # ── Blues ────────────────────────────────────────────────────────────────
     "acoustic blues": "Blues",
@@ -725,6 +737,9 @@ _PURPOSE_FOLDER_NAMES = frozenset({
 
 # Folder-name segments → genre hint (used by _genre_from_folder, module-level for performance)
 _FOLDER_HINTS: dict[str, str] = {
+    "comedy": "Comedy",
+    "stand-up": "Comedy",
+    "standup": "Comedy",
     "blues": "Blues",
     "country": "Country",
     "electronic": "Electronic",
@@ -779,7 +794,7 @@ class ClassificationResult:
 
 class GenreClassifier:
     """
-    Classifies a TrackRecord into one of the 15 CrateSort parent genres.
+    Classifies a TrackRecord into one of the 16 CrateSort parent genres.
 
     Classification tiers (first match wins):
       1. Genre tag is already a valid parent genre → HIGH
