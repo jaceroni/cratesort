@@ -26,7 +26,7 @@ from cratesort.src.core.file_organizer import RollbackLog, _sha256
 from cratesort.src.core.straggler_detector import (
     Straggler, add_dismissed_stragglers, library_drive_root,
 )
-from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout
+from cratesort.src.gui.overlays import _CrateSortDialog, _create_dialog_layout, _fit_dialog_width
 from cratesort.src.serato.path_rewriter import PathChange, PathRewriter
 
 logger = logging.getLogger(__name__)
@@ -91,6 +91,15 @@ class _GatherStragglersDialog(_CrateSortDialog):
             self._by_folder.setdefault(s.source_path.parent, []).append(s)
 
         self._folder_checks: dict[Path, QCheckBox] = {}
+
+        # Widen to fit the longest source-folder path on one line (a row also
+        # spends ~170px on the checkbox and the file-count/size meta). Deeper
+        # paths elide with a tooltip; the corner grip goes wider still.
+        _fit_dialog_width(
+            self,
+            [_collapse_home(f) for f in self._by_folder],
+            chrome=190, minimum=560, maximum=900,
+        )
 
         layout = _create_dialog_layout(self)
 
@@ -228,6 +237,7 @@ class _GatherStragglersDialog(_CrateSortDialog):
         path_lbl = QLabel(_collapse_home(folder))
         path_lbl.setStyleSheet(f'color: {_CREAM}; font-size: 13px; background: transparent; border: none;')
         path_lbl.setWordWrap(False)
+        path_lbl.setToolTip(str(folder))
         h.addWidget(path_lbl, stretch=1)
 
         total = sum(s.size for s in items)

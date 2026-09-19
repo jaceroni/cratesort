@@ -104,6 +104,7 @@ class ExecutionResult:
     rollback_log_path: Optional[Path]
     crate_rewrite_summary: Optional[dict]
     duration_seconds: float
+    cancelled: bool = False   # user stopped it partway; `completed` is a clean prefix
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +127,7 @@ class RollbackLog:
             'moves': [],
             'metadata_changes': [],
             'crate_backup_paths': [],
+            'errors': [],
         }
 
     def set_context(
@@ -151,6 +153,8 @@ class RollbackLog:
             'executed_at': op.executed_at or '',
             'status': op.status,
         }
+        if op.error:
+            entry['error'] = op.error
         if duplicate:
             entry['duplicate'] = True
         if stems:
@@ -158,6 +162,14 @@ class RollbackLog:
         if reason:
             entry['reason'] = reason
         self._data['moves'].append(entry)
+
+    def log_error(self, message: str) -> None:
+        """Record a pipeline-level failure that never reached log_move() at all —
+        e.g. the crate-rewrite step for a group throwing before any file in that
+        group was touched. Without this, such a failure was only ever held in an
+        in-memory list the UI showed a bare count of ("1 file could not be
+        removed — check the log") and the log itself had nothing in it to check."""
+        self._data.setdefault('errors', []).append(message)
 
     def log_metadata(
         self,
@@ -677,12 +689,19 @@ class FileOrganizer:
         self,
         plan: ReorganizationPlan,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> ExecutionResult:
         """
         Execute the reorganization plan.
         Each file: copy → verify (SHA-256) → delete original → log.
         Metadata changes are written to the moved files.
         Serato crate paths are updated via PathRewriter.
+
+        `should_cancel`, if given, is polled before each file. When it returns
+        True the move loop stops at that clean boundary — every file already
+        moved is fully logged, and the post-move steps (crate rewrite, empty-
+        folder cleanup, metadata sync) then run over just those files, so a
+        cancelled run leaves the library consistent, not half-written.
         """
         import time
         start = time.time()
@@ -700,8 +719,13 @@ class FileOrganizer:
         skipped: list[FileMoveOp] = []
 
         total = len(plan.operations)
+        cancelled = False
 
         for i, op in enumerate(plan.operations):
+            if should_cancel and should_cancel():
+                cancelled = True
+                logger.info("Execution cancelled by user after %d/%d file(s)", i, total)
+                break
             if progress_callback:
                 progress_callback(i, total, op.source_path.name)
 
@@ -747,6 +771,11 @@ class FileOrganizer:
                 failed.append(op)
                 logger.error("Failed to move %s: %s", op.source_path.name, exc)
 
+        # From here the move loop is done (or was cancelled). Everything below
+        # operates on `completed` only, so it's correct for a partial run too.
+        if progress_callback:
+            progress_callback(total, total, '__finalizing__')
+
         # Wrap post-move steps in try/finally so the log is always saved even if
         # crate rewriting or metadata sync throws an unexpected exception.
         try:
@@ -787,6 +816,7 @@ class FileOrganizer:
             rollback_log_path=log_path,
             crate_rewrite_summary=crate_result,
             duration_seconds=duration,
+            cancelled=cancelled,
         )
 
     def rollback(self, log_path: str | Path) -> dict:

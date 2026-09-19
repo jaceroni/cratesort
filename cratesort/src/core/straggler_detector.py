@@ -15,11 +15,27 @@ from __future__ import annotations
 
 import json
 import logging
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Serato writes a folder whose Finder name contains "/" using U+F022 (a
+# private-use glyph); the same separator on the POSIX filesystem is ":",
+# which is what os.walk yields. Fold U+F022 -> ":" so they match.
+_SLASH_GLYPH = '\uf022'
+
+
+def _canon_path(s: str) -> str:
+    """Canonicalise a path string for cross-source comparison: the
+    U+F022-vs-':' separator above, plus NFC/NFD skew between Serato's
+    strings and os.walk output, so a crate ref and a scanned path for the
+    same file compare equal without touching the disk."""
+    return unicodedata.normalize('NFC', s).replace(_SLASH_GLYPH, ':')
+
 
 _DISMISSED_FILENAME = 'dismissed_stragglers.json'
 _SUBCRATES_DIR = 'Subcrates'
@@ -129,6 +145,7 @@ def detect_stragglers(
     current_crates: dict,
     library_root: Path,
     serato_dir: Path,
+    known_library_paths: Optional[set[str]] = None,
 ) -> list[Straggler]:
     """
     Args:
@@ -137,12 +154,20 @@ def detect_stragglers(
             values (unreadable crates) are skipped.
         library_root: the scanned library folder.
         serato_dir: <library_root>/_Serato_.
+        known_library_paths: optional set of str(path) for every file the scan
+            already cataloged under the library. When given, a crate ref that
+            matches one is known-in-library without a filesystem hit — turning
+            tens of thousands of stat() calls on a slow/USB/exFAT volume into
+            dict lookups. A miss still falls back to a real .exists() check, so
+            results are identical either way.
 
     Returns a list of Straggler, one per unique out-of-library source file,
     sorted by source folder then filename, with the dismiss list applied.
     """
     subcrates_dir = serato_dir / _SUBCRATES_DIR
     dismissed = load_dismissed_stragglers(library_root)
+    # Canonicalised set of every scanned file, for a disk-free in-library test.
+    known_canon = {_canon_path(k) for k in (known_library_paths or ())}
 
     by_source: dict[str, Straggler] = {}
 
@@ -152,8 +177,13 @@ def detect_stragglers(
         crate_name = _crate_display_name(Path(crate_file_str), subcrates_dir)
         for ref in refs:
             r = ref.lstrip('/')
-            # In-library already? Nothing to do.
-            if (library_root / r).exists():
+            resolved = library_root / r
+            # In-library already? Nothing to do. The scan set answers this
+            # for the overwhelming majority of refs with no stat; a set miss
+            # falls back to the same filesystem check the old code always did.
+            if _canon_path(str(resolved)) in known_canon:
+                continue
+            if resolved.exists():
                 continue
             src = _locate_outside(ref, library_root)
             if src is None:

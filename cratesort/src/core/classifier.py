@@ -12,10 +12,26 @@ from cratesort.src.core.scanner import TrackRecord
 # Constants
 # ---------------------------------------------------------------------------
 
+# Bump this whenever a change here would change what genre a track lands in —
+# a new PARENT_GENRES entry, a STYLE_MAP addition/edit, a new tier/routing rule,
+# etc. A saved classification_session.json stamps itself with the version that
+# produced it; dashboard.py's classification cache-skip compares that stamp
+# against this constant and forces a fresh classify pass on mismatch, so a
+# taxonomy change takes effect automatically on next launch — for a real user
+# updating the app, not just for dev testing — with no manual cache-clearing
+# and no "Reclassify Library" button needed. Bumping this is a deliberate,
+# not-in-place edit: it forces every user's whole library to reclassify on
+# their next launch, so reserve it for changes that actually affect genre
+# assignment, not e.g. copy/UI tweaks elsewhere in the classify flow.
+# 2 — 2026-09-04: added Latin genre + Film & TV content-type bucket.
+# 3 — 2026-09-04: added Orchestral genre.
+# 4 — 2026-09-18: added Comedy genre (stand-up / spoken-word bits).
+CLASSIFIER_VERSION = 4
+
 PARENT_GENRES = frozenset({
-    "Blues", "Country", "Electronic", "Funk/Soul", "Hip-Hop/Rap",
-    "House", "Jazz", "R&B", "Reggae", "Rock", "Seasonal", "Specialty",
-    "Traditional",   # 13th genre — Standards, Vocal Pop, Easy Listening, etc.
+    "Blues", "Comedy", "Country", "Electronic", "Funk/Soul", "Hip-Hop/Rap",
+    "House", "Jazz", "Latin", "Orchestral", "R&B", "Reggae", "Rock",
+    "Seasonal", "Specialty", "Traditional",   # 14th genre — Standards, Vocal Pop, Easy Listening, etc.
 })
 
 # Genre tags that carry no useful information — fall through to style analysis.
@@ -54,6 +70,17 @@ SPECIALTY_FOLDER_HINTS = frozenset({
 # ---------------------------------------------------------------------------
 
 STYLE_MAP: dict[str, str] = {
+
+    # ── Comedy ───────────────────────────────────────────────────────────────
+    "comedy album": "Comedy",
+    "spoken comedy": "Comedy",
+    "spoken word": "Comedy",
+    "stand up": "Comedy",
+    "stand up comedy": "Comedy",
+    "stand-up": "Comedy",
+    "stand-up comedy": "Comedy",
+    "standup": "Comedy",
+    "standup comedy": "Comedy",
 
     # ── Blues ────────────────────────────────────────────────────────────────
     "acoustic blues": "Blues",
@@ -393,6 +420,43 @@ STYLE_MAP: dict[str, str] = {
     "traditional jazz": "Jazz",
     "vocal jazz": "Jazz",
 
+    # ── Latin ────────────────────────────────────────────────────────────────
+    "banda": "Latin",
+    "bachata": "Latin",
+    "corrido": "Latin",
+    "cumbia": "Latin",
+    "latin": "Latin",
+    "latin pop": "Latin",
+    "mariachi": "Latin",
+    "merengue": "Latin",
+    "norteño": "Latin",
+    "norteno": "Latin",
+    "ranchera": "Latin",
+    "salsa": "Latin",
+    "tejano": "Latin",
+    "vallenato": "Latin",
+
+    # ── Orchestral ───────────────────────────────────────────────────────────
+    "classical": "Orchestral",
+    "orchestral": "Orchestral",
+    "orchestra": "Orchestral",
+    "symphony": "Orchestral",
+    "symphonic": "Orchestral",
+    "philharmonic": "Orchestral",
+    "philharmonia": "Orchestral",
+    "concerto": "Orchestral",
+    "opera": "Orchestral",
+    "operatic": "Orchestral",
+    "aria": "Orchestral",
+    "requiem": "Orchestral",
+    "sonata": "Orchestral",
+    "overture": "Orchestral",
+    "choral": "Orchestral",
+    "chamber orchestra": "Orchestral",
+    "chamber music": "Orchestral",
+    "film score": "Orchestral",
+    "movie score": "Orchestral",
+
     # ── R&B ──────────────────────────────────────────────────────────────────
     "'50s r&b": "R&B",
     "50s r&b": "R&B",
@@ -673,6 +737,9 @@ _PURPOSE_FOLDER_NAMES = frozenset({
 
 # Folder-name segments → genre hint (used by _genre_from_folder, module-level for performance)
 _FOLDER_HINTS: dict[str, str] = {
+    "comedy": "Comedy",
+    "stand-up": "Comedy",
+    "standup": "Comedy",
     "blues": "Blues",
     "country": "Country",
     "electronic": "Electronic",
@@ -683,6 +750,9 @@ _FOLDER_HINTS: dict[str, str] = {
     "rap": "Hip-Hop/Rap",
     "house": "House",
     "jazz": "Jazz",
+    "latin": "Latin",
+    "orchestral": "Orchestral",
+    "classical": "Orchestral",
     "r&b": "R&B",
     "reggae": "Reggae",
     "rock": "Rock",
@@ -724,7 +794,7 @@ class ClassificationResult:
 
 class GenreClassifier:
     """
-    Classifies a TrackRecord into one of the 12 CrateSort parent genres.
+    Classifies a TrackRecord into one of the 16 CrateSort parent genres.
 
     Classification tiers (first match wins):
       1. Genre tag is already a valid parent genre → HIGH

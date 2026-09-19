@@ -390,6 +390,7 @@ def write_crate_order(serato_dir: str | Path, ordered_crate_paths: list[str]) ->
     subcrates_dir = serato_dir / 'Subcrates'
     existing_file_names = {
         f.stem for f in subcrates_dir.rglob('*.crate')
+        if not f.name.startswith('._')  # skip macOS AppleDouble sidecars
     } if subcrates_dir.exists() else set()
 
     def _has_crate_file(cs_path: str) -> bool:

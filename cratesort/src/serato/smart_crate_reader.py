@@ -36,6 +36,8 @@ class SmartCrateReader:
 
         crates: dict[str, SmartCrate] = {}
         for scrate_file in sorted(self._smartcrates_dir.glob('*.scrate')):
+            if scrate_file.name.startswith('._'):
+                continue  # macOS AppleDouble sidecar, not a smart crate
             try:
                 crate = read_smart_crate_file(scrate_file)
             except Exception as exc:

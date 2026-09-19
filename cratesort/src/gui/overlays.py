@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRect, QRectF, QPropertyAn
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QDialog, QLayout, QVBoxLayout, QFrame, QLabel, QPushButton, QHBoxLayout,
-    QComboBox, QGraphicsScene, QGraphicsView,
+    QComboBox, QGraphicsScene, QGraphicsView, QSizeGrip,
 )
 
 try:
@@ -156,6 +156,12 @@ class _AnimatedStatCardWidget(QFrame):
             self._current_value = max(self._target_value, self._current_value + step)
         self._value_label.setText(f'{self._current_value:,}{self._suffix}')
 
+    def set_suffix(self, suffix: str) -> None:
+        """Change the unit suffix after construction — for a card whose unit
+        isn't known until the value itself is (e.g. bytes freed rounds to
+        KB/MB/GB depending on the amount)."""
+        self._suffix = suffix
+
     def start_animation(self, target: int, duration_ms: int = 1400) -> None:
         self._target_value = target
         self._duration = duration_ms
@@ -269,6 +275,37 @@ class _ArrowComboBox(QComboBox):
         painter.end()
 
 
+class _CornerResizeGrip(QSizeGrip):
+    """Bottom-right drag handle for the frameless dialogs.
+
+    The dialogs are FramelessWindowHint|Tool windows — no OS chrome, so
+    there's no native edge to grab. A plain QSizeGrip renders nothing
+    visible on macOS, so we self-paint the classic three-tick corner
+    texture in a muted cream. QSizeGrip already installs the diagonal
+    resize cursor and honours the dialog's minimumSize/maximumSize, so
+    the user can never drag a dialog below its designed floor.
+    """
+
+    _TICKS = ((2, 2), (2, 8), (8, 2), (2, 14), (8, 8), (14, 2))
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setFixedSize(20, 20)
+        self.setToolTip('Drag to resize')
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor('#6b6255'))
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        w, h = self.width(), self.height()
+        for dx, dy in self._TICKS:
+            p.drawPoint(w - dx, h - dy)
+        p.end()
+
+
 class _CrateSortDialog(QDialog):
     """Base dialog for all CrateSort custom dialogs.
     Handles overlay scrim and show/bounce animation."""
@@ -282,6 +319,16 @@ class _CrateSortDialog(QDialog):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._elastic = True
+
+        # Drag-to-resize handle. Frameless windows have no OS edge to grab, so
+        # every dialog gets a self-painted corner grip. Subclasses that must
+        # stay a fixed size (e.g. pure progress dialogs) set
+        # `self._resizable = False` after super().__init__(). The grip honours
+        # the dialog's minimumWidth/minimumHeight, so a resize can never drop a
+        # dialog below its designed floor.
+        self._resizable = True
+        self._size_grip = _CornerResizeGrip(self)
+        self._size_grip.hide()
 
         self._overlay: Optional[_ModalOverlay] = None
         # Re-raised whenever the parent app window is (re)activated, so the
@@ -308,7 +355,33 @@ class _CrateSortDialog(QDialog):
     def showEvent(self, event) -> None:
         # Ensure layout is computed so width()/height() are accurate before centering.
         self.adjustSize()
+
+        # A dialog sized to its content (a very long change description, a deep
+        # file path) can otherwise come out wider/taller than the app window
+        # itself. Clamp to the parent window with a margin so it always fits
+        # on screen; the corner grip can still be dragged past this later.
+        if self._overlay is not None:
+            pw = self._overlay._parent_window
+            max_w = max(self.minimumWidth(),  pw.width()  - 80)
+            max_h = max(self.minimumHeight(), pw.height() - 80)
+            if self.width() > max_w or self.height() > max_h:
+                self.resize(min(self.width(), max_w), min(self.height(), max_h))
+
         w, h = self.width(), self.height()
+
+        # A subclass that pinned BOTH dimensions (setFixedWidth + setFixedHeight)
+        # is deliberately un-resizable — no grip. Otherwise the adjustSize()
+        # natural height becomes the floor a resize may not drop below, so
+        # dragging the grip up can't clip content the layout needs.
+        _locked = (self.minimumWidth() == self.maximumWidth()
+                   and self.minimumHeight() == self.maximumHeight())
+        if self._resizable and not _locked:
+            self.setMinimumHeight(h)
+            self._size_grip.setVisible(True)
+            self._size_grip.raise_()
+            self._position_size_grip()
+        else:
+            self._size_grip.hide()
 
         # Calculate the final centered position directly — never read geometry()
         # after move(), which is async and returns stale coords on some platforms.
@@ -337,6 +410,24 @@ class _CrateSortDialog(QDialog):
         self.setGeometry(start_rect)
         super().showEvent(event)
         self.run_bounce_animation(target_rect, start_rect)
+
+    def _position_size_grip(self) -> None:
+        grip = getattr(self, '_size_grip', None)
+        if grip is None or not grip.isVisible():
+            return
+        # Tuck it just inside the rounded container corner (12px radius) — the
+        # painted dots sit in the grip's own bottom-right, ~10px off each edge.
+        grip.move(self.width() - grip.width() - 8,
+                  self.height() - grip.height() - 8)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Fires on every frame of the entrance/exit geometry animation too —
+        # cheap, and keeps the grip pinned to the corner throughout.
+        self._position_size_grip()
+        grip = getattr(self, '_size_grip', None)
+        if grip is not None and grip.isVisible():
+            grip.raise_()
 
     def run_bounce_animation(self, target_rect: QRect, start_rect: QRect) -> None:
         if getattr(self, '_elastic', True):
@@ -449,6 +540,31 @@ def _create_dialog_layout(dialog: QDialog) -> QVBoxLayout:
         dialog.setMinimumWidth(needed_width)
 
     return inner
+
+
+def _fit_dialog_width(
+    dialog: QDialog,
+    samples,
+    *,
+    chrome: int = 220,
+    minimum: int = 480,
+    maximum: int = 900,
+) -> None:
+    """Raise `dialog`'s minimum width so the widest string in `samples` fits on
+    one line, clamped to [minimum, maximum].
+
+    For dialogs whose rows hold variable-length content (crate names, file
+    paths, change descriptions) the old fixed minimum width sliced the text
+    off. `chrome` is the horizontal space a row spends on everything that
+    isn't the measured text — icons, timestamps, action buttons, and the
+    dialog's own margins. Past `maximum` the text is expected to wrap or
+    elide (with a tooltip); the resize grip then lets the user go wider.
+    """
+    fm = QFontMetrics(dialog.font())
+    widest = max((fm.horizontalAdvance(str(s)) for s in samples), default=0)
+    want = max(minimum, min(maximum, widest + chrome))
+    if dialog.minimumWidth() < want:
+        dialog.setMinimumWidth(want)
 
 
 def _ov_alert(parent: QWidget, title: str, body: str) -> None:

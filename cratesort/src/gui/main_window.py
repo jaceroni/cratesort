@@ -37,11 +37,11 @@ from cratesort.src.gui.playback_bar import PlaybackBar
 from cratesort.src.gui.video_window import FloatingVideoWindow
 from cratesort.src.utils.undo_manager import UndoManager
 from cratesort.src.utils.serato_guard import launch_serato
+from cratesort.src.version import VERSION
 
 _ASSETS = Path(__file__).parent.parent.parent / 'assets'
 _LOGO_WORDMARK = _ASSETS / 'logo' / 'cs-logo-lockup-horiz.svg'
 
-VERSION = '0.1.0'
 ORG = 'JWBC'
 APP = 'CrateSort'
 
@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
         self._playback_controller = PlaybackController(self)
         self._playback_controller.now_playing_changed.connect(self._on_now_playing_changed)
         self._playback_controller.playback_state_changed.connect(self._on_playback_state_changed)
+        self._playback_controller.media_error.connect(self._on_media_error)
         self._video_window: Optional[FloatingVideoWindow] = None
 
         content_row = QWidget()
@@ -154,6 +155,7 @@ class MainWindow(QMainWindow):
         # Library Browser — index 1
         self._library_browser = LibraryBrowserView(undo_manager=self._undo_manager)
         self._library_browser.album_art_requested.connect(self._update_album_art)
+        self._library_browser.track_deselected.connect(self._restore_status_library_path)
         self._library_browser.play_requested.connect(self._on_play_requested)
         self._content.addWidget(self._library_browser)
 
@@ -161,6 +163,7 @@ class MainWindow(QMainWindow):
         self._crate_manager = CrateManagerView(undo_manager=self._undo_manager)
         self._crate_manager.track_selected.connect(self._update_album_art)
         self._crate_manager.album_art_requested.connect(self._update_album_art)
+        self._crate_manager.track_deselected.connect(self._restore_status_library_path)
         self._crate_manager.navigate_to_settings.connect(lambda: self._on_nav_by_id('settings'))
         self._crate_manager.launch_serato_requested.connect(self._on_launch_serato_requested)
         self._crate_manager.play_requested.connect(self._on_play_requested)
@@ -227,6 +230,9 @@ class MainWindow(QMainWindow):
             self._library_browser.set_now_playing(str(rec.path))
         if hasattr(self, '_crate_manager'):
             self._crate_manager.set_now_playing(str(rec.path))
+
+    def _on_media_error(self, message: str) -> None:
+        _ov_alert(self, 'Playback Error', message)
 
     def _on_playback_state_changed(self, state) -> None:
         """Fan the real player play/pause state out to both track lists so a
@@ -442,6 +448,10 @@ class MainWindow(QMainWindow):
         sb = QStatusBar()
         self.setStatusBar(sb)
 
+        # Footer-left shows the connected library path by default, and swaps to
+        # the selected track's full path while one is selected in a media view.
+        self._status_showing_file = False
+
         self._status_library = QLabel()
         # Explicit left margin so the path text has breathing room matching the right side
         self._status_library.setStyleSheet(
@@ -495,6 +505,14 @@ class MainWindow(QMainWindow):
             return
         outgoing = self._content.currentWidget()
         if outgoing is None or not outgoing.isVisible():
+            self._content.setCurrentIndex(index)
+            return
+
+        # The duplicate-review screen holds hundreds of row widgets; grab()-ing
+        # it for the slide snapshot stalls the main thread for a beat. Entry into
+        # it already skips the animation (see _start_rinse / _on_rinse_done) — make
+        # the exit symmetric with a plain cut.
+        if outgoing is getattr(self, '_duplicate_review', None):
             self._content.setCurrentIndex(index)
             return
 
@@ -603,6 +621,7 @@ class MainWindow(QMainWindow):
             self._settings_view.load(lib)
         if index not in (1, 2):  # Clear art when leaving media views
             self._art_panel.clear()
+            self._restore_status_library_path()
 
     def _on_nav_by_id(self, nav_id: str) -> None:
         for i, (nid, _, _) in enumerate(_NAV_ITEMS):
@@ -613,6 +632,7 @@ class MainWindow(QMainWindow):
 
     def _on_library_changed(self, path: Path) -> None:
         self._settings.setValue('library_path', str(path))
+        self._status_showing_file = False
         self._status_library.setText(str(path))
         self._undo_manager.clear()
         self._apply_nav_state(self._get_app_state())
@@ -760,12 +780,21 @@ class MainWindow(QMainWindow):
             self._status_state.clear()
 
         saved_path = self._settings.value('library_path', None)
-        if saved_path:
+        if saved_path and not self._status_showing_file:
             self._status_library.setText(str(saved_path))
 
     def _update_album_art(self, file_path: str) -> None:
         """Read embedded album art and display in the sidebar panel."""
         self._art_panel.set_track(file_path)
+        if file_path:
+            self._status_showing_file = True
+            self._status_library.setText(file_path)
+
+    def _restore_status_library_path(self) -> None:
+        """Footer-left back to the connected library path (nothing selected)."""
+        self._status_showing_file = False
+        saved_path = self._settings.value('library_path', None)
+        self._status_library.setText(str(saved_path) if saved_path else '')
 
     def _show_about(self) -> None:
         _ov_alert(
@@ -934,6 +963,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._settings.setValue('geometry', self.saveGeometry())
+        if hasattr(self, '_playback_controller'):
+            self._playback_controller.shutdown()
         if hasattr(self, '_library_browser'):
             self._library_browser.save_state()
         if hasattr(self, '_crate_manager'):
@@ -1362,6 +1393,12 @@ class _InlineVideoPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # The library scan spawns worker processes (see ParallelTagReader). In a
+    # PyInstaller build every such worker re-execs this bundle, so without
+    # freeze_support() each one would relaunch the whole GUI. No-op unfrozen.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     import traceback
     def _exception_hook(exc_type, exc_value, exc_tb):
         traceback.print_exception(exc_type, exc_value, exc_tb)

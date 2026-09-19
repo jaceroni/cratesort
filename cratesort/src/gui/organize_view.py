@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -204,6 +205,12 @@ class _ExecutionWorker(QThread):
     def __init__(self, plan: ReorganizationPlan, parent=None):
         super().__init__(parent)
         self._plan = plan
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Request a clean stop. Polled by execute() before each file; a move
+        already in progress finishes (and is logged) before the loop exits."""
+        self._cancelled = True
 
     def run(self) -> None:
         try:
@@ -212,7 +219,11 @@ class _ExecutionWorker(QThread):
 
             result = FileOrganizer(
                 self._plan.library_root, self._plan.serato_dir
-            ).execute(self._plan, progress_callback=_cb)
+            ).execute(
+                self._plan,
+                progress_callback=_cb,
+                should_cancel=lambda: self._cancelled,
+            )
 
             self.finished.emit(result)
         except Exception as exc:
@@ -1067,9 +1078,10 @@ class OrganizeView(QWidget):
 
         self._cancel_exec_btn = QPushButton('Cancel')
         self._cancel_exec_btn.setProperty('flat', 'true')
-        self._cancel_exec_btn.setFixedWidth(100)
+        self._cancel_exec_btn.setFixedWidth(140)
         self._cancel_exec_btn.setStyleSheet(f'QPushButton {{ color: {_DANGER}; }} QPushButton:hover {{ color: #b24c4c; }}')
-        self._cancel_exec_btn.setEnabled(False)  # disabled during crate writes
+        self._cancel_exec_btn.setEnabled(False)  # enabled once the move loop starts; off during crate writes
+        self._cancel_exec_btn.clicked.connect(self._on_cancel_exec)
 
         layout.addWidget(self._exec_label)
         layout.addWidget(self._exec_bar, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -1220,6 +1232,20 @@ class OrganizeView(QWidget):
         self._exec_label.setText('Executing reorganization…')
         self.status_message.emit('Reorganizing library…', 'amber')
 
+        # Cancel is live during the move loop (it stops cleanly at the next
+        # file); it gets disabled once we reach the crate-rewrite phase, which
+        # must not be interrupted.
+        self._cancel_exec_btn.setText('Cancel')
+        self._cancel_exec_btn.setEnabled(True)
+        self._exec_finalizing = False
+        self._exec_cur_started = time.monotonic()
+        self._exec_cur_label = ''
+        if not hasattr(self, '_exec_tick'):
+            self._exec_tick = QTimer(self)
+            self._exec_tick.setInterval(1000)
+            self._exec_tick.timeout.connect(self._on_exec_tick)
+        self._exec_tick.start()
+
         self._exec_worker = _ExecutionWorker(self._plan)
         self._exec_worker.progress.connect(self._on_exec_progress)
         self._exec_worker.finished.connect(self._on_exec_finished)
@@ -1227,19 +1253,71 @@ class OrganizeView(QWidget):
         self._exec_worker.start()
 
     def _on_exec_progress(self, current: int, total: int, filename: str) -> None:
+        if filename == '__finalizing__':
+            # Move loop is done — crate rewriting / cleanup now. Not cancellable.
+            self._exec_finalizing = True
+            self._cancel_exec_btn.setEnabled(False)
+            self._exec_bar.setValue(100)
+            self._exec_step.setText('Updating Serato crates and tidying up…')
+            return
         if total > 0:
             self._exec_bar.setValue(int(100 * current / total))
+        self._exec_cur_started = time.monotonic()
+        self._exec_cur_label = f'Copying and verifying ({current} of {total}): {filename}'
+        self._exec_step.setText(f'{self._exec_cur_label}…')
+
+    def _on_exec_tick(self) -> None:
+        """Once a second, if the current file has been going a while, say so —
+        a slow/stalling drive should read as 'still working', never as a hang."""
+        if self._exec_finalizing or not self._exec_cur_label:
+            return
+        elapsed = int(time.monotonic() - self._exec_cur_started)
+        if elapsed < 15:
+            return
+        mins, secs = divmod(elapsed, 60)
+        clock = f'{mins}:{secs:02d}'
         self._exec_step.setText(
-            f'Copying and verifying ({current} of {total}): {filename}…'
+            f'{self._exec_cur_label} — still working ({clock}). '
+            f'Your drive may be slow; Cancel stops after this file.'
         )
 
+    def _on_cancel_exec(self) -> None:
+        if not getattr(self, '_exec_worker', None):
+            return
+        self._exec_worker.cancel()
+        self._cancel_exec_btn.setEnabled(False)
+        self._cancel_exec_btn.setText('Stopping…')
+        self._exec_label.setText('Stopping after the current file…')
+
     def _on_exec_finished(self, result: ExecutionResult) -> None:
+        if hasattr(self, '_exec_tick'):
+            self._exec_tick.stop()
         self._cached_plan = None; self._cached_plan_mtime = None   # plan consumed — force re-plan on next visit
         self._exec_result = result
         self._rollback_log_path = result.rollback_log_path
         moved   = len(result.completed)
         failed  = len(result.failed)
         skipped = len(result.skipped)
+
+        if getattr(result, 'cancelled', False):
+            self._done_label.setText('Reorganization stopped')
+            line1 = (
+                f'Stopped at your request. {moved:,} file{"s" if moved != 1 else ""} '
+                f'moved and their crate paths updated; everything else was left '
+                f'exactly where it was.'
+            )
+            self._done_detail.setText(
+                line1 + '\n\nRun Organize again to finish, or use Rollback to '
+                'undo the files that did move.'
+            )
+            self._rollback_btn.setVisible(True)
+            self._rollback_btn.setEnabled(bool(self._rollback_log_path))
+            self._done_back_btn.setEnabled(True)
+            self._stack.setCurrentIndex(_STATE_DONE)
+            self.status_message.emit(
+                f'Reorganization stopped. {moved:,} files moved.', 'amber'
+            )
+            return
 
         self._done_label.setText('Reorganization complete!')
         line1 = f'{moved:,} file{"s" if moved != 1 else ""} moved successfully.'
@@ -1267,6 +1345,8 @@ class OrganizeView(QWidget):
         )
 
     def _on_exec_error(self, message: str) -> None:
+        if hasattr(self, '_exec_tick'):
+            self._exec_tick.stop()
         self._cached_plan = None; self._cached_plan_mtime = None   # execution failed — state is uncertain, require re-plan
         self.status_message.emit('Execution failed.', 'error')
         _ov_alert(self, 'Execution Error', f'Reorganization failed:\n\n{message[:400]}')

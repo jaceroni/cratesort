@@ -8,6 +8,18 @@ from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), '..'))
 
+# Single source of truth for the version — cratesort/src/version.py, also
+# read by main_window.py for the in-app title/About text. Read it here as a
+# standalone file (not `import cratesort...`) so packaging the app can never
+# pull in the app's own PyQt6 imports as a side effect. This constant used to
+# be duplicated by hand here AND in main_window.py; main_window.py's copy sat
+# stuck at "0.1.0" for nine straight beta releases because bumping this one
+# was a separate, easy-to-forget step.
+_version_ns: dict = {}
+with open(os.path.join(ROOT, 'cratesort', 'src', 'version.py')) as _f:
+    exec(_f.read(), _version_ns)
+VERSION = _version_ns['VERSION']
+
 block_cipher = None
 
 a = Analysis(
@@ -23,6 +35,17 @@ a = Analysis(
         'PyQt6.QtSvg',
         'PyQt6.QtMultimedia',
         'PyQt6.QtMultimediaWidgets',
+        # Spawned by the library scan in a separate process — make sure the
+        # worker entry point and its deps are in the bundle.
+        'cratesort.src.core.parallel_tag_reader',
+        'cratesort.src.core.scan_worker_proc',
+        # Spawned by audio playback in a separate process (freeze-proofing
+        # against a stalling drive, same reasoning as the scan worker above).
+        # Only the worker entry point needs listing — it's the one reached
+        # via a runtime string import that PyInstaller's static analysis
+        # misses; playback_worker.py itself is a normal top-level import
+        # from playback_controller.py, already followed automatically.
+        'cratesort.src.core.playback_worker_proc',
     ],
     hookspath=[],
     hooksconfig={},
@@ -72,8 +95,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'CrateSort',
         'CFBundleDisplayName': 'CrateSort',
-        'CFBundleShortVersionString': '0.1.5',
-        'CFBundleVersion': '0.1.5',
+        'CFBundleShortVersionString': VERSION,
+        'CFBundleVersion': VERSION,
         'NSHumanReadableCopyright': 'Copyright © 2026 JWBC, LLC. All rights reserved.',
         'NSHighResolutionCapable': True,
     },

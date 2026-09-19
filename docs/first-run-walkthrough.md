@@ -465,7 +465,7 @@ video out and back; confirm now-playing marker tracks correctly across tabs.
 3. Scan & analysis (incremental, "Unrecognized", nav lock)
 4. The Dashboard as hub (stat cards, banners, action cards, activity, sync)
 5. Library & Classify (tag-only, artist grouping, confidence, Unclassified,
-   the 13 genres, inline metadata editing)
+   the 15 genres, inline metadata editing)
 6. Rinse (detection basis, true-dup vs variant, winner logic, crate re-point,
    Keep-All)
 7. Crates (Serato mirror, reference model, smart crates + Check for New Files,

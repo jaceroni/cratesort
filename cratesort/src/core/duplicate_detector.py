@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,42 @@ _LEADING_TRACK_NUMBER = re.compile(r'^\d{1,3}[\s\.\-]+')
 # still splits at the first one, leaving the rest attached to the title
 # where normalize_title's version-suffix stripping can clean it up.
 _ARTIST_TITLE_FILENAME = re.compile(r'^\s*(?P<artist>.+?)\s+[-–—]\s+(?P<title>.+?)\s*$')
+
+# Instrumental/acapella signal — filename and ancestor-folder forms.
+# These remove an entire audio layer (vocals or instruments), so they are
+# never the same recording as the regular version no matter how close
+# duration/bitrate/size land — that closeness is expected, not evidence of
+# a physical match. Checked separately from _VARIANT_KEYWORDS below because
+# that check runs too late (after _is_strong_physical_match already wins)
+# and never looks at folder names at all.
+_INSTRUMENTAL_RE = re.compile(r'\binstrumentals?\b', re.IGNORECASE)
+_ACAPELLA_RE = re.compile(
+    r'\b(?:acapella|acappella|a[- ]cappella|a[- ]capella)s?\b', re.IGNORECASE,
+)
+_INSTRUMENTAL_FOLDER_NAMES = frozenset({'instrumental', 'instrumentals'})
+_ACAPELLA_FOLDER_NAMES = frozenset({
+    'acapella', 'acapellas', 'acappella', 'acappellas',
+    'a cappella', 'a cappellas', 'a-cappella', 'a-cappellas',
+})
+
+
+def _content_variant(rec: TrackRecord) -> str:
+    """
+    'instrumental', 'acapella', or '' — folded into the duplicate-detection
+    bucket key so these never group with the regular version, regardless of
+    how the filename fails to mention it. Real-library bug (20k-track test):
+    an instrumental in an "Instrumentals" subfolder, filename otherwise
+    identical to the vocal version, was tiered true_duplicate because
+    _is_strong_physical_match only looks at duration/bitrate/size — an
+    instrumental commonly matches the vocal version on all three.
+    """
+    name = rec.path.stem
+    ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
+    if _INSTRUMENTAL_RE.search(name) or (ancestor_names & _INSTRUMENTAL_FOLDER_NAMES):
+        return 'instrumental'
+    if _ACAPELLA_RE.search(name) or (ancestor_names & _ACAPELLA_FOLDER_NAMES):
+        return 'acapella'
+    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -133,11 +170,19 @@ class DuplicateDetector:
     # ── Fast pass ────────────────────────────────────────────────────────────
 
     def _fast_pass(self, inventory: list[TrackRecord]) -> list[DuplicateGroup]:
-        buckets: dict[tuple[str, str], list[TrackRecord]] = defaultdict(list)
+        buckets: dict[tuple[str, str, str, bool], list[TrackRecord]] = defaultdict(list)
         self._skipped_count = 0
         for rec in inventory:
+            variant = _content_variant(rec)
+            # A music video is never a duplicate of its audio counterpart — an
+            # MP4's bitrate/file-size trivially dwarfs an MP3/WAV's, which was
+            # winning _pick_winner's quality scoring outright and recommending
+            # the AUDIO copies for deletion, keeping only the video. Audio and
+            # video are always separate buckets; two copies of the same video
+            # (or same audio file) still group together as before.
+            media = rec.is_video
             if rec.artist and rec.title:
-                key = (normalize_artist(rec.artist), normalize_title(rec.title))
+                key = (normalize_artist(rec.artist), normalize_title(rec.title), variant, media)
             else:
                 stem = _LEADING_TRACK_NUMBER.sub('', rec.path.stem)
                 match = _ARTIST_TITLE_FILENAME.match(stem)
@@ -146,18 +191,18 @@ class DuplicateDetector:
                     # download with blank ID3 tags) — parse it directly rather
                     # than assuming the containing folder name is the artist,
                     # so it can still collide with a properly-tagged copy.
-                    key = (normalize_artist(match.group('artist')), normalize_title(match.group('title')))
+                    key = (normalize_artist(match.group('artist')), normalize_title(match.group('title')), variant, media)
                 else:
                     # Filename fallback: folder name → artist, filename stem → title.
                     # Covers library layouts like Artist/01 Title.mp3.
-                    key = (normalize_artist(rec.path.parent.name), normalize_title(rec.path.stem))
+                    key = (normalize_artist(rec.path.parent.name), normalize_title(rec.path.stem), variant, media)
                 if not key[0] or not key[1]:
                     self._skipped_count += 1
                     continue
             buckets[key].append(rec)
 
         groups: list[DuplicateGroup] = []
-        for (norm_artist, norm_title), recs in buckets.items():
+        for bucket_i, ((norm_artist, norm_title, _variant, _media), recs) in enumerate(buckets.items()):
             if len(recs) < 2:
                 continue
             clusters = self._cluster_by_duration(recs)
@@ -165,6 +210,16 @@ class DuplicateDetector:
                 if len(cluster) < 2:
                     continue
                 groups.append(self._build_group(cluster))
+            # This runs on a background QThread (dashboard.py's _BgSteps), but
+            # a tight pure-Python loop over tens of thousands of buckets still
+            # competes hard for the GIL with the main thread's event loop —
+            # confirmed on a real 75k-track library, where this whole pass
+            # made the app feel fully frozen (not just "a bit slow") for
+            # roughly a minute even though it was never literally blocking
+            # the main thread. A near-zero sleep every so often forces a GIL
+            # handoff so Qt's event loop actually gets scheduled in between.
+            if bucket_i % 200 == 0:
+                time.sleep(0)
 
         return groups
 
