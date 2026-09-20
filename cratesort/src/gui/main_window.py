@@ -79,7 +79,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f'CrateSort  {VERSION}')
         self.setMinimumSize(900, 600)
 
-        self._undo_manager = UndoManager(on_change=self._update_undo_buttons)
+        self._undo_manager = UndoManager(
+            on_change=self._update_undo_buttons,
+            on_async_status=self._show_undo_status,
+        )
         self._build_ui()
         self._update_undo_buttons()  # apply initial inactive style
         self._build_menu()
@@ -185,9 +188,10 @@ class MainWindow(QMainWindow):
         self._content.addWidget(self._settings_view)
 
         # Duplicate Review — index 5 (not a nav item; launched from dashboard banner)
-        self._duplicate_review = DuplicateReviewView()
+        self._duplicate_review = DuplicateReviewView(undo_manager=self._undo_manager)
         self._duplicate_review.done.connect(self._on_rinse_done)
         self._duplicate_review.track_selected.connect(self._update_album_art)
+        self._duplicate_review.comments_updated.connect(self._on_comments_updated)
         self._content.addWidget(self._duplicate_review)
 
         root.addWidget(self._content)
@@ -760,6 +764,11 @@ class MainWindow(QMainWindow):
         source = getattr(cmd, 'source_tab', 'crates')
         if source == 'library' and hasattr(self, '_library_browser'):
             self._library_browser._set_status(msg, teal=True)
+        elif source == 'dashboard':
+            # ConsolidationCommand — no dashboard-local status label to route
+            # to (unlike library/crates), so use the always-visible top-chrome
+            # status bar instead.
+            self._update_status(msg, 'green')
         elif hasattr(self, '_crate_manager'):
             self._crate_manager._set_status(msg, teal=True)
 
@@ -834,6 +843,31 @@ class MainWindow(QMainWindow):
             subprocess.Popen(['open', str(lib)])
         elif sys.platform == 'win32':
             subprocess.Popen(['explorer', str(lib)])
+
+    # ------------------------------------------------------------------
+    def _on_comments_updated(self, updates: dict) -> None:
+        """
+        Patch winner TrackRecords in place right after a consolidation commits.
+
+        Consolidation writes the merged comment to disk (file tag + Serato's
+        database V2), but dashboard._inventory is the same in-memory list
+        loaded at the last scan — nothing re-reads it just because a file
+        changed on disk. Library/Crates both render straight from these
+        TrackRecord objects, and the user can navigate to either one directly
+        from the duplicate-review screen without ever passing through
+        _on_rinse_done's rescan (e.g. clicking a sidebar nav item instead of
+        dismissing the review screen) — so without this, the merged comment
+        is invisible until a full app restart.
+        """
+        if not updates:
+            return
+        inv = getattr(self._dashboard, '_inventory', None)
+        if not inv:
+            return
+        for rec in inv:
+            new_comment = updates.get(str(rec.path))
+            if new_comment is not None:
+                rec.comment = new_comment
 
     # ------------------------------------------------------------------
     def _on_rinse_done(self) -> None:

@@ -1,0 +1,15 @@
+CrateSort isn't from the Mac App Store, so the first time you open it,
+macOS will warn you it can't verify the developer. That's expected —
+here's how to get past it:
+
+1. Try to open CrateSort. You'll see a message saying it can't verify
+   the developer.
+
+2. Open System Settings → Privacy & Security.
+
+3. Scroll down. You'll see a line that says something like
+   "CrateSort was blocked..." with an Open Anyway button next to it.
+
+4. Click Open Anyway, then confirm one more time when it asks.
+
+You only need to do this once — after that, CrateSort opens normally.

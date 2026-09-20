@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from cratesort.src.serato.database_reader import read_track_metadata, _normalize_pfil_keys
-from cratesort.src.serato.database_writer import update_play_count
+from cratesort.src.serato.database_writer import update_play_count, update_comment
 from cratesort.src.serato.markers_reader import CuePoint, read_cue_points
 from cratesort.src.serato.markers_writer import write_cue_points
 
@@ -65,7 +65,7 @@ def merge_metadata(
     _merge_play_counts(winner_path, loser_paths, serato_dir, result)
 
     # ── 2. Comments ───────────────────────────────────────────────────────────
-    _merge_comments(winner_path, winner_comment, loser_comments, result)
+    _merge_comments(winner_path, winner_comment, loser_comments, serato_dir, result)
 
     # ── 3. Cue points ─────────────────────────────────────────────────────────
     _merge_cue_points(winner_path, loser_paths, result)
@@ -104,19 +104,28 @@ def _merge_play_counts(
 
     result.play_count_total = total_plays
 
-    if total_plays != winner_plays and total_plays > 0:
-        success = update_play_count(serato_dir, winner_path.as_posix(), total_plays)
-        if success:
-            result.play_count_merged = True
-            logger.info(
-                '[MetadataMerger] Play count: %d → %d for %s',
-                winner_plays, total_plays, winner_path.name,
-            )
-        else:
-            result.errors.append(
-                f'play_count: failed to write {total_plays} to database V2 '
-                f'for {winner_path.name}'
-            )
+    # DISABLED 2026-09-19: this called update_play_count() to patch Serato's
+    # database V2 directly — same binary-patch mechanism (_patch_utpc) that
+    # the now-disabled comment write mirrors (_patch_tcom). A real database
+    # corruption incident happened on the exact drive this ran against
+    # today, during heavy consolidation use. Disabling this too, out of the
+    # same caution, even though this specific function predates today — not
+    # worth writing to Serato's actual database on an unproven guess either
+    # way. See the matching note in _merge_comments above.
+    #
+    # if total_plays != winner_plays and total_plays > 0:
+    #     success = update_play_count(serato_dir, winner_path.as_posix(), total_plays)
+    #     if success:
+    #         result.play_count_merged = True
+    #         logger.info(
+    #             '[MetadataMerger] Play count: %d → %d for %s',
+    #             winner_plays, total_plays, winner_path.name,
+    #         )
+    #     else:
+    #         result.errors.append(
+    #             f'play_count: failed to write {total_plays} to database V2 '
+    #             f'for {winner_path.name}'
+    #         )
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +136,7 @@ def _merge_comments(
     winner_path:    Path,
     winner_comment: Optional[str],
     loser_comments: list[Optional[str]],
+    serato_dir:     Path,
     result:         MergeResult,
 ) -> None:
     all_comments = [winner_comment] + loser_comments
@@ -156,6 +166,24 @@ def _merge_comments(
         )
     except Exception as exc:
         result.errors.append(f'comment: write failed for {winner_path.name} — {exc}')
+
+    # DISABLED 2026-09-19: this called update_comment() to also patch Serato's
+    # database V2 directly (its `tcom` field), so a merged comment would show
+    # up inside Serato, not just in the file's own tag. That binary patcher
+    # was only ever verified against a small synthetic test file, never
+    # against a real, large, production database V2 — and a real corruption
+    # incident happened on the exact drive this ran against today. Whether
+    # this specific code caused it is unconfirmed, but it cannot be ruled
+    # out, and writing to Serato's actual database is not something to keep
+    # doing on an unproven guess. Reverted to the previously-safe behavior:
+    # comment merge only writes the file's own tag. Do not re-enable without
+    # actually testing _patch_tcom / _patch_otrk_tcom (database_writer.py)
+    # against a real, full-size database V2 copy first.
+    #
+    # if not update_comment(serato_dir, winner_path.as_posix(), merged):
+    #     result.errors.append(
+    #         f'comment: failed to write merged comment to Serato database for {winner_path.name}'
+    #     )
 
 
 def _write_comment(file_path: Path, comment: str) -> None:

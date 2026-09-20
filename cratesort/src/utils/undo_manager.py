@@ -10,20 +10,56 @@ class Command:
     description: str = ''
     source_tab:  str = 'crates'
 
+    # True for a command whose execute()/undo() do real file I/O (crate
+    # rewrites, file deletes/copies) that must never run on the UI thread —
+    # same reasoning as this app's scan/playback subprocess isolation. See
+    # ConsolidationCommand below for the only current example. UndoManager
+    # routes an async command through execute_async()/undo_async() instead
+    # of execute()/undo(), and defers the stack mutation + on_change() call
+    # until the command reports completion via on_done().
+    is_async: bool = False
+
     def execute(self) -> None: ...
     def undo(self)    -> None: ...
+
+    # Only called when is_async is True. Must eventually call
+    # on_done(message: str) — from a background thread is fine, the command
+    # is responsible for marshalling back onto the Qt event loop (e.g. via a
+    # QThread's own finished signal), same as this app's other workers.
+    def execute_async(self, on_done: Callable[[str], None]) -> None: ...
+    def undo_async(self, on_done: Callable[[str], None]) -> None: ...
 
 
 class UndoManager:
     MAX_STATES = 10
 
-    def __init__(self, on_change: Optional[Callable] = None):
+    def __init__(
+        self,
+        on_change:       Optional[Callable] = None,
+        on_async_status: Optional[Callable] = None,
+    ):
         self._undo_stack: list[Command] = []
         self._redo_stack: list[Command] = []
-        self._on_change  = on_change or (lambda: None)
+        self._on_change       = on_change or (lambda: None)
+        # cmd, message, icon → for an async command's completion, since
+        # undo()/redo() can't return the message synchronously for those.
+        self._on_async_status = on_async_status or (lambda cmd, msg, icon: None)
+        self._busy = False
+
+    def is_busy(self) -> bool:
+        return self._busy
 
     def push(self, command: Command) -> None:
         command.execute()
+        self._push_common(command)
+
+    def push_completed(self, command: Command) -> None:
+        """For a command whose action already ran elsewhere (e.g. an async
+        worker that completed before this manager even knew about it) —
+        records it for undo without calling execute() again."""
+        self._push_common(command)
+
+    def _push_common(self, command: Command) -> None:
         self._undo_stack.append(command)
         if len(self._undo_stack) > self.MAX_STATES:
             self._undo_stack.pop(0)
@@ -31,7 +67,21 @@ class UndoManager:
         self._on_change()
 
     def undo(self) -> Optional[str]:
-        if not self._undo_stack:
+        if not self._undo_stack or self._busy:
+            return None
+        cmd = self._undo_stack[-1]
+        if cmd.is_async:
+            self._busy = True
+            self._on_change()
+
+            def _done(msg: str) -> None:
+                self._busy = False
+                self._undo_stack.remove(cmd)
+                self._redo_stack.append(cmd)
+                self._on_change()
+                self._on_async_status(cmd, msg, '↺')
+
+            cmd.undo_async(_done)
             return None
         cmd = self._undo_stack.pop()
         cmd.undo()
@@ -40,7 +90,21 @@ class UndoManager:
         return f'Undone: {cmd.description}'
 
     def redo(self) -> Optional[str]:
-        if not self._redo_stack:
+        if not self._redo_stack or self._busy:
+            return None
+        cmd = self._redo_stack[-1]
+        if cmd.is_async:
+            self._busy = True
+            self._on_change()
+
+            def _done(msg: str) -> None:
+                self._busy = False
+                self._redo_stack.remove(cmd)
+                self._undo_stack.append(cmd)
+                self._on_change()
+                self._on_async_status(cmd, msg, '↻')
+
+            cmd.execute_async(_done)
             return None
         cmd = self._redo_stack.pop()
         cmd.execute()
@@ -48,13 +112,52 @@ class UndoManager:
         self._on_change()
         return f'Redone: {cmd.description}'
 
-    def can_undo(self) -> bool: return bool(self._undo_stack)
-    def can_redo(self) -> bool: return bool(self._redo_stack)
+    def can_undo(self) -> bool: return bool(self._undo_stack) and not self._busy
+    def can_redo(self) -> bool: return bool(self._redo_stack) and not self._busy
 
     def clear(self) -> None:
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._on_change()
+
+
+class ConsolidationCommand(Command):
+    """
+    Wraps a completed duplicate-consolidation run so it lives on the same
+    sidebar Undo/Redo stack as every other crate action, instead of only
+    being undoable from the duplicate-review screen's own (now removed)
+    button — which disappeared the moment you navigated away, with no way
+    back. Async because consolidation does real file I/O; see is_async
+    above.
+
+    do_undo/do_redo are injected as (command, on_done) callables — the
+    actual QThread workers live in duplicate_review_view.py (which already
+    has them), keeping this module Qt-free like every other command here.
+    log_path is mutable: a redo produces a new rollback log, which the next
+    undo must target.
+    """
+    source_tab = 'dashboard'
+
+    def __init__(
+        self,
+        description: str,
+        log_path,
+        approved: list,
+        do_undo:  Callable[['ConsolidationCommand', Callable[[str], None]], None],
+        do_redo:  Callable[['ConsolidationCommand', Callable[[str], None]], None],
+    ):
+        self.is_async    = True
+        self.description = description
+        self.log_path    = log_path
+        self.approved    = approved
+        self._do_undo    = do_undo
+        self._do_redo    = do_redo
+
+    def undo_async(self, on_done: Callable[[str], None]) -> None:
+        self._do_undo(self, on_done)
+
+    def execute_async(self, on_done: Callable[[str], None]) -> None:
+        self._do_redo(self, on_done)
 
 
 # ---------------------------------------------------------------------------

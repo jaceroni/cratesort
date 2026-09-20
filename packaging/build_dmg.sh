@@ -45,6 +45,7 @@ mkdir -p "$STAGE" "$SCRATCH"
 osacompile -o "$STAGE/Uninstall CrateSort.app" "$ROOT/packaging/uninstall.applescript"
 cp -R "$APP" "$STAGE/CrateSort.app"
 ln -s /Applications "$STAGE/Applications"
+cp "$ROOT/packaging/If CrateSort Won't Open.txt" "$STAGE/If CrateSort Won't Open.txt"
 
 # ------------------------------------------------- rendered app icon -----
 # Raw cratesort/assets/icons/app/CrateSort.icns is a flat, sharp-cornered

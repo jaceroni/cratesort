@@ -119,6 +119,21 @@ def _smart_crate_name_from_key(key: str) -> str:
     return key[len(_SMART_CRATE_PREFIX):]
 
 
+def _smart_crate_display_name(raw_name: str) -> str:
+    """
+    A .scrate file's stem is used verbatim as SmartCrate.name (see
+    smart_crate_reader.py) — no conversion happens on read, unlike regular
+    crates (crate_reader.py always converts Serato's '%%' nesting separator
+    to '/' before anything sees the name). Some real Serato smart crates use
+    '%%' for this same nesting; others use a doubled '»'-style glyph. Either
+    way it's Serato's own internal separator, never meant to reach a human —
+    convert both to '/' here, matching the '%%' → '/' convention already
+    used everywhere else in this app (crate_writer.py, path_rewriter.py,
+    straggler_detector.py, checkpoint.py).
+    """
+    return raw_name.replace('%%', '/').replace('≫≫', '/').replace('»»', '/')
+
+
 _WAND_ICON_CACHE: dict[tuple[str, int], QIcon] = {}
 
 
@@ -750,7 +765,15 @@ def _crate_load_signature(inventory, library_path: Path) -> tuple:
     """Everything crate_manager.load() reads off disk. Unchanged since last load
     ⇒ a repeat load() (plain tab switch) is a no-op and can be skipped instead of
     re-reading every .crate/.scrate and rebuilding the tree. Any crate edit,
-    reorder, smart-crate change, or inline edit bumps one of these mtimes."""
+    reorder, smart-crate change, or inline edit bumps one of these mtimes.
+
+    Includes the duplicate-consolidation log glob (mirrors
+    library_browser.py's _library_load_signature) so a just-finished
+    consolidation forces a real rebuild on the next tab visit — id(inventory)
+    and len(inventory) don't change when a winner TrackRecord's .comment is
+    patched in place (see main_window._on_comments_updated), so without this
+    the merged comment stayed invisible in Crates until a full app restart.
+    """
     serato = library_path / '_Serato_'
     cs     = library_path / '_CrateSort'
     return (
@@ -760,6 +783,7 @@ def _crate_load_signature(inventory, library_path: Path) -> tuple:
         _path_mtime(serato / 'neworder.pref'),
         _path_mtime(cs / 'library_edits.json'),
         _path_mtime(cs / 'classification_session.json'),
+        _glob_sig(cs, 'duplicate_consolidation_*.json'),
     )
 
 
@@ -2451,14 +2475,63 @@ class CrateManagerView(QWidget):
             order_index = {p: i for i, p in enumerate(saved)}
             top_level.sort(key=lambda fp: order_index.get(fp, len(saved)))
 
-        for full_path in top_level:
-            self._add_crate_item(self._crate_tree.invisibleRootItem(), full_path)
-
-        if self._smart_crate_library and self._smart_crate_library.names:
+        # Group smart crates by their encoded parent path (everything but the
+        # last '/'-separated segment of their cleaned display name) BEFORE
+        # building the real tree, so _add_crate_item can attach each one as
+        # an actual child of the real crate it structurally belongs under —
+        # same exact-path match, not a name guess. A real crate's full_path
+        # (e.g. "Hip-Hop/1990s") uses this identical '/'-joined format (see
+        # crate_reader.py's Crate.full_path), because Serato encodes nesting
+        # in the filename for BOTH crate types the same way — there's no
+        # other "location" data to read it from.
+        self._smart_by_parent: dict[str, list[tuple[str, str]]] = {}
+        if self._smart_crate_library:
             for name in self._smart_crate_library.names:
                 smart_crate = self._smart_crate_library.crates[name]
-                item = QTreeWidgetItem(self._crate_tree.invisibleRootItem())
-                item.setText(0, f'{smart_crate.name}  ({len(smart_crate.tracks):,})')
+                display_path = _smart_crate_display_name(smart_crate.name)
+                parent = '/'.join(display_path.split('/')[:-1])
+                self._smart_by_parent.setdefault(parent, []).append((name, display_path))
+        attached_smart_names: set[str] = set()
+
+        for full_path in top_level:
+            self._add_crate_item(
+                self._crate_tree.invisibleRootItem(), full_path, attached_smart_names,
+            )
+
+        # Whatever's left has no real crate matching its encoded parent path
+        # anywhere — genuinely not nested under anything real, so it needs
+        # its own synthetic grouping, same mechanism as before but with no
+        # separate "Smart Crates" section: it just becomes its own top-level
+        # branch, same as any other crate with no parent.
+        remaining = [
+            n for n in (self._smart_crate_library.names if self._smart_crate_library else [])
+            if n not in attached_smart_names
+        ]
+        if remaining:
+            smart_group_nodes: dict[str, QTreeWidgetItem] = {}
+
+            def _smart_parent_for(display_path: str) -> QTreeWidgetItem:
+                parent = self._crate_tree.invisibleRootItem()
+                built = ''
+                for part in display_path.split('/')[:-1]:
+                    built = f'{built}/{part}' if built else part
+                    node = smart_group_nodes.get(built)
+                    if node is None:
+                        node = QTreeWidgetItem(parent)
+                        node.setText(0, part)
+                        node.setChildIndicatorPolicy(
+                            QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+                        )
+                        smart_group_nodes[built] = node
+                    parent = node
+                return parent
+
+            for name in remaining:
+                smart_crate = self._smart_crate_library.crates[name]
+                display_path = _smart_crate_display_name(smart_crate.name)
+                leaf_name = display_path.split('/')[-1]
+                item = QTreeWidgetItem(_smart_parent_for(display_path))
+                item.setText(0, f'{leaf_name}  ({len(smart_crate.tracks):,})')
                 item.setData(0, Qt.ItemDataRole.UserRole, _smart_crate_key(name))
 
         if restore_expanded is not None:
@@ -2485,7 +2558,12 @@ class CrateManagerView(QWidget):
             self._total_crate_tracks(child) for child in crate.children
         )
 
-    def _add_crate_item(self, parent_item: QTreeWidgetItem, full_path: str) -> None:
+    def _add_crate_item(
+        self,
+        parent_item: QTreeWidgetItem,
+        full_path: str,
+        attached_smart_names: Optional[set[str]] = None,
+    ) -> None:
         if not self._crate_library or full_path not in self._crate_library.crates:
             return
         crate = self._crate_library.crates[full_path]
@@ -2501,7 +2579,20 @@ class CrateManagerView(QWidget):
             ch_index = {p: i for i, p in enumerate(saved_ch)}
             children.sort(key=lambda p: ch_index.get(p, len(saved_ch)))
         for child_path in children:
-            self._add_crate_item(item, child_path)
+            self._add_crate_item(item, child_path, attached_smart_names)
+        # Attach any smart crates whose encoded parent path is exactly this
+        # real crate's full_path — see _rebuild_crate_tree's _smart_by_parent.
+        # Smart crates live wherever Serato's own naming says they belong,
+        # same as any other nested crate; this is the only place that
+        # happens (not a separate section).
+        for name, display_path in getattr(self, '_smart_by_parent', {}).get(full_path, []):
+            smart_crate = self._smart_crate_library.crates[name]
+            leaf_name = display_path.split('/')[-1]
+            sc_item = QTreeWidgetItem(item)
+            sc_item.setText(0, f'{leaf_name}  ({len(smart_crate.tracks):,})')
+            sc_item.setData(0, Qt.ItemDataRole.UserRole, _smart_crate_key(name))
+            if attached_smart_names is not None:
+                attached_smart_names.add(name)
         has_ch = item.childCount() > 0
         if has_ch:
             item.setChildIndicatorPolicy(
@@ -2594,7 +2685,7 @@ class CrateManagerView(QWidget):
         elif _is_smart_crate_key(key):
             name = _smart_crate_name_from_key(key)
             self._track_search.setPlaceholderText(
-                f'Searching "{name}" — select All Tracks to search your full library…'
+                f'Searching "{_smart_crate_display_name(name)}" — select All Tracks to search your full library…'
             )
             self._load_smart_crate_tracks(name)
         else:
@@ -3556,6 +3647,13 @@ class CrateManagerView(QWidget):
         key = item.data(0, Qt.ItemDataRole.UserRole)
         if key == _ALL_TRACKS_KEY:
             return
+        if key is None:
+            # The "— Smart Crates —" header and the synthetic group folders
+            # built purely for display nesting (see _rebuild_crate_tree) —
+            # neither is a real crate. Without this guard this fell through
+            # to the regular-crate menu below, offering Delete/Rename on
+            # something that doesn't exist in self._crate_library at all.
+            return
 
         if _is_smart_crate_key(key):
             smart_menu = QMenu(self)
@@ -3740,7 +3838,7 @@ class CrateManagerView(QWidget):
                 self._set_status('')
                 return
             self._refresh(select=_smart_crate_key(name))
-            self._set_status(f'Saved: {name}', teal=True)
+            self._set_status(f'Saved: {_smart_crate_display_name(name)}', teal=True)
 
     def _smart_crate_refresh(self, key: str) -> None:
         if not self._smart_crate_library:
@@ -3752,7 +3850,7 @@ class CrateManagerView(QWidget):
         new_tracks = [str(rec.path) for rec in match_tracks(crate.rules, crate.match_all, self._inventory)]
 
         if set(new_tracks) == set(crate.tracks):
-            self._set_status(f"No new files for '{name}'")
+            self._set_status(f"No new files for '{_smart_crate_display_name(name)}'")
             return
 
         writer = self._smart_writer()
@@ -3775,9 +3873,9 @@ class CrateManagerView(QWidget):
                 crate.rules, crate.match_all, crate.live_update, crate.tracks,
                 crate.rules, crate.match_all, crate.live_update, new_tracks,
             )
-            cmd.description = f"Refreshed '{name}' ({summary})"
+            cmd.description = f"Refreshed '{_smart_crate_display_name(name)}' ({summary})"
             self._undo_manager.push(cmd)
-            self._set_status(f"Refreshed '{name}': {summary}", teal=True)
+            self._set_status(f"Refreshed '{_smart_crate_display_name(name)}': {summary}", teal=True)
         else:
             result = writer.update(name, crate.rules, crate.match_all, crate.live_update, new_tracks)
             if not result.success:
@@ -3785,7 +3883,7 @@ class CrateManagerView(QWidget):
                 self._set_status('')
                 return
             self._refresh(select=_smart_crate_key(name))
-            self._set_status(f"Refreshed '{name}': {summary}", teal=True)
+            self._set_status(f"Refreshed '{_smart_crate_display_name(name)}': {summary}", teal=True)
 
     def _smart_crate_duplicate(self, key: str) -> None:
         if not self._smart_crate_library:
@@ -3812,7 +3910,7 @@ class CrateManagerView(QWidget):
                 self._set_status('')
                 return
             self._refresh(select=_smart_crate_key(dst))
-        self._set_status(f'Duplicated: {name}', teal=True)
+        self._set_status(f'Duplicated: {_smart_crate_display_name(name)}', teal=True)
         # Jump straight into the rule editor on the new copy — rename +
         # tweak the one rule that differs, in a single motion. Whatever
         # gets saved there folds into the same undo entry (see
@@ -3827,10 +3925,11 @@ class CrateManagerView(QWidget):
         crate = self._smart_crate_library.crates.get(name)
         if not crate:
             return
+        display_name = _smart_crate_display_name(name)
         if crate.tracks:
-            msg = f'Delete "{name}"? It matches {len(crate.tracks)} tracks. This cannot be undone.'
+            msg = f'Delete "{display_name}"? It matches {len(crate.tracks)} tracks. This cannot be undone.'
         else:
-            msg = f'Delete "{name}"? This cannot be undone.'
+            msg = f'Delete "{display_name}"? This cannot be undone.'
         if not _ov_confirm(self, 'Delete Smart Crate', msg, confirm_text='Delete', confirm_danger=True):
             return
         writer = self._smart_writer()

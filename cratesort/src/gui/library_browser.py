@@ -3,13 +3,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys as _sys
-import unicodedata
 from collections import Counter, defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from cratesort.src.core.duplicate_consolidator import read_recent_merges
 from cratesort.src.core.classifier import PARENT_GENRES
 
 from PyQt6.QtCore import Qt, QByteArray, QEvent, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal
@@ -794,7 +791,6 @@ class LibraryBrowserView(QWidget):
         self._classify_results: dict[str, tuple[str, str]] = {}  # artist → (genre, conf)
         self._classify_worker = None
         self._new_track_paths: set[str] = set()  # paths added via Add Tracks this session
-        self._recent_merges: dict[str, dict] = {}  # normalized dest path → {count, most_recent}
         # Tracks the last genre edit for post-sidebar-rebuild navigation
         self._last_edited_artist:  Optional[str] = None
         self._last_assigned_genre: Optional[str] = None
@@ -880,7 +876,6 @@ class LibraryBrowserView(QWidget):
         self._loaded_inv_id = id(inventory)
         self._inventory     = list(inventory)
         self._new_track_paths.clear()
-        self._recent_merges = read_recent_merges(library_path)
 
         # Load classification session
         self._session_genre = {}
@@ -1698,9 +1693,8 @@ class LibraryBrowserView(QWidget):
         comment = edits.get('comment', rec.comment or '')
 
         is_new = str(rec.path) in self._new_track_paths
-        merge_info = self._recent_merges.get(unicodedata.normalize('NFC', str(rec.path)))
         child.setIcon(LC_ARTIST, self._resting_track_icon(str(rec.path)))
-        prefix = '◆ ' if is_new else ('⟳ ' if merge_info else '')
+        prefix = '◆ ' if is_new else ''
         child.setText(LC_ARTIST, f'  {prefix}{title}')
         child.setText(LC_TRACKS,   '')
         child.setText(LC_ALBUM,    album)
@@ -1737,20 +1731,7 @@ class LibraryBrowserView(QWidget):
                     child.setForeground(col, _red)
                 child.setForeground(LC_GENRE, _red)
         else:
-            if merge_info:
-                _merged_brush = QBrush(QColor('#D17D34'))
-                for col in range(len(HEADERS)):
-                    child.setForeground(col, _merged_brush)
-                count = merge_info['count']
-                try:
-                    most_recent = datetime.fromisoformat(merge_info['most_recent']).strftime('%B %d, %Y')
-                except Exception:
-                    most_recent = merge_info['most_recent']
-                child.setToolTip(
-                    LC_ARTIST,
-                    f'Absorbed {count} duplicate cop{"y" if count == 1 else "ies"} on {most_recent}',
-                )
-            elif is_new:
+            if is_new:
                 _new_brush = QBrush(QColor('#5c9d94'))
                 for col in range(len(HEADERS)):
                     child.setForeground(col, _new_brush)

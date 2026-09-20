@@ -116,7 +116,14 @@ def detect_changes(current: dict, previous: dict) -> list[dict]:
     prev_crates = previous.get('crates', {})
 
     def _display_name(path: str) -> str:
-        return path.split('/')[-1].removesuffix('.crate')
+        # '%%' is Serato's internal nesting separator (its literal filename
+        # convention, e.g. "Hip-Hop%%1990s.crate") — every other place in the
+        # app converts it to '/' before showing it to a human (see
+        # crate_writer.py's _serato_to_cratesort_path, and the identical
+        # replace('%%', '/') in straggler_detector.py / path_rewriter.py /
+        # crate_reader.py). This was the one place that forgot to, leaking
+        # raw '%%' into the Serato Crate Changes Detected dialog.
+        return path.split('/')[-1].removesuffix('.crate').replace('%%', '/')
 
     norm_prev: dict[str, str] = {_normalize_path(p): p for p in prev_crates}
 

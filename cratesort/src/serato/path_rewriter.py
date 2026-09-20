@@ -175,7 +175,7 @@ class PathRewriter:
                     )
                     for orig_path, orig_bytes in written_originals:
                         try:
-                            orig_path.write_bytes(orig_bytes)
+                            self._write_atomic_bytes(orig_path, orig_bytes)
                             logger.info("Restored: %s", orig_path.name)
                         except Exception as restore_exc:
                             logger.error(
@@ -311,6 +311,21 @@ class PathRewriter:
         tmp = target.with_suffix('.tmp')
         try:
             write_crate_file(tmp, data)
+            tmp.replace(target)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def _write_atomic_bytes(self, target: Path, data: bytes) -> None:
+        """Same atomic tmp-then-rename guarantee as _write_atomic, for a
+        caller that already has raw bytes (the mid-batch rollback below,
+        restoring a crate to its pre-rewrite state) rather than decoded TLV
+        entries. A force-quit or crash during the write only ever loses the
+        .tmp file — target is never touched until the rename, which is
+        atomic on the same filesystem."""
+        tmp = target.with_suffix('.tmp')
+        try:
+            tmp.write_bytes(data)
             tmp.replace(target)
         except Exception:
             tmp.unlink(missing_ok=True)

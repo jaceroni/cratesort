@@ -26,8 +26,9 @@ from cratesort.src.core.duplicate_dismissals import add_dismissed, remove_dismis
 from cratesort.src.core.file_organizer import FileOrganizer
 from cratesort.src.serato.crate_reader import CrateReader
 from cratesort.src.utils.checkpoint import update_checkpoint_crates
+from cratesort.src.utils.undo_manager import ConsolidationCommand
 from cratesort.src.gui.overlays import (
-    _ov_alert, _ov_confirm, _CrateSortDialog, _create_dialog_layout, _AnimatedStatCardWidget,
+    _ov_alert, _CrateSortDialog, _create_dialog_layout, _AnimatedStatCardWidget,
 )
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -484,8 +485,8 @@ class DuplicateReviewView(QWidget):
 
     States:
       0 — Results: Tier 1 (true dupes) + Tier 2 (variants) review lists
-      1 — Progress: consolidation in progress (% complete bar)
-      2 — Celebration: "Rinsed. X files cleaned up, Y GB freed."
+      1 — Progress: "Consolidating…" (% complete bar)
+      2 — Celebration: "Consolidation Successful"
 
     Review model (opt-in, per-group):
       * Every group is a cheap collapsed strip; click it to open the full card.
@@ -497,10 +498,16 @@ class DuplicateReviewView(QWidget):
     Emits `done` when the user dismisses the celebration or skips entirely.
     """
 
-    done           = pyqtSignal()    # user finished — return to dashboard
-    track_selected = pyqtSignal(str) # file path → populate sidebar artwork
+    done              = pyqtSignal()      # user finished — return to dashboard
+    track_selected    = pyqtSignal(str)   # file path → populate sidebar artwork
+    # winner file path (str) → merged comment. Fired the moment a real
+    # consolidation commits — independent of `done`, which also fires from
+    # Skip/Classify and carries nothing. The caller's in-memory TrackRecords
+    # (dashboard._inventory) were loaded at the last scan and have no other
+    # way to learn their .comment is now stale on disk.
+    comments_updated  = pyqtSignal(dict)
 
-    def __init__(self, parent=None):
+    def __init__(self, undo_manager=None, parent=None):
         super().__init__(parent)
 
         self._library_path: Optional[Path] = None
@@ -508,8 +515,14 @@ class DuplicateReviewView(QWidget):
         self._groups:       list[DuplicateGroup] = []
         self._summary:      Optional[DuplicateSummary] = None
         self._worker:       Optional[_ConsolidationWorker] = None
-        self._undo_worker:  Optional[_UndoConsolidationWorker] = None
-        self._last_rollback_log_path: Optional[Path] = None
+        # Undo/redo for a completed consolidation now lives on the shared
+        # sidebar Undo/Redo stack (see ConsolidationCommand in
+        # undo_manager.py) rather than a screen-local button that vanished
+        # the moment you navigated away — which is exactly what happened in
+        # practice. _cmd_workers keeps the async undo/redo QThreads alive
+        # while in flight (nothing else would hold a reference to them).
+        self._undo_manager = undo_manager
+        self._cmd_workers:  set = set()
 
         # Per-group winner overrides: group index → DuplicateCopy
         self._winner_overrides: dict[int, DuplicateCopy] = {}
@@ -1288,6 +1301,14 @@ class DuplicateReviewView(QWidget):
 
         layout.addLayout(footer)
         _refresh_footer(winner)
+
+        # Symmetric with _build_collapsed_card's "click anywhere to open" —
+        # click anywhere on the card that isn't a real control (a copy row,
+        # a button, the disclosure chevron) collapses it back. Those controls
+        # all accept their own mouse press, so this only fires on the card's
+        # own background/label surface, which Qt bubbles unhandled mouse
+        # events up to.
+        card.mousePressEvent = lambda _e, i=idx: self._on_collapse(i)
         return card
 
     def _build_dismissed_card(self, idx: int, group: DuplicateGroup) -> QFrame:
@@ -1666,7 +1687,7 @@ class DuplicateReviewView(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(16)
 
-        title = QLabel('Rinsing…')
+        title = QLabel('Consolidating…')
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(f'color: {_CREAM}; font-size: 20px; font-weight: 700; background: transparent;')
         layout.addWidget(title)
@@ -1769,17 +1790,8 @@ class DuplicateReviewView(QWidget):
         self._celeb_errors_lbl.hide()
         layout.addWidget(self._celeb_errors_lbl)
 
-        self._undo_btn = QPushButton('Undo This Consolidation')
-        self._undo_btn.setFixedHeight(30)
-        self._undo_btn.setStyleSheet(
-            f'QPushButton {{ background: transparent; color: {_MUTED}; border: none; '
-            f'font-size: 12px; text-decoration: underline; }}'
-            f'QPushButton:hover {{ color: {_CREAM}; }}'
-        )
-        self._undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._undo_btn.clicked.connect(self._on_undo_consolidation)
-        self._undo_btn.hide()
-        layout.addWidget(self._undo_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        # Undo now lives on the sidebar Undo/Redo stack (ConsolidationCommand),
+        # not a button on this screen — see __init__ and _on_finished.
 
         classify_btn = QPushButton('Go Back to Dashboard')
         classify_btn.setFixedHeight(44)
@@ -1851,14 +1863,26 @@ class DuplicateReviewView(QWidget):
         self._progress_label.setText(label)
 
     def _on_finished(self, result: ConsolidationResult) -> None:
+        approved   = getattr(self._worker, '_approved', None)
         self._worker = None
-        self._last_rollback_log_path = result.rollback_log_path
-        if result.rollback_log_path and result.files_removed > 0:
-            self._undo_btn.setText('Undo This Consolidation')
-            self._undo_btn.setEnabled(True)
-            self._undo_btn.show()
-        else:
-            self._undo_btn.hide()
+        if result.comment_updates:
+            self.comments_updated.emit(result.comment_updates)
+
+        if (
+            self._undo_manager is not None
+            and result.rollback_log_path
+            and result.files_removed > 0
+            and approved
+        ):
+            n = result.files_removed
+            cmd = ConsolidationCommand(
+                description=f'Consolidated {n} duplicate file{"s" if n != 1 else ""}',
+                log_path=result.rollback_log_path,
+                approved=approved,
+                do_undo=self._run_consolidation_undo,
+                do_redo=self._run_consolidation_redo,
+            )
+            self._undo_manager.push_completed(cmd)
 
         n = result.files_removed
         freed_value, freed_unit = _round_unit(result.space_freed)
@@ -1898,50 +1922,66 @@ class DuplicateReviewView(QWidget):
         self._stack.setCurrentIndex(_STATE_RESULTS)
         _ov_alert(self, 'Consolidation Failed', f'Something went wrong:\n{msg[:400]}')
 
-    # ── Undo ──────────────────────────────────────────────────────────────────
+    # ── Undo / Redo (via the sidebar's shared UndoManager) ──────────────────
+    # These are the do_undo/do_redo callables ConsolidationCommand invokes —
+    # see undo_manager.py. Each keeps its worker alive in self._cmd_workers
+    # until it reports back, since nothing else holds a reference to it.
 
-    def _on_undo_consolidation(self) -> None:
-        log_path = getattr(self, '_last_rollback_log_path', None)
-        if not log_path:
-            return
-        if not _ov_confirm(
-            self,
-            'Undo This Consolidation',
-            'This restores every consolidated file back to its original location '
-            'and repoints your crates back to it — undoing exactly what this '
-            'consolidation just did.\n\n'
-            'Only do this now, before anything else has touched these tracks or crates.',
-            confirm_text='Undo',
-            confirm_danger=True,
-        ):
-            return
-
-        self._undo_btn.setEnabled(False)
-        self._undo_btn.setText('Undoing…')
-        self._undo_worker = _UndoConsolidationWorker(
-            log_path=log_path,
+    def _run_consolidation_undo(self, cmd: ConsolidationCommand, on_done: Callable[[str], None]) -> None:
+        worker = _UndoConsolidationWorker(
+            log_path=cmd.log_path,
             library_path=self._library_path,
             serato_dir=self._serato_dir,
             parent=self,
         )
-        self._undo_worker.finished.connect(self._on_undo_finished)
-        self._undo_worker.errored.connect(self._on_undo_errored)
-        self._undo_worker.start()
+        self._cmd_workers.add(worker)
 
-    def _on_undo_finished(self, result: dict) -> None:
-        self._undo_worker = None
-        self._undo_btn.hide()
-        self._last_rollback_log_path = None
-        restored = result.get('restored', 0)
-        failed   = result.get('failed', 0)
-        msg = f'{restored} file{"s" if restored != 1 else ""} restored.'
-        if failed:
-            errors = '\n'.join(result.get('errors', [])[:10])
-            msg += f'\n\n{failed} could not be restored:\n{errors}'
-        _ov_alert(self, 'Consolidation Undone', msg)
+        def _finished(result: dict) -> None:
+            self._cmd_workers.discard(worker)
+            restored = result.get('restored', 0)
+            failed   = result.get('failed', 0)
+            if failed:
+                errors = '\n'.join(result.get('errors', [])[:10])
+                _ov_alert(
+                    self, 'Some Files Could Not Be Restored',
+                    f'{restored} file{"s" if restored != 1 else ""} restored, '
+                    f'{failed} failed:\n\n{errors}',
+                )
+            on_done(f'Restored {restored} file{"s" if restored != 1 else ""}')
 
-    def _on_undo_errored(self, msg: str) -> None:
-        self._undo_worker = None
-        self._undo_btn.setEnabled(True)
-        self._undo_btn.setText('Undo This Consolidation')
-        _ov_alert(self, 'Undo Failed', f'Something went wrong:\n{msg[:400]}')
+        def _errored(msg: str) -> None:
+            self._cmd_workers.discard(worker)
+            _ov_alert(self, 'Undo Failed', f'Something went wrong:\n{msg[:400]}')
+            on_done('Undo failed')
+
+        worker.finished.connect(_finished)
+        worker.errored.connect(_errored)
+        worker.start()
+
+    def _run_consolidation_redo(self, cmd: ConsolidationCommand, on_done: Callable[[str], None]) -> None:
+        worker = _ConsolidationWorker(
+            approved=cmd.approved,
+            library_path=self._library_path,
+            serato_dir=self._serato_dir,
+            parent=self,
+        )
+        self._cmd_workers.add(worker)
+
+        def _finished(result: ConsolidationResult) -> None:
+            self._cmd_workers.discard(worker)
+            # A redo produces a fresh rollback log — the next undo must
+            # target this one, not the original run's (already-consumed) log.
+            cmd.log_path = result.rollback_log_path
+            if result.comment_updates:
+                self.comments_updated.emit(result.comment_updates)
+            n = result.files_removed
+            on_done(f'Consolidated {n} file{"s" if n != 1 else ""}')
+
+        def _errored(msg: str) -> None:
+            self._cmd_workers.discard(worker)
+            _ov_alert(self, 'Redo Failed', f'Something went wrong:\n{msg[:400]}')
+            on_done('Redo failed')
+
+        worker.finished.connect(_finished)
+        worker.errored.connect(_errored)
+        worker.start()
