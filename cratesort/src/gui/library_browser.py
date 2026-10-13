@@ -7,6 +7,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
+
+
 from cratesort.src.core.classifier import PARENT_GENRES
 
 from PyQt6.QtCore import Qt, QByteArray, QEvent, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal
@@ -15,12 +17,14 @@ from cratesort.src.gui.overlays import (
     _CrateSortDialog, _ov_alert, _create_dialog_layout, _AnimatedStatCardWidget,
 )
 from cratesort.src.utils.undo_manager import (
-    UndoManager, LibraryFieldEditCommand, LibraryTagsEditCommand,
+    UndoManager, LibraryFieldEditCommand, LibraryBatchFieldEditCommand,
+    LibraryTagsEditCommand,
     LibraryGenreChangeCommand, LibraryReassignArtistCommand,
 )
 from cratesort.src.gui.theme import TRACK_ROW_HEIGHT
 from cratesort.src.gui.inline_edit import make_inline_editor
 from cratesort.src.gui.track_icons import note_icon, play_icon, pause_icon
+from cratesort.src.gui.classifier_view import _artist_edit_key, _parse_artist_edit_key
 from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 
 try:
@@ -110,6 +114,10 @@ def _get_artist_icon():
     if _ARTIST_ICON is None:
         _ARTIST_ICON = _make_person_icon()
     return _ARTIST_ICON
+
+# _artist_edit_key / _parse_artist_edit_key now live in classifier_view.py
+# (imported above) — single source of truth for the __artist__/__filmtv__
+# key contract, shared with crate_manager.py's _artist_edit_key_for_track.
 
 # Editable track columns (field name for storage).
 # LC_GENRE and LC_ARTIST (as artist) are NOT here — use right-click menus only.
@@ -794,6 +802,12 @@ class LibraryBrowserView(QWidget):
         # Tracks the last genre edit for post-sidebar-rebuild navigation
         self._last_edited_artist:  Optional[str] = None
         self._last_assigned_genre: Optional[str] = None
+        # Record of the most recent time the tree actually had more than
+        # one item selected, kept up to date by _on_selection_changed.
+        # _on_item_double_clicked consults this to restore a multi-selection
+        # a double-click's own first half just collapsed down to one row, so
+        # batch-edit still sees the whole group.
+        self._last_multi_selection: Optional[list] = None
 
         # Auto-classify modal state
         self._analyze_modal:          Optional[_AnalyzeLibraryModal] = None
@@ -1042,12 +1056,31 @@ class LibraryBrowserView(QWidget):
         self._row_height_delegate = _TrackRowHeightDelegate(self._tree)
         self._tree.setItemDelegate(self._row_height_delegate)
         self._tree.setExpandsOnDoubleClick(False)
+        # Qt's default edit triggers include DoubleClicked, which starts its
+        # OWN native in-place editing on a double-click — entirely separate
+        # from and invisible to this app's custom inline editor (the
+        # floating QLineEdit placed via setItemWidget in
+        # _on_item_double_clicked). That native machinery does its own
+        # selection handling internally as part of entering edit mode, and
+        # it runs as part of the same mouseDoubleClickEvent that emits
+        # itemDoubleClicked — after any signal handler connected to it
+        # returns. That's exactly the kind of invisible interference that
+        # made three different attempts to restore a multi-selection on
+        # double-click all fail identically regardless of how/when the
+        # restore was triggered: Qt's native edit-trigger handling was
+        # silently re-collapsing the selection again afterward, every time.
+        # This app never uses Qt's native editing at all — every field is
+        # edited through the custom overlay widget — so there's nothing
+        # legitimate for any edit trigger to do here; turning them off
+        # entirely removes the interference at the source.
+        self._tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.itemExpanded.connect(self._on_item_expanded)
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._tree.itemSelectionChanged.connect(self._on_selection_changed)
         self._tree.setMouseTracking(True)
         self._tree.viewport().setMouseTracking(True)
         self._tree.viewport().installEventFilter(self)
@@ -1263,7 +1296,8 @@ class LibraryBrowserView(QWidget):
                 continue
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
             artist = data.get('artist', '')
-            existing_genre = self._edits.get(f'__artist__{artist}', {}).get('genre')
+            is_film_tv = data.get('is_film_tv', False)
+            existing_genre = self._edits.get(_artist_edit_key(artist, is_film_tv), {}).get('genre')
             if existing_genre and existing_genre not in _UC:
                 continue  # deliberate override — handled
             if existing_genre in _UC:
@@ -1476,8 +1510,15 @@ class LibraryBrowserView(QWidget):
         for rec in self._inventory:
             edits = self._edits.get(str(rec.path), {})
             if 'reassign_artist' in edits:
-                # Explicit manual override always wins, video or not.
-                artist_tracks[edits['reassign_artist']].append(rec)
+                # Explicit manual override always wins, video or not — but
+                # it can target either a regular artist or a Film & TV
+                # group, so route to whichever bucket it was actually aimed
+                # at (reassign_is_film_tv), not always the regular one.
+                target = edits['reassign_artist']
+                if edits.get('reassign_is_film_tv'):
+                    film_tv_tracks[target].append(rec)
+                else:
+                    artist_tracks[target].append(rec)
                 continue
             ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
             if ancestor_names & _FILM_TV_FOLDER_NAMES:
@@ -1494,7 +1535,7 @@ class LibraryBrowserView(QWidget):
         formats: set[str] = set()
 
         for artist, tracks in sorted(artist_tracks.items()):
-            artist_edits = self._edits.get(f'__artist__{artist}', {})
+            artist_edits = self._edits.get(_artist_edit_key(artist), {})
             if 'genre' in artist_edits:
                 genre = artist_edits['genre']
             else:
@@ -1514,7 +1555,7 @@ class LibraryBrowserView(QWidget):
                         if canonical:
                             _tag_counts[canonical] += 1
                     genre = _tag_counts.most_common(1)[0][0] if _tag_counts else ''
-            item = self._make_artist_item(artist, tracks, genre)
+            item = self._make_artist_item(artist, tracks, genre, is_film_tv=False)
             self._tree.addTopLevelItem(item)
             if genre:
                 genres.add(genre)
@@ -1527,9 +1568,9 @@ class LibraryBrowserView(QWidget):
         # still honors a manual "Change Genre" override — e.g. moving "Menace
         # to Society" into Hip-Hop/Rap on purpose.
         for title, tracks in sorted(film_tv_tracks.items()):
-            artist_edits = self._edits.get(f'__artist__{title}', {})
+            artist_edits = self._edits.get(_artist_edit_key(title, is_film_tv=True), {})
             genre = artist_edits.get('genre', FILM_TV_GENRE)
-            item = self._make_artist_item(title, tracks, genre)
+            item = self._make_artist_item(title, tracks, genre, is_film_tv=True)
             self._tree.addTopLevelItem(item)
             if genre:
                 genres.add(genre)
@@ -1594,13 +1635,17 @@ class LibraryBrowserView(QWidget):
         if self._classify_mode:
             self._populate_classify_columns()
 
-    def _make_artist_item(self, artist: str, tracks: list, genre: str) -> QTreeWidgetItem:
+    def _make_artist_item(
+        self, artist: str, tracks: list, genre: str, is_film_tv: bool = False
+    ) -> QTreeWidgetItem:
         item = QTreeWidgetItem()
         # Pin the row height to match the Crates track table. Set on the item
         # itself (not just the delegate) — QTreeView always honours an item
         # size hint; a delegate sizeHint can be silently overridden.
         item.setSizeHint(LC_ARTIST, QSize(-1, TRACK_ROW_HEIGHT))
-        item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, {'artist': artist, 'tracks': tracks})
+        item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, {
+            'artist': artist, 'tracks': tracks, 'is_film_tv': is_film_tv,
+        })
         item.setData(LC_GENRE,  Qt.ItemDataRole.UserRole + 1, genre)  # for filtering
 
         # Common path
@@ -1611,7 +1656,7 @@ class LibraryBrowserView(QWidget):
             common = 'Multiple locations'
 
         # Artist-level tags only — track tags are independent and stored separately
-        tags = self._edits.get(f'__artist__{artist}', {}).get('tags', '')
+        tags = self._edits.get(_artist_edit_key(artist, is_film_tv), {}).get('tags', '')
 
         _UC_ARTIST = {'', '—', 'Unclassified', 'Untagged'}
 
@@ -1651,15 +1696,15 @@ class LibraryBrowserView(QWidget):
         # tier is only ever meaningful before a decision is made; a future
         # "reset classification" feature can surface it again on demand.
         _, confidence = self._classify_lookup(artist)
-        frozen = self._frozen_confidence(artist)
-        existing_override = self._edits.get(f'__artist__{artist}', {}).get('genre')
+        frozen = self._frozen_confidence(artist, is_film_tv)
+        existing_override = self._edits.get(_artist_edit_key(artist, is_film_tv), {}).get('genre')
         if frozen != 'MATCHED' and existing_override and existing_override not in _UC_ARTIST:
             # Backfill/migrate: covers artists settled before Confidence-
             # freezing existed at all (frozen == '') and artists frozen by
             # an earlier build of this feature that froze the original tier
             # instead of always MATCHED (frozen == 'HIGH'/'LOW'/...). Either
             # way, once settled it should read MATCHED from here on.
-            self._edits[f'__artist__{artist}']['confidence'] = 'MATCHED'
+            self._edits[_artist_edit_key(artist, is_film_tv)]['confidence'] = 'MATCHED'
             self._confidence_backfilled = True
             frozen = 'MATCHED'
         confidence = frozen or confidence
@@ -1667,7 +1712,7 @@ class LibraryBrowserView(QWidget):
             item.setText(LC_CLS_CONF, confidence)
             item.setForeground(LC_CLS_CONF, QBrush(QColor(self._CONF_COLORS.get(confidence, '#a89b85'))))
 
-        status_label, status_color = self._derive_persistent_status(artist)
+        status_label, status_color = self._derive_persistent_status(artist, is_film_tv)
         item.setText(LC_CLS_STATUS, status_label)
         item.setForeground(LC_CLS_STATUS, QBrush(QColor(status_color)) if status_color else QBrush())
 
@@ -1768,12 +1813,12 @@ class LibraryBrowserView(QWidget):
             pass
         return '', ''
 
-    def _frozen_confidence(self, artist: str) -> str:
+    def _frozen_confidence(self, artist: str, is_film_tv: bool = False) -> str:
         """Confidence tier frozen at the moment this artist was last settled
         (Approved/Edited via Accept Reclassifications, right-click Approve, or
         Change Genre), or '' if never settled. See _apply_library_genre /
         _exit_classify_mode_accept for where this gets written."""
-        return self._edits.get(f'__artist__{artist}', {}).get('confidence', '')
+        return self._edits.get(_artist_edit_key(artist, is_film_tv), {}).get('confidence', '')
 
     # ── Lazy loading ──────────────────────────────────────────────────
 
@@ -1838,7 +1883,33 @@ class LibraryBrowserView(QWidget):
 
     # ── Selection + album art ──────────────────────────────────────────
 
+    def _on_selection_changed(self) -> None:
+        """Keep a record of the most recent time the tree genuinely had more
+        than one item selected, so _on_item_double_clicked can restore it
+        for batch-editing after a double-click's first half narrows the
+        selection down to one row (standard, correct behavior for that first
+        click in isolation). No time limit on how long this stays valid —
+        an earlier version expired it after 1 second, which turned out to
+        be far too short: selecting a group and then actually moving to
+        double-click a specific cell in it routinely takes longer than that
+        in real use, which was silently defeating the whole feature. Instead
+        the record is only invalidated by a genuine signal that the user has
+        moved on — narrowing to a single item that ISN'T part of the
+        recorded group means they clicked away from it on purpose."""
+        sel = self._tree.selectedItems()
+        if len(sel) > 1:
+            self._last_multi_selection = list(sel)
+        elif (len(sel) == 1 and self._last_multi_selection
+                and sel[0] not in self._last_multi_selection):
+            self._last_multi_selection = None
+
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        # A plain click always behaves normally here — including narrowing
+        # an existing multi-selection down to just this row, same as any
+        # standard app (shift/cmd are what extend selection, not a bare
+        # click). The multi-selection only needs to survive specifically
+        # for a double-click, which is the actual batch-edit trigger — see
+        # _on_item_double_clicked.
         if item.parent():  # track child
             rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
             if rec and hasattr(rec, 'path'):
@@ -2104,6 +2175,30 @@ class LibraryBrowserView(QWidget):
         if not (rec and field):
             return
 
+        # Batch fan-out: if the row just edited is part of a multi-selection,
+        # apply this same field+value to every other selected track too —
+        # only this one field changes on those other tracks, nothing else.
+        # Title is excluded: every track's title is expected to be unique,
+        # there's no legitimate reason to set several different songs to the
+        # same title, and the multi-select fan-out gesture is easy to
+        # trigger by habit (double-click one row's Title cell to fix just
+        # that one track, forgetting several others are still selected from
+        # an earlier batch action) — so Title always edits only the row you
+        # actually double-clicked, regardless of selection.
+        selected = [it for it in self._tree.selectedItems() if it.parent() is not None]
+        if field != 'title' and len(selected) > 1 and item in selected:
+            old_vals: dict[str, str] = {}
+            for it in selected:
+                it_rec = it.data(LC_PATH, Qt.ItemDataRole.UserRole)
+                if it_rec:
+                    old_vals[str(it_rec.path)] = it.text(col).lstrip()
+            if self._undo_manager:
+                cmd = LibraryBatchFieldEditCommand(self, field, old_vals, new_val)
+                self._undo_manager.push(cmd)
+            else:
+                self._apply_library_field_batch(field, {p: new_val for p in old_vals})
+            return
+
         if self._undo_manager:
             cmd = LibraryFieldEditCommand(self, str(rec.path), field, original, new_val)
             self._undo_manager.push(cmd)  # execute() updates cell + saves + writes disk
@@ -2143,12 +2238,14 @@ class LibraryBrowserView(QWidget):
         return None
 
     def _find_item_by_key(self, key: str) -> Optional[QTreeWidgetItem]:
-        if key.startswith('__artist__'):
-            artist = key[len('__artist__'):]
+        parsed = _parse_artist_edit_key(key)
+        if parsed is not None:
+            artist, is_film_tv = parsed
             for i in range(self._tree.topLevelItemCount()):
                 top = self._tree.topLevelItem(i)
                 data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-                if data.get('artist', '') == artist:
+                if (data.get('artist', '') == artist
+                        and data.get('is_film_tv', False) == is_film_tv):
                     return top
             return None
         return self._find_track_item(key)
@@ -2227,6 +2324,34 @@ class LibraryBrowserView(QWidget):
             self._flash_row_text(item)
             self._tree.scrollToItem(item)
 
+    def _apply_library_field_batch(self, field: str, values_map: dict) -> None:
+        """Set one field to its mapped value across multiple tracks at once —
+        same shape as _apply_library_field but batched: one disk write per
+        track, one flash/scroll pass at the end instead of per-track churn.
+        Shared by execute() and undo()."""
+        disk_failures = 0
+        for file_path, value in values_map.items():
+            self._edits.setdefault(file_path, {})[field] = value
+            self.track_field_changed.emit(file_path, field, value)
+
+            item = self._find_track_item(file_path)
+            col = _FIELD_TO_COL.get(field)
+            if item and col is not None:
+                item.setText(col, f'  {value}' if col == LC_ARTIST else value)
+
+            if field != 'tags':
+                rec = self._resolve_track(file_path)
+                if rec and not self._write_disk_field(rec, field, value):
+                    disk_failures += 1
+
+        self._save_edits()
+        if disk_failures:
+            self._flash_disk_failure(
+                f'⚠ Could not write to {disk_failures} file(s) — check that the '
+                'drive is connected and the files are not locked.'
+            )
+        self._flash_keys(values_map.keys())
+
     def _apply_library_tags(self, key: str, tags_str: str) -> None:
         """Set the tags string on a track or artist key — shared by execute() and undo()."""
         if tags_str:
@@ -2263,7 +2388,7 @@ class LibraryBrowserView(QWidget):
                 # forever; that reads as "still needs attention" even after
                 # they've explicitly signed off. See _frozen_confidence for
                 # the read side.
-                if key.startswith('__artist__'):
+                if _parse_artist_edit_key(key) is not None:
                     self._edits[key]['confidence'] = 'MATCHED'
 
         # Stage a per-track genre entry for anything that actually writes to
@@ -2283,13 +2408,17 @@ class LibraryBrowserView(QWidget):
                     disk_failures += 1
         self._save_edits()
 
+        # Keep the full prefixed key (not just the bare name) so a genre
+        # change on one of two same-named artist/Film & TV groups (e.g.
+        # "Scarface" the rapper vs. the movie) can't cross-apply to the
+        # other once _sync_genres_to_session resolves it back to an entry.
         artist_changes = {
-            k[len('__artist__'):]: v for k, v in edits_map.items()
-            if k.startswith('__artist__') and v is not None
+            k: v for k, v in edits_map.items()
+            if _parse_artist_edit_key(k) is not None and v is not None
         }
         track_changes = {
             k: v for k, v in edits_map.items()
-            if not k.startswith('__artist__') and v is not None
+            if _parse_artist_edit_key(k) is None and v is not None
         }
         self._sync_genres_to_session(artist_changes, track_changes)
 
@@ -2317,21 +2446,43 @@ class LibraryBrowserView(QWidget):
                 f'check that the drive is connected and files are not locked.'
             )
         else:
-            names = [k[len('__artist__'):] if k.startswith('__artist__') else Path(k).stem
-                      for k, g in edits_map.items() if g is not None]
+            names = []
+            for k, g in edits_map.items():
+                if g is None:
+                    continue
+                parsed = _parse_artist_edit_key(k)
+                names.append(parsed[0] if parsed else Path(k).stem)
             genre = next((g for g in edits_map.values() if g is not None), None)
             if names and genre:
                 label = names[0] if len(names) == 1 else f'{len(names)} items'
                 self._set_status(f'✓ {label} → {genre}', teal=True)
 
-    def _apply_library_reassign(self, edits_map: dict, disk_map: dict) -> None:
+    def _apply_library_reassign(
+        self, edits_map: dict, disk_map: dict, seed_genre: Optional[tuple] = None,
+    ) -> None:
         """Replace each track's edit dict wholesale and write its artist tag to
-        disk — shared by execute() and undo() of a reassignment."""
+        disk — shared by execute() and undo() of a reassignment.
+
+        seed_genre: (artist_key, genre) to default a brand-new destination
+        group to, only if it doesn't already have its own genre edit. Pass
+        None on undo — reverting a reassignment should never plant or touch
+        this. A newly-created group must inherit the genre/Film & TV status
+        of whatever bucket the user was reassigning FROM, not fall through
+        to Unclassified — the user is already standing inside that genre by
+        doing the reassignment there; dropping classification entirely
+        would be assuming the opposite of their actual intent."""
         for path, edit_dict in edits_map.items():
             if edit_dict:
                 self._edits[path] = edit_dict
             else:
                 self._edits.pop(path, None)
+
+        if seed_genre is not None:
+            artist_key, genre = seed_genre
+            if genre and not self._edits.get(artist_key, {}).get('genre'):
+                self._edits.setdefault(artist_key, {})['genre'] = genre
+                self._edits[artist_key]['confidence'] = 'MATCHED'
+
         self._save_edits()
 
         disk_failures = 0
@@ -2396,23 +2547,57 @@ class LibraryBrowserView(QWidget):
         if not rec:
             return
 
-        # Commit any existing editor first before opening a new one
-        self._commit_active_editor()
+        # A genuine double-click is the batch-edit trigger, so bring back
+        # whatever multi-selection existed right before this gesture started
+        # (the double-click's own first half already collapsed it down to
+        # just this row — standard, correct behavior for a plain click in
+        # isolation). Applied via a deferred zero-delay timer, AFTER the
+        # editor below is created and focused, not before: giving the new
+        # editor widget keyboard focus turns out to itself re-sync the
+        # tree's selection back down to just the current item as a side
+        # effect — restoring first just got silently undone by that.
+        # Deferring to the next event-loop tick runs after focus-handling
+        # has fully settled, so this restore is the last word regardless of
+        # what Qt does internally in between.
+        pending = self._last_multi_selection
 
-        current = item.text(column).lstrip()
-        editor = make_inline_editor(
-            current,
-            on_commit=self._commit_active_editor,
-            on_cancel=self._cancel_active_editor,
-        )
+        # Freeze repainting from here through the deferred restore below, so
+        # the brief collapsed-then-restored selection state never actually
+        # gets drawn to screen as two visibly separate frames — it should
+        # land as one clean jump straight to [group selected + editor open],
+        # not a flash-off-then-flash-back-on.
+        self._tree.setUpdatesEnabled(False)
 
-        self._edit_widget   = editor
-        self._edit_item     = item
-        self._edit_col      = column
-        self._edit_original = current
+        def _restore_after_focus(target_item=item, group=pending):
+            try:
+                if group and target_item in group:
+                    for it in group:
+                        it.setSelected(True)
+            finally:
+                self._tree.setUpdatesEnabled(True)
 
-        self._tree.setItemWidget(item, column, editor)
-        editor.setFocus()
+        try:
+            # Commit any existing editor first before opening a new one
+            self._commit_active_editor()
+
+            current = item.text(column).lstrip()
+            editor = make_inline_editor(
+                current,
+                on_commit=self._commit_active_editor,
+                on_cancel=self._cancel_active_editor,
+            )
+
+            self._edit_widget   = editor
+            self._edit_item     = item
+            self._edit_col      = column
+            self._edit_original = current
+
+            self._tree.setItemWidget(item, column, editor)
+            editor.setFocus()
+        except Exception:
+            self._tree.setUpdatesEnabled(True)
+            raise
+        QTimer.singleShot(0, _restore_after_focus)
 
     # ── Filtering ─────────────────────────────────────────────────────
 
@@ -2507,10 +2692,21 @@ class LibraryBrowserView(QWidget):
             except Exception as exc:
                 print(f'[LibraryBrowser] Failed to load session for sync: {exc}')
                 return
+        # artist_changes is keyed by the full __artist__X/__filmtv__X string,
+        # not bare name — resolve to (name, is_film_tv) once so a change to
+        # one of two same-named artist/Film & TV entries (e.g. "Scarface"
+        # the rapper vs. the movie) can't also apply to the other.
+        artist_change_lookup: dict = {}
+        for key, genre in artist_changes.items():
+            parsed = _parse_artist_edit_key(key)
+            if parsed is not None:
+                artist_change_lookup[parsed] = genre
+
         session = self._cached_session
         for entry in session.entries:
-            if entry.artist in artist_changes:
-                entry.final_genre = artist_changes[entry.artist]
+            change = artist_change_lookup.get((entry.artist, entry.is_film_tv))
+            if change is not None:
+                entry.final_genre = change
                 if entry.state in ('pending', 'flagged'):
                     entry.state = 'edited'
             for track in entry.tracks:
@@ -2564,7 +2760,7 @@ class LibraryBrowserView(QWidget):
             if item.parent() is None:
                 data   = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
                 artist = data.get('artist', '')
-                key = f'__artist__{artist}'
+                key = _artist_edit_key(artist, data.get('is_film_tv', False))
                 for rec in data.get('tracks', []):
                     disk_old[str(rec.path)] = rec.genre or ''
             else:
@@ -2612,10 +2808,10 @@ class LibraryBrowserView(QWidget):
         _UC = {'', '—', 'Unclassified', 'Untagged'}
         if not proposed or proposed in _UC:
             return  # nothing real proposed for this artist to approve
-        key = f'__artist__{artist}'
+        artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+        key = _artist_edit_key(artist, artist_data.get('is_film_tv', False))
         old_genre = self._edits.get(key, {}).get('genre')
 
-        artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
         disk_old = {str(rec.path): (rec.genre or '') for rec in artist_data.get('tracks', [])}
 
         if self._undo_manager:
@@ -2674,17 +2870,50 @@ class LibraryBrowserView(QWidget):
         if not tracks_to_move:
             return
 
-        # 3. Show artist-picker dialog once
-        existing_artists = []
+        # 3. Show artist-picker dialog once. Destinations include both
+        # regular artists and Film & TV groups — a reassignment can target
+        # either (see reassign_is_film_tv handling in _rebuild_tree). Every
+        # entry always shows its genre/content-type, not just ones that
+        # happen to collide on name — a colliding "Scarface" shouldn't be
+        # the only one with a label while every other entry stays bare;
+        # consistent labeling means the user never has to wonder whether
+        # the app actually checked for a collision or not.
+        existing_artists: list[str] = []
+        label_to_target: dict[str, tuple] = {}   # label -> (name, is_film_tv)
         for i in range(self._tree.topLevelItemCount()):
-            top = self._tree.topLevelItem(i)
+            top  = self._tree.topLevelItem(i)
             data = top.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
-            existing_artists.append(data.get('artist', ''))
+            name = data.get('artist', '')
+            is_film_tv = data.get('is_film_tv', False)
+            hint = 'Film & TV' if is_film_tv else (top.text(LC_GENRE) or 'Unclassified')
+            label = f'{name} ({hint})'
+            existing_artists.append(label)
+            label_to_target[label] = (name, is_film_tv)
 
         dlg = _ReassignArtistDialog(existing_artists, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_artist = dlg.artist_name.strip()
+        typed = dlg.artist_name.strip()
+        seed_genre = None
+        if typed in label_to_target:
+            new_artist, new_is_film_tv = label_to_target[typed]
+        else:
+            # Brand-new destination — default it to the genre/Film & TV
+            # status of wherever these tracks are being reassigned FROM,
+            # not Unclassified. Reassigning from inside Film & TV (or any
+            # genre) to a new name is adding a group to that bucket, not
+            # asking to start over with no classification — the user is
+            # already standing inside it by doing the reassignment there.
+            new_artist = typed
+            src_parent = tracks_to_move[0][2]
+            src_data   = src_parent.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            new_is_film_tv = src_data.get('is_film_tv', False)
+            if new_is_film_tv:
+                from cratesort.src.gui.classifier_view import FILM_TV_GENRE
+                src_genre = FILM_TV_GENRE
+            else:
+                src_genre = src_parent.text(LC_GENRE)
+            seed_genre = (_artist_edit_key(new_artist, new_is_film_tv), src_genre)
         if not new_artist:
             return
 
@@ -2701,19 +2930,28 @@ class LibraryBrowserView(QWidget):
 
         label = tracks_to_move[0][1].filename if len(moves) == 1 else ''
         if self._undo_manager:
-            cmd = LibraryReassignArtistCommand(self, moves, new_artist, label)
+            cmd = LibraryReassignArtistCommand(
+                self, moves, new_artist, label,
+                new_is_film_tv=new_is_film_tv, seed_genre=seed_genre,
+            )
             self._undo_manager.push(cmd)
         else:
             edits_map = {
-                path: {**info['prior_edit'], 'reassign_artist': new_artist, 'original_artist': info['group_artist']}
+                path: {
+                    **info['prior_edit'],
+                    'reassign_artist':     new_artist,
+                    'reassign_is_film_tv': new_is_film_tv,
+                    'original_artist':     info['group_artist'],
+                }
                 for path, info in moves.items()
             }
             disk_map = {path: new_artist for path in moves}
-            self._apply_library_reassign(edits_map, disk_map)
+            self._apply_library_reassign(edits_map, disk_map, seed_genre=seed_genre)
 
     def _edit_artist_tags(self, item: QTreeWidgetItem, artist: str) -> None:
         from cratesort.src.gui.classifier_view import _EditTagsDialog
-        key = f'__artist__{artist}'
+        item_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+        key = _artist_edit_key(artist, item_data.get('is_film_tv', False))
         current_tags_str = self._edits.get(key, {}).get('tags', '')
         current_tags = [t.strip() for t in current_tags_str.split(',') if t.strip()]
         dlg = _EditTagsDialog(
@@ -2977,7 +3215,7 @@ class LibraryBrowserView(QWidget):
         self._classify_banner_frame.setVisible(True)
         self._classify_btn.setVisible(False)
 
-    def _derive_persistent_status(self, artist: str) -> tuple[str, str]:
+    def _derive_persistent_status(self, artist: str, is_film_tv: bool = False) -> tuple[str, str]:
         """
         Persistent (always-visible, not just during classify-mode review)
         status for an artist — deliberately NOT sourced from ArtistEntry.state,
@@ -3018,7 +3256,7 @@ class LibraryBrowserView(QWidget):
             # accept), so there was never anything pending.
             return '✓ Approved', '#6B9E78'
 
-        existing_genre = self._edits.get(f'__artist__{artist}', {}).get('genre')
+        existing_genre = self._edits.get(_artist_edit_key(artist, is_film_tv), {}).get('genre')
         if existing_genre is None:
             return '◔ Pending', '#a89b85'
         if existing_genre in _UC:
@@ -3071,7 +3309,9 @@ class LibraryBrowserView(QWidget):
                 artist, ('Unclassified', 'NONE')
             )
 
-            existing_genre = self._edits.get(f'__artist__{artist}', {}).get('genre')
+            existing_genre = self._edits.get(
+                _artist_edit_key(artist, data.get('is_film_tv', False)), {}
+            ).get('genre')
             if existing_genre and existing_genre not in _UC:
                 item.setText(LC_CLS_PROPOSED, existing_genre)
                 item.setBackground(LC_CLS_PROPOSED, QBrush(QColor(_BG_NORMAL)))
@@ -3152,7 +3392,7 @@ class LibraryBrowserView(QWidget):
             artist = data.get('artist', '')
             current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
             proposed = item.text(LC_CLS_PROPOSED)
-            artist_key = f'__artist__{artist}'
+            artist_key = _artist_edit_key(artist, data.get('is_film_tv', False))
             existing_genre = edits.get(artist_key, {}).get('genre')
             if existing_genre and existing_genre not in _UC:
                 continue  # user-set override — don't overwrite with classifier's proposal
@@ -3195,7 +3435,7 @@ class LibraryBrowserView(QWidget):
             item = self._tree.topLevelItem(i)
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
             artist = data.get('artist', '')
-            artist_key = f'__artist__{artist}'
+            artist_key = _artist_edit_key(artist, data.get('is_film_tv', False))
             if artist_key not in edits:
                 current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
                 if current_genre in _UC:

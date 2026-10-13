@@ -49,6 +49,9 @@ from cratesort.src.gui.overlays import (
 from cratesort.src.gui.theme import TRACK_ROW_HEIGHT
 from cratesort.src.gui.inline_edit import make_inline_editor
 from cratesort.src.gui.track_icons import note_icon, play_icon, pause_icon
+from cratesort.src.gui.classifier_view import (
+    _FILM_TV_FOLDER_NAMES, _artist_edit_key, FILM_TV_GENRE,
+)
 
 _ASSETS         = Path(__file__).parent.parent.parent / 'assets'
 _ICON_CHECKED   = str(_ASSETS / 'icons' / 'checkbox-checked.svg')
@@ -99,6 +102,30 @@ _BORDER = '#444444'
 
 _SETTINGS_KEY   = 'crate_manager_header_state'
 _ALL_TRACKS_KEY = '__ALL_TRACKS__'
+
+
+def _artist_edit_key_for_track(rec, has_reassign_override: bool = False) -> str:
+    """The library_edits.json artist-level key for `rec`'s artist/title —
+    __filmtv__X instead of __artist__X if this track lives in a Film & TV
+    folder, matching library_browser.py's _artist_edit_key/is_film_tv split.
+    Without this, a Film & TV group sharing a name with a real artist (e.g.
+    "Scarface" the movie vs. Scarface the rapper) would read the wrong
+    artist-level genre/tags entry here.
+
+    `has_reassign_override` must be True when this track has a manual
+    'reassign_artist' edit — library_browser.py's _rebuild_tree treats that
+    override as always winning over folder location ("Explicit manual
+    override always wins, video or not"), routing the track into the plain
+    artist grouping regardless of which folder it physically sits in.
+    Without checking this here too, a track reassigned out of a Film & TV
+    folder would read/write __filmtv__X here while Library reads/writes
+    __artist__X for the exact same track — the two views silently disagree
+    on where its genre/tags are stored."""
+    if has_reassign_override:
+        return _artist_edit_key(rec.artist, is_film_tv=False)
+    ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
+    is_film_tv = bool(ancestor_names & _FILM_TV_FOLDER_NAMES)
+    return _artist_edit_key(rec.artist, is_film_tv)
 
 # Smart crates live in a separate Serato namespace (Smartcrates, not
 # Subcrates) and are flat (no %%-nesting), so their tree keys get a
@@ -1507,7 +1534,10 @@ class _CrateLoadWorker(QThread):
     def _build_resolved(self, tp: str, rec) -> dict:
         edits      = self._edits.get(str(rec.path), {})
         path_str   = str(rec.path)
-        artist_key = f'__artist__{rec.artist}' if rec.artist else ''
+        artist_key = (
+            _artist_edit_key_for_track(rec, 'reassign_artist' in edits)
+            if rec.artist else ''
+        )
 
         genre = (
             edits.get('genre')
@@ -3088,7 +3118,10 @@ class CrateManagerView(QWidget):
             rec = self._resolve_track(path)
             if row is None or rec is None:
                 continue
-            artist_key = f'__artist__{rec.artist}' if rec.artist else ''
+            artist_key = (
+                _artist_edit_key_for_track(rec, 'reassign_artist' in self._edits.get(path, {}))
+                if rec.artist else ''
+            )
             display = (
                 self._edits.get(path, {}).get('genre')
                 or (self._edits.get(artist_key, {}).get('genre') if artist_key else None)
@@ -3119,16 +3152,41 @@ class CrateManagerView(QWidget):
             self._track_model.set_display(row, TC_TAGS, tags_str)
             self._flash_row(row)
 
-    def _apply_crate_reassign(self, crate_path: Optional[str], values: dict) -> None:
-        """values: file_path -> artist to set, or None to clear the override.
-        Shared by execute()/undo() of CrateReassignArtistCommand."""
-        for path, artist in values.items():
-            if artist is None:
+    def _apply_crate_reassign(
+        self, crate_path: Optional[str], values: dict, seed_genre: Optional[tuple] = None,
+    ) -> None:
+        """values: file_path -> (artist, is_film_tv) to set, or None to clear
+        the override. Shared by execute()/undo() of CrateReassignArtistCommand.
+        reassign_is_film_tv must be written alongside reassign_artist — it's
+        the same field library_browser.py's _rebuild_tree reads to decide
+        whether a reassignment routes into the regular artist grouping or a
+        Film & TV group, and library_edits.json is shared between both
+        views, so a reassignment made here needs to resolve the same way
+        over in Library.
+
+        seed_genre: (artist_key, genre) to default a brand-new destination
+        group to, only if it doesn't already have its own genre edit. Pass
+        None on undo. Without this, a group created via reassign here would
+        fall through to Unclassified over in Library instead of inheriting
+        the genre/Film & TV status of wherever the track was reassigned
+        from — same fix as library_browser.py's _apply_library_reassign."""
+        for path, target in values.items():
+            if target is None:
                 self._edits.get(path, {}).pop('reassign_artist', None)
+                self._edits.get(path, {}).pop('reassign_is_film_tv', None)
                 if path in self._edits and not self._edits[path]:
                     del self._edits[path]
             else:
-                self._edits.setdefault(path, {})['reassign_artist'] = artist
+                artist, is_film_tv = target
+                self._edits.setdefault(path, {})['reassign_artist']     = artist
+                self._edits.setdefault(path, {})['reassign_is_film_tv'] = is_film_tv
+
+        if seed_genre is not None:
+            artist_key, genre = seed_genre
+            if genre and not self._edits.get(artist_key, {}).get('genre'):
+                self._edits.setdefault(artist_key, {})['genre'] = genre
+                self._edits[artist_key]['confidence'] = 'MATCHED'
+
         self._save_edits()
 
         if crate_path and self._current_crate_path != crate_path:
@@ -4370,21 +4428,79 @@ class CrateManagerView(QWidget):
         rec = self._resolve_track(raw) if raw else None
         if rec is None:
             return
-        existing_artists = sorted({rec.artist for rec in self._inventory if rec.artist})
+
+        # Same picker UI as Library's Reassign Artist: one entry per (name,
+        # Film & TV or not) pair that actually exists in the library, every
+        # entry always labeled with its genre/content-type — never an
+        # unlabeled "Scarface" the user can't tell apart from another one.
+        seen: dict[tuple, str] = {}   # (name, is_film_tv) -> genre label
+        for other in self._inventory:
+            if not other.artist:
+                continue
+            ancestor_names = {p.lower() for p in other.path.parts[:-1]}
+            is_film_tv = bool(ancestor_names & _FILM_TV_FOLDER_NAMES)
+            target = (other.artist, is_film_tv)
+            if target in seen:
+                continue
+            key = _artist_edit_key(other.artist, is_film_tv)
+            genre = (
+                self._edits.get(key, {}).get('genre')
+                or (FILM_TV_GENRE if is_film_tv else None)
+                or self._session_genre.get(other.artist)
+                or other.genre
+                or 'Unclassified'
+            )
+            seen[target] = genre
+
+        existing_artists: list[str] = []
+        label_to_target: dict[str, tuple] = {}
+        for (name, is_film_tv), genre in sorted(seen.items(), key=lambda kv: kv[0][0].lower()):
+            label = f'{name} ({genre})'
+            existing_artists.append(label)
+            label_to_target[label] = (name, is_film_tv)
+
         dlg = _ReassignArtistDialog(existing_artists, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_artist = dlg.artist_name.strip()
+        typed = dlg.artist_name.strip()
+        seed_genre = None
+        if typed in label_to_target:
+            new_artist, new_is_film_tv = label_to_target[typed]
+        else:
+            # Brand-new destination — default it to the genre/Film & TV
+            # status of wherever THIS track is being reassigned from, same
+            # reasoning as library_browser.py's _reassign_track.
+            new_artist = typed
+            ancestor_names = {p.lower() for p in rec.path.parts[:-1]}
+            new_is_film_tv = bool(ancestor_names & _FILM_TV_FOLDER_NAMES)
+            src_key = _artist_edit_key(rec.artist, new_is_film_tv) if rec.artist else None
+            src_genre = (
+                (self._edits.get(src_key, {}).get('genre') if src_key else None)
+                or (FILM_TV_GENRE if new_is_film_tv else None)
+                or self._session_genre.get(rec.artist or '')
+                or rec.genre
+            )
+            if src_genre:
+                seed_genre = (_artist_edit_key(new_artist, new_is_film_tv), src_genre)
         if not new_artist:
             return
-        old_artist = self._edits.get(str(rec.path), {}).get('reassign_artist')
+
+        prior = self._edits.get(str(rec.path), {})
+        old_artist     = prior.get('reassign_artist')
+        old_is_film_tv = prior.get('reassign_is_film_tv', False)
         if self._undo_manager:
             cmd = CrateReassignArtistCommand(
-                self, self._current_crate_path, str(rec.path), rec.filename, old_artist, new_artist,
+                self, self._current_crate_path, str(rec.path), rec.filename,
+                old_artist, new_artist,
+                old_is_film_tv=old_is_film_tv, new_is_film_tv=new_is_film_tv,
+                seed_genre=seed_genre,
             )
             self._undo_manager.push(cmd)
         else:
-            self._apply_crate_reassign(self._current_crate_path, {str(rec.path): new_artist})
+            self._apply_crate_reassign(
+                self._current_crate_path, {str(rec.path): (new_artist, new_is_film_tv)},
+                seed_genre=seed_genre,
+            )
 
     def _remove_from_crate(self, rows: list[int]) -> None:
         if not self._current_crate_path or self._current_crate_path == _ALL_TRACKS_KEY:

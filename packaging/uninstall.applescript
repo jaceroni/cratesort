@@ -14,8 +14,8 @@ if theButton is "Uninstall" then
 	set removedApp to false
 	repeat with p in appPaths
 		set posixPath to p as text
-		set exists to (do shell script "[ -d " & quoted form of posixPath & " ] && echo yes || echo no")
-		if exists is "yes" then
+		set pathExists to (do shell script "[ -d " & quoted form of posixPath & " ] && echo yes || echo no")
+		if pathExists is "yes" then
 			try
 				do shell script "rm -rf " & quoted form of posixPath
 			on error

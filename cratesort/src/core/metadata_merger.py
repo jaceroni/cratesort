@@ -284,18 +284,34 @@ def _merge_cue_points(
     result.cues_lost       = cues_lost
     result.lost_cue_details = lost_details
 
-    if cues_merged > 0:
-        merged_cues = list(slot_map.values())
-        success = write_cue_points(winner_path, merged_cues)
-        if not success:
-            result.errors.append(
-                f'cue_points: write failed for {winner_path.name}'
-            )
-        else:
-            logger.info(
-                '[MetadataMerger] %d loser cue(s) merged into %s (%d lost)',
-                cues_merged, winner_path.name, cues_lost,
-            )
+    # DISABLED 2026-10-12: write_cue_points() rewrites the winner file's own
+    # Serato Markers2 GEOB tag — i.e. it overwrites real cue point data.
+    # This was live and unguarded (not covered by the 2026-09-19 disable of
+    # the play-count/comment database-V2 writes) and directly violates the
+    # locked AGENTS.md rule: "Serato metadata is never touched. Cue points,
+    # beat grids, loops, color tags — never overwritten under any
+    # circumstances." Surfaced via a real-data run that threw
+    # "cue_points: write failed" for every .m4a (write_cue_points only
+    # supports mp3/aiff, so it always returns False for other formats —
+    # a second, independent bug on top of the rule violation). The merge
+    # computation above (dedup + slot-fill) is harmless and stays so
+    # cues_merged/cues_lost reporting still works; only the actual file
+    # write is disabled. Do not re-enable without a product decision to
+    # allow cue point writes at all, plus real-data proof per
+    # [[feedback_test_serato_writes_against_real_data]].
+    #
+    # if cues_merged > 0:
+    #     merged_cues = list(slot_map.values())
+    #     success = write_cue_points(winner_path, merged_cues)
+    #     if not success:
+    #         result.errors.append(
+    #             f'cue_points: write failed for {winner_path.name}'
+    #         )
+    #     else:
+    #         logger.info(
+    #             '[MetadataMerger] %d loser cue(s) merged into %s (%d lost)',
+    #             cues_merged, winner_path.name, cues_lost,
+    #         )
 
     if cues_lost > 0:
         logger.warning(

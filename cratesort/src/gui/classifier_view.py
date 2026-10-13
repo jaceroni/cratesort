@@ -71,6 +71,30 @@ FILM_TV_GENRE = 'Film & TV'
 _FILM_TV_FOLDER_NAMES = frozenset({'film & tv', 'film and tv'})
 
 
+def _artist_edit_key(name: str, is_film_tv: bool = False) -> str:
+    """The library_edits.json / self._edits dict key for an artist-level
+    edit (genre, tags, confidence). Film & TV groups get a distinct
+    __filmtv__ prefix instead of __artist__ so a title that happens to
+    match a real artist's name (e.g. "Scarface" the movie vs. Scarface the
+    rapper) never collides on the same key — without this, a genre/tags
+    edit on one silently overwrote the other's stored value, since both
+    were keyed by name alone."""
+    return f'__filmtv__{name}' if is_film_tv else f'__artist__{name}'
+
+
+def _parse_artist_edit_key(key: str):
+    """Reverse of _artist_edit_key: (name, is_film_tv) for an artist-level
+    key, or None if `key` is a plain track-path key instead. Single source
+    of truth for both directions of the __artist__/__filmtv__ prefix
+    contract — library_browser.py imports this rather than keeping its own
+    copy, so the two can never silently drift apart."""
+    if key.startswith('__filmtv__'):
+        return key[len('__filmtv__'):], True
+    if key.startswith('__artist__'):
+        return key[len('__artist__'):], False
+    return None
+
+
 def _film_tv_title(rec) -> str:
     """
     Best-effort show/movie title for grouping Film & TV clips into their own
@@ -373,7 +397,7 @@ class ClassificationSession:
         # 2. Apply genre overrides and metadata edits (artist-level and track-level)
         _UC = {'', '—', 'Unclassified', 'Untagged'}
         for entry in self.entries:
-            artist_key = _nfc(f'__artist__{entry.artist}')
+            artist_key = _nfc(_artist_edit_key(entry.artist, entry.is_film_tv))
             new_genre = nfc_edits.get(artist_key, {}).get('genre')
             if new_genre and new_genre not in _UC:
                 entry.final_genre = new_genre
@@ -532,7 +556,7 @@ class _ClassifyWorker(QThread):
                 canonical   = _canonical_artist(primary)
                 artist_tracks[canonical].append(rec)
 
-                combined_tags = _tags_for(str(rec.path)) + _tags_for(f'__artist__{canonical}')
+                combined_tags = _tags_for(str(rec.path)) + _tags_for(_artist_edit_key(canonical))
                 if combined_tags:
                     style_tags_by_path[str(rec.path)] = combined_tags
 

@@ -621,25 +621,37 @@ class CrateTagsEditCommand(Command):
 
 
 class CrateReassignArtistCommand(Command):
-    """Undoable artist reassignment for a single track within a crate."""
+    """Undoable artist reassignment for a single track within a crate —
+    either a regular artist, or a Film & TV group (new_is_film_tv=True)."""
     source_tab = 'crates'
 
     def __init__(
         self, view, crate_path: Optional[str], file_path: str, label: str,
         old_artist: Optional[str], new_artist: str,
+        old_is_film_tv: bool = False, new_is_film_tv: bool = False,
+        seed_genre: Optional[tuple] = None,
     ):
-        self.view       = view
-        self.crate_path = crate_path
-        self.file_path  = file_path
-        self.old_artist = old_artist
-        self.new_artist = new_artist
+        self.view           = view
+        self.crate_path     = crate_path
+        self.file_path      = file_path
+        self.old_artist     = old_artist
+        self.new_artist     = new_artist
+        self.old_is_film_tv = old_is_film_tv
+        self.new_is_film_tv = new_is_film_tv
+        # (artist_key, genre) to default a brand-new destination group to —
+        # only applied on execute(), never on undo().
+        self.seed_genre     = seed_genre
         self.description = f"Reassigned '{label}' to {new_artist}"
 
     def execute(self) -> None:
-        self.view._apply_crate_reassign(self.crate_path, {self.file_path: self.new_artist})
+        self.view._apply_crate_reassign(
+            self.crate_path, {self.file_path: (self.new_artist, self.new_is_film_tv)},
+            seed_genre=self.seed_genre,
+        )
 
     def undo(self) -> None:
-        self.view._apply_crate_reassign(self.crate_path, {self.file_path: self.old_artist})
+        target = (self.old_artist, self.old_is_film_tv) if self.old_artist is not None else None
+        self.view._apply_crate_reassign(self.crate_path, {self.file_path: target})
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +675,29 @@ class LibraryFieldEditCommand(Command):
 
     def undo(self) -> None:
         self.view._apply_library_field(self.file_path, self.field, self.old_val)
+
+
+class LibraryBatchFieldEditCommand(Command):
+    """Undoable inline edit of one field across multiple selected tracks at
+    once — same field, same new value on every track, each track's other
+    fields untouched. One undo step reverts the whole batch."""
+    source_tab = 'library'
+
+    def __init__(self, view, field: str, old_vals: dict, new_val: str):
+        self.view       = view
+        self.field      = field
+        self.old_vals   = dict(old_vals)   # file_path -> prior value
+        self.new_val    = new_val
+        n = len(self.old_vals)
+        self.description = f'Edited {field} on {n} track(s)'
+
+    def execute(self) -> None:
+        self.view._apply_library_field_batch(
+            self.field, {p: self.new_val for p in self.old_vals}
+        )
+
+    def undo(self) -> None:
+        self.view._apply_library_field_batch(self.field, dict(self.old_vals))
 
 
 class LibraryTagsEditCommand(Command):
@@ -705,13 +740,22 @@ class LibraryGenreChangeCommand(Command):
 
 
 class LibraryReassignArtistCommand(Command):
-    """Undoable move of one or more tracks to a different artist group."""
+    """Undoable move of one or more tracks to a different artist group —
+    either a regular artist, or a Film & TV group (new_is_film_tv=True)."""
     source_tab = 'library'
 
-    def __init__(self, view, moves: dict, new_artist: str, label: str):
-        self.view       = view
-        self.moves      = moves   # file_path -> {'prior_edit': dict, 'prior_disk_artist': str, 'group_artist': str}
-        self.new_artist = new_artist
+    def __init__(
+        self, view, moves: dict, new_artist: str, label: str,
+        new_is_film_tv: bool = False, seed_genre: Optional[tuple] = None,
+    ):
+        self.view           = view
+        self.moves          = moves   # file_path -> {'prior_edit': dict, 'prior_disk_artist': str, 'group_artist': str}
+        self.new_artist     = new_artist
+        self.new_is_film_tv = new_is_film_tv
+        # (artist_key, genre) to default a brand-new destination group to —
+        # only applied on execute(), never on undo(). See
+        # LibraryBrowserView._apply_library_reassign for why this exists.
+        self.seed_genre     = seed_genre
         n = len(moves)
         self.description = (
             f"Reassigned '{label}' to {new_artist}" if n == 1
@@ -720,11 +764,16 @@ class LibraryReassignArtistCommand(Command):
 
     def execute(self) -> None:
         edits_map = {
-            path: {**info['prior_edit'], 'reassign_artist': self.new_artist, 'original_artist': info['group_artist']}
+            path: {
+                **info['prior_edit'],
+                'reassign_artist':     self.new_artist,
+                'reassign_is_film_tv': self.new_is_film_tv,
+                'original_artist':     info['group_artist'],
+            }
             for path, info in self.moves.items()
         }
         disk_map = {path: self.new_artist for path in self.moves}
-        self.view._apply_library_reassign(edits_map, disk_map)
+        self.view._apply_library_reassign(edits_map, disk_map, seed_genre=self.seed_genre)
 
     def undo(self) -> None:
         edits_map = {path: dict(info['prior_edit']) for path, info in self.moves.items()}

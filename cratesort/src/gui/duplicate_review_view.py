@@ -873,7 +873,7 @@ class DuplicateReviewView(QWidget):
 
         def plan_section(
             title_base: str, subtitle: str, accent: str,
-            entries: list[tuple[int, DuplicateGroup]], is_true: bool,
+            entries: list[tuple[int, DuplicateGroup]], accept_all_label: str,
         ) -> None:
             visible = [(i, g) for i, g in entries if self._passes_filter(i, g)]
             if not visible:
@@ -884,16 +884,15 @@ class DuplicateReviewView(QWidget):
             # needing a dedicated "hide accepted" filter button for it.
             visible.sort(key=lambda ig: ig[0] in self._accepted)
             action: Optional[tuple[str, Callable[[], None]]] = None
-            if is_true:
-                remaining = [
-                    i for i, _g in entries
-                    if i not in self._accepted and i not in self._dismissed
-                ]
-                if remaining:
-                    action = (
-                        'Accept all remaining true duplicates',
-                        lambda r=remaining: self._on_accept_all_true(r),
-                    )
+            remaining = [
+                i for i, _g in entries
+                if i not in self._accepted and i not in self._dismissed
+            ]
+            if remaining:
+                action = (
+                    accept_all_label,
+                    lambda r=remaining: self._on_accept_all(r),
+                )
             n = len(entries)
             steps.append(('w', self._build_section_header(
                 f'{title_base} — {n} group{"s" if n != 1 else ""}',
@@ -906,13 +905,13 @@ class DuplicateReviewView(QWidget):
             'True Duplicates',
             'Same file found in multiple locations. '
             'We\'ve selected the best copy — confirm or choose a different one.',
-            _RED, tier1, True,
+            _RED, tier1, 'Accept all remaining true duplicates',
         )
         plan_section(
             'Possible Variants',
             'Looks like different versions of the same song. '
             'Confirm if any are actual duplicates you want to consolidate.',
-            _ORANGE, tier2, False,
+            _ORANGE, tier2, 'Accept all remaining possible variants',
         )
 
         has_visible_card = any(step[0] == 'c' for step in steps)
@@ -1427,7 +1426,7 @@ class DuplicateReviewView(QWidget):
         self._apply_card_change(idx)
         self._scroll_to_card(idx)
 
-    def _on_accept_all_true(self, indices: list[int]) -> None:
+    def _on_accept_all(self, indices: list[int]) -> None:
         for i in indices:
             if i not in self._dismissed:
                 self._accepted.add(i)

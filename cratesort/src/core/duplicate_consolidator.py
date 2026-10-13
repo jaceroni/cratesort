@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
 import hashlib
+import os
 import shutil
+import stat
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -46,10 +49,25 @@ class DuplicateConsolidator:
 
     For each group:
     1. The winner file stays in place.
-    2. Every loser file path is remapped to the winner path in all .crate files
-       via PathRewriter (atomic, backed up).
-    3. Loser files are deleted from disk.
-    4. The operation is logged to a RollbackLog with duplicate=True so the
+    2. Loser files are moved to a trash staging area (_CrateSort/.dup_trash) —
+       not deleted yet. A loser whose move fails keeps its own crate
+       references untouched — they still point at a real file — rather than
+       being repointed to the winner while the duplicate itself is silently
+       left behind.
+    3. Every successfully-trashed loser's file path is remapped to the winner
+       path in all .crate files via PathRewriter (atomic, backed up).
+    4. Only once that rewrite succeeds with zero errors are the group's
+       trashed losers permanently deleted. Any rewrite failure (exception or
+       even a single per-crate error) restores every trashed loser in that
+       group back to its original path and leaves the crate(s) untouched —
+       a loser's file is never gone while any of its crate entries might
+       still be unresolved. This is what keeps delete and crate-reference
+       update one atomic unit, per the project's FV-1 rule: a hard
+       interruption (crash, force-quit, drive disconnect) between "file
+       gone" and "crate updated" is exactly how a DJ's crates end up
+       pointing at files that no longer exist — this consolidator must never
+       create that window, even transiently.
+    5. The operation is logged to a RollbackLog with duplicate=True so the
        repair_crate_paths flow can restore if needed.
 
     Nothing is written unless commit=True. Pass commit=False for a dry-run
@@ -92,6 +110,8 @@ class DuplicateConsolidator:
         rlog.set_context(self._library_path, self._serato_dir)
         touched_crates: set[Path] = set()
         comment_updates: dict[str, str] = {}
+        trash_dir = self._library_path / '_CrateSort' / '.dup_trash'
+        trash_counter = 0
 
         for i, entry in enumerate(approved_groups):
             if len(entry) == 3:
@@ -108,6 +128,10 @@ class DuplicateConsolidator:
             losers = [c for c in losers if c.file_path != winner.file_path]
             changes: list[PathChange] = []
 
+            # Per-loser PathChange pairs (rel + abs variant), keyed by the
+            # loser's own path so we can later reroute crate references only
+            # for losers whose delete actually succeeded — see below.
+            changes_by_loser: dict[Path, list[PathChange]] = {}
             for loser in losers:
                 # Build relative path keys (how they appear in .crate files)
                 try:
@@ -118,11 +142,15 @@ class DuplicateConsolidator:
                     winner_rel = winner.file_path.as_posix()
 
                 # Both relative and absolute variants for crate compatibility
-                changes.append(PathChange(old_path=loser_rel,  new_path=winner_rel))
-                changes.append(PathChange(
-                    old_path=loser.file_path.as_posix(),
-                    new_path=winner.file_path.as_posix(),
-                ))
+                pair = [
+                    PathChange(old_path=loser_rel, new_path=winner_rel),
+                    PathChange(
+                        old_path=loser.file_path.as_posix(),
+                        new_path=winner.file_path.as_posix(),
+                    ),
+                ]
+                changes_by_loser[loser.file_path] = pair
+                changes.extend(pair)
 
             if not changes:
                 continue
@@ -146,57 +174,121 @@ class DuplicateConsolidator:
                 if merge_result.comment_merged and merge_result.comment_final:
                     comment_updates[str(winner.file_path)] = merge_result.comment_final
 
-            # Reroute all crate references first (before deleting files)
-            rewrite_result = None
+            # Move loser files to trash staging FIRST, before rerouting any
+            # crate references — but do NOT permanently delete them yet. A
+            # loser's crate entries must only be repointed to the winner once
+            # we know the loser's own file is actually gone, and the file
+            # must only actually be gone once we know its crate entries were
+            # successfully repointed. Trashing (not deleting) lets a failed
+            # move leave that loser's crate entries pointing at its own
+            # still-present, still-valid file — no broken reference, nothing
+            # hidden — while also letting a failed/interrupted crate rewrite
+            # restore an already-trashed file instead of it just being gone.
+            trashed: dict[Path, Path] = {}   # loser.file_path -> trash_path
+            pending_ops: dict[Path, FileMoveOp] = {}
             if commit:
-                try:
-                    rewrite_result = PathRewriter(self._serato_dir).rewrite(
-                        changes, dry_run=False
+                for loser in losers:
+                    op = FileMoveOp(
+                        source_path=loser.file_path,
+                        destination_path=winner.file_path,
+                        reason='duplicate_consolidation',
+                        status='pending',
                     )
-                    crates_updated += rewrite_result.crates_modified
-                    for bp in rewrite_result.backup_paths:
-                        rlog.log_crate_backup(bp)
-                    touched_crates.update(r.crate_file for r in rewrite_result.changes_log)
-                    # rewrite() catches per-crate exceptions internally and still
-                    # returns normally — without this, a crate that individually
-                    # failed to update was invisible even to all_errors.
-                    for crate_file, err in rewrite_result.errors:
-                        msg = f'{group.canonical_title}: {crate_file.name} — {err}'
-                        all_errors.append(msg)
-                        rlog.log_error(msg)
-                except Exception as exc:
-                    msg = f'{group.canonical_title}: crate rewrite failed — {exc}'
-                    all_errors.append(msg)
-                    rlog.log_error(msg)
-                    continue
-
-            # Delete loser files
-            for loser in losers:
-                op = FileMoveOp(
-                    source_path=loser.file_path,
-                    destination_path=winner.file_path,
-                    reason='duplicate_consolidation',
-                    status='pending',
-                )
-                if commit:
+                    pending_ops[loser.file_path] = op
                     try:
                         op.sha256_source = _sha256(loser.file_path)
-                        op.executed_at   = datetime.now().isoformat()
-                        loser.file_path.unlink()
-                        _cleanup_empty_parents(loser.file_path.parent, self._library_path)
-                        op.status = 'completed'
-                        files_removed += 1
-                        space_freed   += loser.file_size
+                        trash_dir.mkdir(parents=True, exist_ok=True)
+                        trash_counter += 1
+                        trash_path = trash_dir / f'{trash_counter:06d}_{loser.file_path.name}'
+                        _move_with_flag_retry(loser.file_path, trash_path)
+                        trashed[loser.file_path] = trash_path
                     except Exception as exc:
                         op.status = 'failed'
                         op.error  = str(exc)
                         all_errors.append(
                             f'{loser.file_path.name}: delete failed — {exc}'
                         )
-                    rlog.log_move(op, duplicate=True)
-                else:
+                        rlog.log_move(op, duplicate=True)
+            else:
+                for loser in losers:
                     files_removed += 1
                     space_freed   += loser.file_size
+
+            successful_changes: list[PathChange] = []
+            for loser_path in trashed:
+                successful_changes.extend(changes_by_loser[loser_path])
+
+            # Reroute crate references for whichever losers were successfully
+            # trashed — still one batched PathRewriter call per group (not
+            # per loser), so a group with several losers still costs one
+            # scan of the .crate tree and one backup per touched crate,
+            # same as before.
+            rewrite_result = None
+            rewrite_ok = False
+            if commit and successful_changes:
+                try:
+                    rewrite_result = PathRewriter(self._serato_dir).rewrite(
+                        successful_changes, dry_run=False
+                    )
+                    # Any per-crate error (rewrite() catches these internally
+                    # and still returns normally) means this group's crate
+                    # state can't be trusted as fully updated — treat the
+                    # whole group as not-safe-to-finalize, same as a hard
+                    # exception, rather than guessing which specific loser's
+                    # reference actually failed.
+                    if rewrite_result.errors:
+                        for crate_file, err in rewrite_result.errors:
+                            msg = f'{group.canonical_title}: {crate_file.name} — {err}'
+                            all_errors.append(msg)
+                            rlog.log_error(msg)
+                    else:
+                        rewrite_ok = True
+                        crates_updated += rewrite_result.crates_modified
+                        for bp in rewrite_result.backup_paths:
+                            rlog.log_crate_backup(bp)
+                        touched_crates.update(r.crate_file for r in rewrite_result.changes_log)
+                except Exception as exc:
+                    msg = f'{group.canonical_title}: crate rewrite failed — {exc}'
+                    all_errors.append(msg)
+                    rlog.log_error(msg)
+
+            # Finalize: only now, with the crate rewrite confirmed fully
+            # successful, do the trashed files actually get deleted for
+            # good. Otherwise every trashed loser in this group is restored
+            # to exactly where it came from — no file is ever permanently
+            # gone while its crate references might still be stale.
+            if commit:
+                for loser_path, trash_path in trashed.items():
+                    op = pending_ops[loser_path]
+                    if rewrite_ok:
+                        try:
+                            trash_path.unlink()
+                            _cleanup_empty_parents(loser_path.parent, self._library_path)
+                            op.status      = 'completed'
+                            op.executed_at = datetime.now().isoformat()
+                            loser = next(l for l in losers if l.file_path == loser_path)
+                            files_removed += 1
+                            space_freed   += loser.file_size
+                        except Exception as exc:
+                            op.status = 'failed'
+                            op.error  = f'trash cleanup failed — {exc}'
+                            all_errors.append(
+                                f'{loser_path.name}: could not finish removing duplicate — {exc}'
+                            )
+                    else:
+                        try:
+                            _move_with_flag_retry(trash_path, loser_path)
+                        except Exception as exc:
+                            op.status = 'failed'
+                            op.error  = f'restore-from-trash failed — {exc}'
+                            all_errors.append(
+                                f'{loser_path.name}: left in trash, could not restore — {exc} '
+                                f'(file is at {trash_path})'
+                            )
+                        else:
+                            op.status = 'failed'
+                            op.error  = 'crate rewrite did not succeed — restored'
+                    rlog.log_move(op, duplicate=True)
 
         if commit:
             rlog.save()
@@ -237,6 +329,37 @@ class DuplicateConsolidator:
 # ---------------------------------------------------------------------------
 
 _MACOS_JUNK = frozenset({'.DS_Store', '.localized', '.Spotlight-V100', '.fseventsd'})
+
+
+def _move_with_flag_retry(src: Path, dst: Path) -> None:
+    """
+    Move a file, retrying once after clearing the macOS user-immutable
+    (uchg) flag if the first attempt fails with EPERM (Errno 1 — distinct
+    from EACCES/Errno 13, a real permissions problem this doesn't touch).
+    Files that moved over from Windows/NTFS or came out of certain
+    backup/restore tools sometimes land with this flag set, which blocks
+    a move/delete even though normal POSIX read/write permissions look
+    fine. Only clears the user-level flag (no elevated privileges needed)
+    — if that isn't the cause, or clearing it still doesn't allow the
+    move, the original exception propagates unchanged. Used for both
+    "move to trash" and "restore from trash" — same flag issue can block
+    either direction.
+    """
+    try:
+        shutil.move(str(src), str(dst))
+        return
+    except OSError as exc:
+        if exc.errno != errno.EPERM:
+            raise
+        try:
+            current_flags = os.stat(src).st_flags
+            if current_flags & stat.UF_IMMUTABLE:
+                os.chflags(src, current_flags & ~stat.UF_IMMUTABLE)
+                shutil.move(str(src), str(dst))
+                return
+        except OSError:
+            pass
+        raise
 
 
 def _cleanup_empty_parents(start: Path, stop_at: Path) -> None:
