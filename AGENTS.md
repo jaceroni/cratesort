@@ -108,10 +108,10 @@ Status messages are brief: "Library synced." "3 crates updated." "25 tracks need
 
 These have been decided. If a planning conversation starts to drift toward revisiting them, redirect.
 
-- **13-genre taxonomy** — Blues, Country, Electronic, Funk/Soul, Hip-Hop/Rap, House, Jazz, R&B, Reggae, Rock, Seasonal, Specialty, Traditional. These are the only folder-level genres.
+- **Genre taxonomy** — the folder-level genres live in `classifier.py` `PARENT_GENRES` (16 as of 2026-10-13, incl. Latin, Orchestral, Comedy; Film & TV is a separate content-type bucket). Originally 13: Blues, Country, Electronic, Funk/Soul, Hip-Hop/Rap, House, Jazz, R&B, Reggae, Rock, Seasonal, Specialty, Traditional. These are the only folder-level genres.
 - **"Pop" is never a valid genre.** Everything gets reclassified to its actual genre.
-- **One genre per artist.** Artists live in exactly one genre folder. Style tags at the track level handle nuance.
-- **Artist genre changes never cascade to tracks.** Style tags are independent.
+- **One primary genre per artist, with track-level exceptions (revised 2026-10-13).** An artist has one primary genre, but any track can be an exception and then lives in that genre's bucket/folder under the same artist name (e.g. a rock artist's Christmas songs in Seasonal). Seasonal is an artist's primary only if ALL their tracks are seasonal. Files only move on Organize. See CLAUDE-CS.md "Track-Level Genre Exceptions". Style tags at the track level still handle nuance.
+- **Artist genre changes never cascade to tracks.** Style tags are independent. Artist-level Approve/Change Genre also never overwrite a track's genre exception.
 - **Serato metadata is never touched.** Cue points, beat grids, loops, color tags — never overwritten under any circumstances.
 - **Serato's edits always win** on startup sync. CrateSort absorbs changes, never overwrites.
 - **Crate file order** is only changed by explicit user drag reorder. Never by sorting.

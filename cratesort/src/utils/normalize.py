@@ -7,6 +7,22 @@ from __future__ import annotations
 import re
 
 
+_SORT_ARTICLE = re.compile(r'^(?:the|an?)\s+(?=\S)', re.IGNORECASE)
+
+
+def sort_key(text: str) -> str:
+    """
+    Display-order key for sorting artist names and track titles.
+    Ignores a leading "The", "A" or "An" (whole word + space) so
+    "The Doors" files under D. Display text is never changed.
+    "A$AP Rocky", "A-Ha" and a bare "The" are left alone.
+    """
+    t = (text or '').strip()
+    if t.startswith('◆'):          # "new track" marker in the Library tree
+        t = t[1:].lstrip()
+    return _SORT_ARTICLE.sub('', t, count=1).lower()
+
+
 def normalize_artist(name: str) -> str:
     """
     Normalize an artist name for comparison.

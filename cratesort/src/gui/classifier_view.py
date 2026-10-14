@@ -71,6 +71,14 @@ FILM_TV_GENRE = 'Film & TV'
 _FILM_TV_FOLDER_NAMES = frozenset({'film & tv', 'film and tv'})
 
 
+from cratesort.src.core.genre_exceptions import is_seasonal_signal as _is_seasonal_signal
+
+
+def library_edits_title(edits: dict, rec) -> str:
+    """Title as the user currently has it (staged edit wins over file tag)."""
+    return edits.get(str(rec.path), {}).get('title', rec.title) or ''
+
+
 def _artist_edit_key(name: str, is_film_tv: bool = False) -> str:
     """The library_edits.json / self._edits dict key for an artist-level
     edit (genre, tags, confidence). Film & TV groups get a distinct
@@ -586,6 +594,21 @@ class _ClassifyWorker(QThread):
                     if not (r.genre == 'Specialty'
                             and r.reason.startswith('Short clip'))
                 ]
+                # Seasonal tracks (Christmas folder / title / tag) are track-level
+                # exceptions, not the artist's identity — a record shop files
+                # Michael Bolton's Christmas songs in Christmas, not under his
+                # name. Vote on the non-seasonal tracks whenever any exist;
+                # an artist is only Seasonal if ALL their tracks are.
+                _non_seasonal = [
+                    (rec, r) for rec, r in vote_results
+                    if not _is_seasonal_signal(
+                        rec.path,
+                        library_edits_title(edits, rec),
+                        rec.genre,
+                    )
+                ]
+                if _non_seasonal and len(_non_seasonal) < len(vote_results):
+                    vote_results = _non_seasonal
                 all_track_infos = [
                     TrackInfo(
                         path=str(rec.path),

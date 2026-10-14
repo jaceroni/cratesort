@@ -22,6 +22,8 @@ from cratesort.src.utils.undo_manager import (
     LibraryGenreChangeCommand, LibraryReassignArtistCommand,
 )
 from cratesort.src.gui.theme import TRACK_ROW_HEIGHT
+from cratesort.src.utils.normalize import sort_key as _sort_key
+from cratesort.src.core.genre_exceptions import effective_override as _effective_override
 from cratesort.src.gui.inline_edit import make_inline_editor
 from cratesort.src.gui.track_icons import note_icon, play_icon, pause_icon
 from cratesort.src.gui.classifier_view import _artist_edit_key, _parse_artist_edit_key
@@ -211,6 +213,18 @@ def _library_load_signature(inventory, library_path: Path) -> tuple:
 # ---------------------------------------------------------------------------
 # Track tree row-height delegate
 # ---------------------------------------------------------------------------
+
+class _SortItem(QTreeWidgetItem):
+    """Tree item that sorts the Artist / Title column ignoring a leading
+    The / A / An. Display text is untouched; other columns sort as default."""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else LC_ARTIST
+        if col == LC_ARTIST:
+            return _sort_key(self.text(col)) < _sort_key(other.text(col))
+        return super().__lt__(other)
+
 
 class _TrackRowHeightDelegate(QStyledItemDelegate):
     """Locks every row of the Library track tree to TRACK_ROW_HEIGHT.
@@ -1421,7 +1435,7 @@ class LibraryBrowserView(QWidget):
                 genre_artist_count[genre] = genre_artist_count.get(genre, 0) + 1
                 genre_track_count[genre] = genre_track_count.get(genre, 0) + len(tracks)
 
-        total_artists = self._tree.topLevelItemCount()
+        total_artists = self._unique_artist_count()
         total_tracks = len(self._inventory)
 
         def _make_item(key: str, name: str, artist_c: int, track_c: int, itype: str) -> QListWidgetItem:
@@ -1477,7 +1491,15 @@ class LibraryBrowserView(QWidget):
         self, current: QListWidgetItem, _previous: QListWidgetItem
     ) -> None:
         if current:
-            self._sidebar_genre = current.data(Qt.ItemDataRole.UserRole) or 'All'
+            new_genre = current.data(Qt.ItemDataRole.UserRole) or 'All'
+            if new_genre != self._sidebar_genre and self._search.text():
+                # Moving to a different bucket starts fresh — a leftover
+                # search term silently emptied the new bucket and read as
+                # "nothing here". Use the All bucket to search across genres.
+                self._search.blockSignals(True)
+                self._search.clear()
+                self._search.blockSignals(False)
+            self._sidebar_genre = new_genre
             self._apply_filter()
 
     # ── Tree population ───────────────────────────────────────────────
@@ -1543,7 +1565,7 @@ class LibraryBrowserView(QWidget):
                 if not genre:
                     # Step 3: taxonomy-validated ID3 majority vote (exact case-insensitive match only)
                     _tag_counts: Counter = Counter()
-                    for rec in tracks:
+                    for rec in self._vote_tracks(tracks):
                         t_edits = self._edits.get(str(rec.path), {})
                         raw_tag = (
                             t_edits.get('genre')
@@ -1555,10 +1577,24 @@ class LibraryBrowserView(QWidget):
                         if canonical:
                             _tag_counts[canonical] += 1
                     genre = _tag_counts.most_common(1)[0][0] if _tag_counts else ''
-            item = self._make_artist_item(artist, tracks, genre, is_film_tv=False)
-            self._tree.addTopLevelItem(item)
-            if genre:
-                genres.add(genre)
+            # Tracks with a genre exception (explicit, or a Seasonal signal)
+            # get their own row in that genre's bucket — same artist name,
+            # only that bucket's tracks. The primary row keeps the rest.
+            primary_tracks, exception_groups = self._split_track_exceptions(tracks, genre)
+            if primary_tracks or not exception_groups:
+                item = self._make_artist_item(
+                    artist, primary_tracks, genre, is_film_tv=False, primary_genre=genre,
+                )
+                self._tree.addTopLevelItem(item)
+                if genre:
+                    genres.add(genre)
+            for ex_genre, ex_tracks in exception_groups.items():
+                ex_item = self._make_artist_item(
+                    artist, ex_tracks, ex_genre, is_film_tv=False,
+                    exception_genre=ex_genre, primary_genre=genre,
+                )
+                self._tree.addTopLevelItem(ex_item)
+                genres.add(ex_genre)
             for rec in tracks:
                 if rec.extension:
                     formats.add(rec.extension.lstrip('.').upper())
@@ -1616,7 +1652,7 @@ class LibraryBrowserView(QWidget):
                     self._tree.setColumnWidth(LC_ARTIST, artist_w)
             QTimer.singleShot(100, _resize_to_content)
 
-        n = self._tree.topLevelItemCount()
+        n = self._unique_artist_count()
         t = len(self._inventory)
         self._count_label.setText(f'{n:,} artists · {t:,} tracks')
         self._update_empty_state()
@@ -1635,16 +1671,55 @@ class LibraryBrowserView(QWidget):
         if self._classify_mode:
             self._populate_classify_columns()
 
+    # ── Track-level genre exceptions ──────────────────────────────────
+    def _track_override_genre(self, rec) -> Optional[str]:
+        """Genre this track is an exception to (explicit or Seasonal signal),
+        or None if it simply follows its artist's primary genre."""
+        edit = self._edits.get(str(rec.path), {})
+        return _effective_override(edit, rec.path, edit.get('title', rec.title), rec.genre)
+
+    def _vote_tracks(self, tracks: list) -> list:
+        """Tracks that should vote on an artist's primary genre: everything
+        except seasonal exceptions, unless that would leave nobody."""
+        pool = [r for r in tracks if self._track_override_genre(r) is None]
+        return pool or tracks
+
+    def _split_track_exceptions(self, tracks: list, primary: str) -> tuple[list, dict]:
+        """Split an artist's tracks into (tracks staying in the primary
+        bucket, {exception genre: tracks}). An override equal to the primary
+        genre is not an exception."""
+        stay: list = []
+        groups: dict[str, list] = {}
+        for rec in tracks:
+            ov = self._track_override_genre(rec)
+            if ov and ov != primary:
+                groups.setdefault(ov, []).append(rec)
+            else:
+                stay.append(rec)
+        return stay, groups
+
+    def _unique_artist_count(self) -> int:
+        """Artist rows can repeat across genre buckets — count each artist once."""
+        seen = set()
+        for i in range(self._tree.topLevelItemCount()):
+            d = self._tree.topLevelItem(i).data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            seen.add((d.get('artist', ''), d.get('is_film_tv', False)))
+        return len(seen)
+
     def _make_artist_item(
-        self, artist: str, tracks: list, genre: str, is_film_tv: bool = False
+        self, artist: str, tracks: list, genre: str, is_film_tv: bool = False,
+        exception_genre: str = '', primary_genre: str = '',
     ) -> QTreeWidgetItem:
-        item = QTreeWidgetItem()
+        item = _SortItem()
         # Pin the row height to match the Crates track table. Set on the item
         # itself (not just the delegate) — QTreeView always honours an item
         # size hint; a delegate sizeHint can be silently overridden.
         item.setSizeHint(LC_ARTIST, QSize(-1, TRACK_ROW_HEIGHT))
         item.setData(LC_ARTIST, Qt.ItemDataRole.UserRole, {
             'artist': artist, 'tracks': tracks, 'is_film_tv': is_film_tv,
+            # Non-empty on a row that holds only genre-exception tracks.
+            'exception_genre': exception_genre,
+            'primary_genre': primary_genre or genre,
         })
         item.setData(LC_GENRE,  Qt.ItemDataRole.UserRole + 1, genre)  # for filtering
 
@@ -1712,7 +1787,20 @@ class LibraryBrowserView(QWidget):
             item.setText(LC_CLS_CONF, confidence)
             item.setForeground(LC_CLS_CONF, QBrush(QColor(self._CONF_COLORS.get(confidence, '#a89b85'))))
 
-        status_label, status_color = self._derive_persistent_status(artist, is_film_tv)
+        if exception_genre:
+            # Exception-only row: the classifier's artist-level proposal and
+            # Approved/Pending state don't describe it. Edited if the user
+            # chose it; otherwise it was detected from a seasonal signal.
+            item.setText(LC_CLS_CONF, 'MATCHED')
+            item.setForeground(LC_CLS_CONF, QBrush(QColor(self._CONF_COLORS.get('MATCHED', '#a89b85'))))
+            explicit = any(
+                'genre_override' in self._edits.get(str(r.path), {}) for r in tracks
+            )
+            status_label, status_color = (
+                ('✎ Edited', '#D4A04A') if explicit else ('◔ Pending', '#a89b85')
+            )
+        else:
+            status_label, status_color = self._derive_persistent_status(artist, is_film_tv)
         item.setText(LC_CLS_STATUS, status_label)
         item.setForeground(LC_CLS_STATUS, QBrush(QColor(status_color)) if status_color else QBrush())
 
@@ -1723,7 +1811,7 @@ class LibraryBrowserView(QWidget):
         return item
 
     def _make_track_child(self, parent: QTreeWidgetItem, rec) -> QTreeWidgetItem:
-        child = QTreeWidgetItem(parent)
+        child = _SortItem(parent)
         child.setSizeHint(LC_ARTIST, QSize(-1, TRACK_ROW_HEIGHT))  # match Crates row height
         edits = self._edits.get(str(rec.path), {})
 
@@ -2371,9 +2459,15 @@ class LibraryBrowserView(QWidget):
             self._flash_row_text(item)
             self._tree.scrollToItem(item)
 
-    def _apply_library_genre(self, edits_map: dict, disk_map: dict) -> None:
+    def _apply_library_genre(
+        self, edits_map: dict, disk_map: dict, overrides: Optional[dict] = None,
+    ) -> None:
         """Set genre for one or more keys (track path or __artist__X) and write
-        the affected files to disk — shared by execute() and undo()."""
+        the affected files to disk — shared by execute() and undo().
+
+        `overrides` is {track path: genre | '' | None} for track-level genre
+        exceptions: a genre string = exception to that bucket, '' = pinned to
+        the artist's primary, None = no explicit choice (key removed)."""
         for key, genre in edits_map.items():
             if genre is None:
                 self._edits.get(key, {}).pop('genre', None)
@@ -2390,6 +2484,16 @@ class LibraryBrowserView(QWidget):
                 # the read side.
                 if _parse_artist_edit_key(key) is not None:
                     self._edits[key]['confidence'] = 'MATCHED'
+
+        for path, ov in (overrides or {}).items():
+            if ov is None:
+                entry = self._edits.get(path)
+                if entry is not None:
+                    entry.pop('genre_override', None)
+                    if not entry:
+                        del self._edits[path]
+            else:
+                self._edits.setdefault(path, {})['genre_override'] = ov
 
         # Stage a per-track genre entry for anything that actually writes to
         # disk successfully — same "free-tier write-through" pattern used for
@@ -2607,7 +2711,7 @@ class LibraryBrowserView(QWidget):
 
         _UC_GENRES = {'', '—', 'Unclassified', 'Untagged'}
 
-        visible_count = 0
+        visible_keys: set = set()
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
@@ -2639,9 +2743,10 @@ class LibraryBrowserView(QWidget):
                     continue
 
             item.setHidden(False)
-            visible_count += 1
+            visible_keys.add((artist, data.get('is_film_tv', False)))
 
-        total = self._tree.topLevelItemCount()
+        visible_count = len(visible_keys)
+        total = self._unique_artist_count()
         if search or genre_f:
             self._count_label.setText(f'{visible_count:,} of {total:,} artists visible')
         else:
@@ -2756,42 +2861,72 @@ class LibraryBrowserView(QWidget):
 
         old_edits: dict[str, Optional[str]] = {}
         disk_old: dict[str, str] = {}
+        old_overrides: dict[str, Optional[str]] = {}   # path -> prior genre_override (None = absent)
+        new_overrides: dict[str, str] = {}             # path -> '' (follow primary) | exception genre
+
+        def _track_exception(rec, primary: str) -> None:
+            # Choosing the artist's own primary genre pins the track to it
+            # ('') rather than leaving a no-op exception behind.
+            path = str(rec.path)
+            old_edits[path] = self._edits.get(path, {}).get('genre')
+            disk_old[path] = rec.genre or ''
+            old_overrides[path] = self._edits.get(path, {}).get('genre_override')
+            _uc = {'', '—', 'Unclassified', 'Untagged'}
+            same = new_genre == primary or (new_genre in _uc and primary in _uc)
+            new_overrides[path] = '' if same else new_genre
+
         for item in selected:
             if item.parent() is None:
-                data   = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+                data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+                if data.get('exception_genre'):
+                    # An exception-only row holds only tracks that live outside
+                    # the artist's primary genre — re-genre them as tracks;
+                    # never touch the artist's primary.
+                    primary = data.get('primary_genre', '')
+                    for rec in data.get('tracks', []):
+                        _track_exception(rec, primary)
+                    continue
                 artist = data.get('artist', '')
                 key = _artist_edit_key(artist, data.get('is_film_tv', False))
+                # data['tracks'] is only this row's tracks — exceptions that
+                # live in other buckets are deliberately left alone.
                 for rec in data.get('tracks', []):
                     disk_old[str(rec.path)] = rec.genre or ''
+                old_edits[key] = self._edits.get(key, {}).get('genre')
             else:
                 rec = item.data(LC_PATH, Qt.ItemDataRole.UserRole)
                 if not rec:
                     continue
-                key = str(rec.path)
-                disk_old[str(rec.path)] = rec.genre or ''
-            old_edits[key] = self._edits.get(key, {}).get('genre')
+                parent_data = item.parent().data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+                _track_exception(rec, parent_data.get('primary_genre', ''))
         if not old_edits:
             return
 
         label = hint_label or f'{len(selected)} items'
         if self._undo_manager:
-            cmd = LibraryGenreChangeCommand(self, old_edits, new_genre, disk_old, label)
+            cmd = LibraryGenreChangeCommand(
+                self, old_edits, new_genre, disk_old, label,
+                old_overrides=old_overrides, new_overrides=new_overrides,
+            )
             self._undo_manager.push(cmd)
         else:
             self._apply_library_genre(
                 {k: new_genre for k in old_edits},
                 {p: new_genre for p in disk_old},
+                overrides=new_overrides,
             )
 
     def _artist_menu(self, item: QTreeWidgetItem, pos) -> None:
         data  = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
         artist = data.get('artist', '')
         menu   = QMenu(self)
-        approve   = menu.addAction('✓ Approve')
+        # Exception-only rows (e.g. an artist's Christmas songs in Seasonal)
+        # have no classifier proposal to approve.
+        approve   = None if data.get('exception_genre') else menu.addAction('✓ Approve')
         chg       = menu.addAction('↕ Change Genre…')
         edit_tags = menu.addAction('✏ Edit Style Tags…')
         action = menu.exec(self._tree.viewport().mapToGlobal(pos))
-        if action == approve:
+        if approve is not None and action == approve:
             self._approve_artist(item, artist)
         elif action == chg:
             self._change_genre_for_selection(artist, item.text(LC_GENRE))
@@ -2809,6 +2944,8 @@ class LibraryBrowserView(QWidget):
         if not proposed or proposed in _UC:
             return  # nothing real proposed for this artist to approve
         artist_data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+        if artist_data.get('exception_genre'):
+            return  # exception-only row — nothing artist-level to approve
         key = _artist_edit_key(artist, artist_data.get('is_film_tv', False))
         old_genre = self._edits.get(key, {}).get('genre')
 
@@ -3287,6 +3424,8 @@ class LibraryBrowserView(QWidget):
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            if data.get('exception_genre'):
+                continue   # exception-only row: not part of artist-level review
             artist = data.get('artist', '')
             current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
 
@@ -3389,6 +3528,8 @@ class LibraryBrowserView(QWidget):
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             data = item.data(LC_ARTIST, Qt.ItemDataRole.UserRole) or {}
+            if data.get('exception_genre'):
+                continue   # exception-only row: never takes an artist-level proposal
             artist = data.get('artist', '')
             current_genre = item.data(LC_GENRE, Qt.ItemDataRole.UserRole + 1) or ''
             proposed = item.text(LC_CLS_PROPOSED)

@@ -26,7 +26,8 @@ from cratesort.src.core.scanner import TrackRecord
 # 2 — 2026-09-04: added Latin genre + Film & TV content-type bucket.
 # 3 — 2026-09-04: added Orchestral genre.
 # 4 — 2026-09-18: added Comedy genre (stand-up / spoken-word bits).
-CLASSIFIER_VERSION = 4
+# 5 — 2026-10-13: artist genre vote ignores seasonal tracks (track-level exceptions).
+CLASSIFIER_VERSION = 5
 
 PARENT_GENRES = frozenset({
     "Blues", "Comedy", "Country", "Electronic", "Funk/Soul", "Hip-Hop/Rap",

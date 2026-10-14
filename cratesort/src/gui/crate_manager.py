@@ -47,6 +47,7 @@ from cratesort.src.gui.overlays import (
     _ArrowComboBox, _CrateSortDialog, _ov_alert, _ov_confirm, _create_dialog_layout,
 )
 from cratesort.src.gui.theme import TRACK_ROW_HEIGHT
+from cratesort.src.utils.normalize import sort_key as _article_sort_key
 from cratesort.src.gui.inline_edit import make_inline_editor
 from cratesort.src.gui.track_icons import note_icon, play_icon, pause_icon
 from cratesort.src.gui.classifier_view import (
@@ -578,6 +579,8 @@ class _TrackTableModel(QAbstractTableModel):
                 except (TypeError, ValueError, IndexError):
                     return (1, 0)
             return _br
+        if col in (TC_TITLE, TC_ARTIST):
+            return lambda d, c=col: _article_sort_key(self._display(d, c))
         return lambda d, c=col: self._display(d, c).lower()
 
 

@@ -4,6 +4,7 @@ import copy
 import json
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from cratesort.src.core.classifier import ClassificationResult, Confidence
+from cratesort.src.core.genre_exceptions import effective_override
 from cratesort.src.core.file_organizer import (
     ExecutionResult, FileOrganizer, ReorganizationPlan,
 )
@@ -136,15 +138,27 @@ class _PlanWorker(QThread):
             # (blank string, 'Untagged') are skipped here.
             _SKIP_GENRES = {'Untagged', ''}
             classifications: dict = {}
+            _nfc_edits = {unicodedata.normalize('NFC', k): v for k, v in edits.items()}
             for entry in session.entries:
                 genre = entry.final_genre or entry.proposed_genre
                 if not genre or genre in _SKIP_GENRES:
                     continue
                 for track in entry.tracks:
+                    # Track-level genre exceptions (e.g. an artist's Christmas
+                    # songs) land in their own genre folder under the same
+                    # artist name — effective genre, not the artist's primary.
+                    t_edit = _nfc_edits.get(unicodedata.normalize('NFC', str(track.path)), {})
+                    ex_genre = effective_override(
+                        t_edit, track.path, t_edit.get('title', track.title), track.genre_tag,
+                    )
+                    t_genre = ex_genre if (ex_genre and ex_genre not in _SKIP_GENRES) else genre
                     classifications[Path(track.path)] = ClassificationResult(
-                        genre=genre,
+                        genre=t_genre,
                         confidence=Confidence.HIGH,
-                        reason=f'Classified ({entry.state}): {genre}',
+                        reason=(
+                            f'Genre exception: {t_genre}' if t_genre != genre
+                            else f'Classified ({entry.state}): {genre}'
+                        ),
                     )
 
             # 3. Reconstruct (TrackRecord, ClassificationResult) pairs

@@ -2108,3 +2108,18 @@ Walked through in detail with Jace 2026-08-28. This is user-facing truth, not ju
 **Fast-follows (documented, not built):** per-file review UI (currently per-source-folder), cross-`/Volumes` straggler location, a Cancel button on the progress dialog, mid-eliding very long non-`~` source paths in the folder rows.
 
 **Tested:** synthetic end-to-end (`detect_stragglers` → move → `PathRewriter` → re-detect shows 0; backups written), resolver unit checks (unique resolves, ambiguous/fuzzy do not), offscreen dialog construction + copy + checkbox QSS + scroll fit at 1/2/6/15 folders, headless `MainWindow` boot. pytest still not in the dev venv — verified by direct execution.
+
+## Track-Level Genre Exceptions (2026-10-13)
+
+**Replaces the old "one genre per artist" rule.** An artist has ONE primary genre; any track can carry a genre *exception* and then lives in that genre's bucket (Library) and folder (Organize) under the **same artist name** — record-shop logic (Michael Bolton's Christmas songs file under Seasonal, "How Am I Supposed to Live Without You" stays in R&B). Files still only move on Organize execute.
+
+- **Storage:** `library_edits.json[<track path>]['genre_override']` — absent = no explicit choice (Seasonal signals may auto-detect), `''` = pinned to the artist's primary, `'Rock'` = exception. **Deliberately separate from the per-track `genre` staging** that Approve/Accept write for every track — that can't tell "user chose this" from "Approve stamped the artist genre".
+- **Single source:** `core/genre_exceptions.py` (`effective_override`, `is_seasonal_signal`). Seasonal signals: ancestor folder named Christmas/Holiday/Seasonal/etc., unambiguous title word (christmas/xmas — NOT "holiday"), or a genre tag that STYLE_MAP resolves to Seasonal.
+- **Classifier:** `_ClassifyWorker` artist vote ignores seasonal tracks when any non-seasonal exist (Seasonal is primary only if ALL tracks are). `CLASSIFIER_VERSION` → 5.
+- **Library:** `_rebuild_tree` emits one top-level row per (artist, genre bucket); exception rows carry `exception_genre` in item data (+ `primary_genre` on every row). `_unique_artist_count()` for counts. Exception-only rows: no Approve, skipped by classify-mode review/accept loops. Change Genre on an exception row or a track child sets track exceptions (choosing the artist's primary pins `''`); on a primary row it changes the artist and touches only that row's tracks, so exceptions are never clobbered (this fixed Approve reverting a deliberate per-track genre). Undo via `LibraryGenreChangeCommand(old_overrides/new_overrides)`.
+- **Organize:** `_PlanWorker` builds `classifications` per track from `effective_override`, so one artist can land in two genre folders. No "also in X" cue anywhere — Jace: browsing Rock shouldn't surface Seasonal info.
+- **Not done / verify:** only synthetic-tested (headless tree, FileOrganizer plan, classifier vote). Needs the real-data-copy Organize run before shipping (FV-2). Crates screen, Classification screen are unchanged (artist-level).
+
+### Library sort + search behavior (2026-10-13, 0.2.6/0.2.8)
+- **Articles ignored when sorting:** `sort_key()` in `utils/normalize.py` skips a leading The/A/An (whole word + space, only if something remains) for the Library Artist/Title column (`_SortItem.__lt__`) and the Crates Title/Artist columns. Sort-only; display text is unchanged. "A$AP Rocky", "A-Ha", "The The" stay put; "A Tribe Called Quest" files under T.
+- **Search clears on bucket switch:** `_on_sidebar_genre_changed` clears the search box when a *different* genre bucket is clicked (not on refresh, not on re-clicking the same bucket). Use the All bucket to search across genres.

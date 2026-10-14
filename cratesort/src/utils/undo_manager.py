@@ -720,23 +720,34 @@ class LibraryTagsEditCommand(Command):
 
 class LibraryGenreChangeCommand(Command):
     """Undoable genre reassignment — covers single-track, sibling-selection,
-    artist-level, and bulk mixed-selection genre changes in the Library view."""
+    artist-level, and bulk mixed-selection genre changes in the Library view.
+
+    Track-level changes also carry genre *exceptions* (`new_overrides`:
+    path -> '' or genre; `old_overrides`: path -> prior value or None) so a
+    track can live in a different genre bucket than its artist's primary."""
     source_tab = 'library'
 
-    def __init__(self, view, old_edits: dict, new_genre: str, disk_old: dict, label: str):
+    def __init__(
+        self, view, old_edits: dict, new_genre: str, disk_old: dict, label: str,
+        old_overrides: Optional[dict] = None, new_overrides: Optional[dict] = None,
+    ):
         self.view       = view
         self.old_edits  = dict(old_edits)   # key (path or __artist__X) -> prior genre or None
         self.new_genre  = new_genre
         self.disk_old   = dict(disk_old)    # file_path -> prior on-disk genre
+        self.old_overrides = dict(old_overrides or {})
+        self.new_overrides = dict(new_overrides or {})
         self.description = f"Changed genre on '{label}' to {new_genre}"
 
     def execute(self) -> None:
         edits_map = {k: self.new_genre for k in self.old_edits}
         disk_map  = {p: self.new_genre for p in self.disk_old}
-        self.view._apply_library_genre(edits_map, disk_map)
+        self.view._apply_library_genre(edits_map, disk_map, overrides=self.new_overrides)
 
     def undo(self) -> None:
-        self.view._apply_library_genre(dict(self.old_edits), dict(self.disk_old))
+        self.view._apply_library_genre(
+            dict(self.old_edits), dict(self.disk_old), overrides=dict(self.old_overrides),
+        )
 
 
 class LibraryReassignArtistCommand(Command):
